@@ -1,0 +1,40 @@
+{
+	"name": "chamberlain-ai",
+	"build": {
+		"dockerfile": "Dockerfile"
+	},
+	"runArgs": ["--name", "chamberlain-ai"],
+
+	"features": {
+		"ghcr.io/anthropics/devcontainer-features/claude-code:1.0": {}
+	},
+
+	// Use 'forwardPorts' to make a list of ports inside the container available locally.
+	// "forwardPorts": [],
+
+	"postCreateCommand": "bash .devcontainer/postCreateCommand.sh",
+	"postStartCommand": "bash .devcontainer/postStartCommand.sh",
+	"waitFor": "postStartCommand",
+
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				"justjavac.vscode-deno-extensionpack"
+			],
+			"settings": {
+				"terminal.integrated.defaultProfile.linux": "zsh"
+			}
+			
+		}
+	},
+
+    "mounts": [
+		"source=commandhistory,target=/commandhistory,type=volume",
+		"source=${localEnv:HOME}/.config/gh,target=/home/node/.config/gh,type=bind,consistency=cached",
+		"source=claude-code-config,target=/home/node/.claude,type=volume",
+		"source=codex-data,target=/home/node/.codex,type=volume",
+		"source=gemini-data,target=/home/node/.gemini,type=volume"
+	],
+
+	"remoteUser": "node"
+}
