@@ -6,6 +6,7 @@
 	"runArgs": ["--name", "chamberlain-ai"],
 
 	"features": {
+		"ghcr.io/devcontainers/features/github-cli:1": {},
 		"ghcr.io/anthropics/devcontainer-features/claude-code:1.0": {}
 	},
 
@@ -18,13 +19,9 @@
 
 	"customizations": {
 		"vscode": {
-			"extensions": [
-				"justjavac.vscode-deno-extensionpack"
-			],
 			"settings": {
 				"terminal.integrated.defaultProfile.linux": "zsh"
 			}
-			
 		}
 	},
 

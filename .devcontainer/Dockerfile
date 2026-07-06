@@ -23,6 +23,22 @@ RUN apt-get update && apt-get install -y \
         -o /usr/share/doc/fzf/examples/key-bindings.zsh
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Tauri用のネイティブ依存（Linux: WebKitGTK/appindicator backend）
+# ＋ cargo-xwin でのWindowsクロスコンパイルに必要なclang/lld
+# ─────────────────────────────────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libgtk-3-dev \
+    libayatana-appindicator3-dev \
+    libwebkit2gtk-4.1-dev \
+    clang \
+    lld \
+    llvm \
+    && apt-get autoremove -y \
+    && apt-get clean -y \
+    && rm -rf /var/lib/apt/lists/*
+
+# ─────────────────────────────────────────────────────────────────────────────
 # uv
 # ─────────────────────────────────────────────────────────────────────────────
 RUN curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh
@@ -51,6 +67,17 @@ RUN npm install -g @google/gemini-cli
 # vscode ユーザーの設定
 # ─────────────────────────────────────────────────────────────────────────────
 USER node
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Rust / Tauri（Windows向けクロスコンパイルにはcargo-xwinを使用）
+# ─────────────────────────────────────────────────────────────────────────────
+ENV PATH="/home/node/.cargo/bin:${PATH}"
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable \
+    && rustup target add x86_64-pc-windows-msvc \
+    && cargo install cargo-xwin
+
+# pnpmはベースイメージのバージョンがNode.js 20と非互換のため9系に固定
+RUN npm install -g pnpm@9
 
 # zsh-in-docker: Oh My Zsh + プラグイン設定
 RUN SCRIPT_URL="https://github.com/deluan/zsh-in-docker/releases/download/v1.2.0/zsh-in-docker.sh" \
