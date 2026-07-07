@@ -1,6 +1,15 @@
 .tmp
 .pnpm-store
 
+# Node
+node_modules
+dist
+*.tsbuildinfo
+
+# Tauri (Rust build output + CLI-generated schemas)
+src-tauri/target
+src-tauri/gen
+
 # Claude Code
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
