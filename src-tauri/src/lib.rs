@@ -1,11 +1,33 @@
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use serde::Serialize;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
-    AppHandle, Manager, WindowEvent,
+    AppHandle, Emitter, Manager, State, WindowEvent,
 };
 use tauri_plugin_notification::{NotificationExt, PermissionState};
+
+const SAMPLE_TRIGGER_ID: &str = "sample-10s";
+const TICK_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Activity event emitted whenever a trigger fires. This is the primary
+/// observability surface Chamberlain exposes to its UI — see issue #6
+/// ("UI as observability plane"): every trigger firing, notification, or
+/// proactive action must also arrive here so the developer can watch the
+/// secretary's behavior without depending on OS-level notification rendering.
+#[derive(Clone, Serialize)]
+struct ActivityEvent {
+    ts: u64,
+    source: String,
+    message: String,
+}
+
+struct AppState {
+    sample_paused: Arc<AtomicBool>,
+}
 
 fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
@@ -15,10 +37,6 @@ fn show_main_window(app: &AppHandle) {
     }
 }
 
-// Windows toast notifications require the app's AppUserModelId to be registered
-// in the registry; installers normally do this via a Start Menu shortcut, but a
-// portable single-exe distribution has to self-register it on first run instead.
-// Without this, tauri-plugin-notification's show() silently no-ops on Windows.
 #[cfg(windows)]
 fn register_aumid(app_id: &str, display_name: &str) {
     use windows_registry::CURRENT_USER;
@@ -27,10 +45,6 @@ fn register_aumid(app_id: &str, display_name: &str) {
     }
 }
 
-/// Shows a toast notification. This always runs natively in Rust — never
-/// through the (permanently hidden, tray-only) webview — so it works
-/// regardless of window visibility. The scheduler below and the tray's
-/// manual "Send test notification" both go through this same path.
 fn send_notification(app: &AppHandle, title: &str, body: &str) {
     let notification = app.notification();
 
@@ -47,46 +61,70 @@ fn send_notification(app: &AppHandle, title: &str, body: &str) {
     }
 }
 
-const TICK_INTERVAL: Duration = Duration::from_secs(10);
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
-/// The periodic-execution primitive for this MVP demo: wakes up every
-/// `TICK_INTERVAL`, decides something happened (here: nothing more than a
-/// counter), and notifies. Lives entirely in Rust as a background async
-/// task — Chamberlain's app logic, not just its OS-integration layer, since
-/// a permanently-hidden Tauri window doesn't reliably run webview JS (see
-/// project notes on the notification-plugin/window-visibility investigation).
-fn spawn_scheduler(app: AppHandle) {
+fn spawn_sample_trigger(app: AppHandle, paused: Arc<AtomicBool>) {
     tauri::async_runtime::spawn(async move {
         let mut tick_count: u64 = 0;
         loop {
             tokio::time::sleep(TICK_INTERVAL).await;
+            if paused.load(Ordering::Relaxed) {
+                continue;
+            }
             tick_count += 1;
-            send_notification(
-                &app,
-                "Chamberlain",
-                &format!(
-                    "Tick #{tick_count} — still watching (every {}s)",
-                    TICK_INTERVAL.as_secs()
-                ),
-            );
+            let message = format!("Tick #{tick_count}");
+            send_notification(&app, "Chamberlain", &message);
+            let event = ActivityEvent {
+                ts: now_millis(),
+                source: SAMPLE_TRIGGER_ID.into(),
+                message,
+            };
+            let _ = app.emit("activity", event);
         }
     });
 }
 
+#[tauri::command]
+fn pause_sample_trigger(state: State<'_, AppState>) {
+    state.sample_paused.store(true, Ordering::Relaxed);
+}
+
+#[tauri::command]
+fn resume_sample_trigger(state: State<'_, AppState>) {
+    state.sample_paused.store(false, Ordering::Relaxed);
+}
+
+#[tauri::command]
+fn sample_trigger_status(state: State<'_, AppState>) -> bool {
+    state.sample_paused.load(Ordering::Relaxed)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let sample_paused = Arc::new(AtomicBool::new(false));
+
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
+        .manage(AppState {
+            sample_paused: sample_paused.clone(),
+        })
+        .invoke_handler(tauri::generate_handler![
+            pause_sample_trigger,
+            resume_sample_trigger,
+            sample_trigger_status,
+        ])
         .on_window_event(|window, event| {
-            // Close-to-tray: intercept the window's close button so it hides
-            // the window instead of terminating the process. The app only
-            // exits via the tray's Quit item.
             if let WindowEvent::CloseRequested { api, .. } = event {
                 let _ = window.hide();
                 api.prevent_close();
             }
         })
-        .setup(|app| {
+        .setup(move |app| {
             #[cfg(windows)]
             {
                 let identifier = app.config().identifier.clone();
@@ -115,7 +153,7 @@ pub fn run() {
                 })
                 .build(app)?;
 
-            spawn_scheduler(app.handle().clone());
+            spawn_sample_trigger(app.handle().clone(), sample_paused.clone());
 
             Ok(())
         })
