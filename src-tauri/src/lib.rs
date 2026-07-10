@@ -3,9 +3,17 @@ use std::time::Duration;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
-    AppHandle, Manager,
+    AppHandle, Manager, WindowEvent,
 };
 use tauri_plugin_notification::{NotificationExt, PermissionState};
+
+fn show_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
 
 // Windows toast notifications require the app's AppUserModelId to be registered
 // in the registry; installers normally do this via a Start Menu shortcut, but a
@@ -69,11 +77,16 @@ fn spawn_scheduler(app: AppHandle) {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
-        .setup(|app| {
-            if let Some(window) = app.get_webview_window("main") {
-                window.hide()?;
+        .on_window_event(|window, event| {
+            // Close-to-tray: intercept the window's close button so it hides
+            // the window instead of terminating the process. The app only
+            // exits via the tray's Quit item.
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                let _ = window.hide();
+                api.prevent_close();
             }
-
+        })
+        .setup(|app| {
             #[cfg(windows)]
             {
                 let identifier = app.config().identifier.clone();
@@ -85,15 +98,17 @@ pub fn run() {
                 register_aumid(&identifier, &display_name);
             }
 
+            let open_item = MenuItem::with_id(app, "open", "Open Chamberlain", true, None::<&str>)?;
             let notify_item = MenuItem::with_id(app, "notify", "Send test notification", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&notify_item, &quit_item])?;
+            let menu = Menu::with_items(app, &[&open_item, &notify_item, &quit_item])?;
 
             TrayIconBuilder::new()
                 .icon(app.default_window_icon().unwrap().clone())
                 .menu(&menu)
                 .show_menu_on_left_click(true)
                 .on_menu_event(|app, event| match event.id.as_ref() {
+                    "open" => show_main_window(app),
                     "notify" => send_notification(app, "Chamberlain", "テスト通知です"),
                     "quit" => app.exit(0),
                     _ => {}

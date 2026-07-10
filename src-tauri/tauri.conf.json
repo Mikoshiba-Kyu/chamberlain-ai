@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Chamberlain: Interval Notifier",
+  "productName": "Chamberlain",
   "version": "0.1.0",
   "identifier": "dev.chamberlain.interval-notifier",
   "build": {
@@ -15,7 +15,7 @@
         "title": "Chamberlain",
         "width": 800,
         "height": 600,
-        "visible": false
+        "visible": true
       }
     ],
     "security": {

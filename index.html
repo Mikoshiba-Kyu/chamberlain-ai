@@ -5,10 +5,11 @@
     <title>Chamberlain</title>
   </head>
   <body>
-    <!--
-      This window is never shown (tray-only residency); all of Chamberlain's
-      periodic-execution + notification logic lives in src-tauri/src/lib.rs.
-      No frontend script is needed here for this MVP.
-    -->
+    <div id="root">
+      <div style="padding: 32px; font-family: sans-serif; color: #888;">
+        Loading Chamberlain UI…
+      </div>
+    </div>
+    <script type="module" src="/src/app/main.tsx"></script>
   </body>
 </html>
