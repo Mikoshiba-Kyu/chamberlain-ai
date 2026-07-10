@@ -39,6 +39,15 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 日本語フォント（WSLg経由でTauriウィンドウを描画する際の文字化け防止）
+# ─────────────────────────────────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y \
+    fonts-noto-cjk \
+    && apt-get autoremove -y \
+    && apt-get clean -y \
+    && rm -rf /var/lib/apt/lists/*
+
+# ─────────────────────────────────────────────────────────────────────────────
 # uv
 # ─────────────────────────────────────────────────────────────────────────────
 RUN curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh
