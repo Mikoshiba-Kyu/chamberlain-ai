@@ -1,0 +1,23 @@
+[package]
+name = "chamberlain-core"
+version = "0.1.0"
+description = "Chamberlain framework core: heartbeat tick, trigger discovery, JS runtime host, state store, OS notification, tray"
+authors = ["Mikoshiba-Kyu"]
+edition = "2021"
+
+# NOTE: 意図的に `crate-type` を指定しない (デフォルト `rlib`)。`cdylib` は V8
+# (rustyscript 経由) の TLS relocation (R_X86_64_TPOFF32 against
+# v8::internal::g_current_isolate_) と衝突するため使えない。モバイル対応時は
+# platform ごとの追加調整が必要。
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-notification = "2"
+tauri-plugin-store = "2"
+tokio = { version = "1", features = ["time", "sync"] }
+serde = { version = "=1.0.219", features = ["derive"] }
+serde_json = "1"
+rustyscript = "0.12"
+
+[target.'cfg(windows)'.dependencies]
+windows-registry = "0.5"

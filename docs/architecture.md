@@ -12,9 +12,59 @@
 
 想定読者は Chamberlain フレームワーク側を触る開発者 (現時点では自分たち)。フレームワーク上でアプリを作る開発者向けのドキュメントは、フレームワークが安定した時点で別途書く。
 
+## 用語 (3 つの役割)
+
+Chamberlain には常に 3 種類の役割が登場する。「ユーザー」と呼ぶと混乱するため、以下で使い分ける。
+
+- **フレームワーク開発者** — Chamberlain 本体を作る人。現時点では我々。`packages/core` を触る
+- **エージェント開発者** — Chamberlain を使って秘書エージェントアプリを作る人。create-chamberlain (予定) のユーザー。`examples/react` を雛形として自分のアプリを組み立てる
+- **エンドユーザー** — エージェント開発者が配布した秘書アプリを使う人。UI やロジックは変えられない
+
+以降のドキュメントと Issue ではこの 3 語で明示的に呼び分ける。
+
+## レポ構造 (workspace)
+
+Chamberlain は cargo + pnpm の 2 系統 workspace として構成される (フレームワーク開発サイクルの詳細は #11 参照)。
+
+```
+chamberlain-ai/
+├── packages/
+│   └── core/                       # フレームワーク本体 (Rust クレート)
+│       └── src/lib.rs              # builder(config) + framework logic
+├── examples/
+│   └── react/                      # 常設プレイグラウンド (フル Tauri + React アプリ)
+│       ├── src/                    # React フロントエンド
+│       ├── src-tauri/
+│       │   ├── Cargo.toml          # chamberlain-core を path 依存
+│       │   ├── tauri.conf.json
+│       │   └── src/
+│       │       ├── lib.rs          # chamberlain_core::builder(...) を呼ぶだけ
+│       │       └── main.rs
+│       └── triggers/               # サンプル TS トリガー
+├── Cargo.toml                      # [workspace]
+├── package.json                    # workspace root (最小)
+└── pnpm-workspace.yaml
+```
+
+- **`packages/core`** — フレームワーク本体。将来 `chamberlain-core` として crates.io に publish される (#10)
+- **`examples/react`** — フレームワーク開発者の日常サイクル用。core を workspace path 依存で参照するので、`packages/core` を編集したら即反映される。将来 `templates/react` として create-chamberlain の元ネタになる (#9)
+- **workspace root** — pnpm-workspace / cargo workspace のルート。Cargo.lock はここに 1 つ
+
+### フロントエンドフレームワークの選択肢
+
+秘書 UI (トリガー一覧・アクティビティフィード・将来のチャット) は**フレームワーク機能**であり、エージェント開発者ごとに実装するものではない (`overview.md` の思想と整合)。一方、create-chamberlain 実行時にフロントエンドフレームワーク (React / Vue / 等) を選ばせる方向で設計する (Tauri の create-tauri-app と同じ発想)。
+
+これから必然的に以下の構造になる:
+
+- **contract 本体** は `packages/core` (Rust) が持つ invoke commands + event の集合
+- **UI 実装は言語ごとにパラレル**: `templates/react/`, 将来 `templates/vue/` 等
+- 共通 helper 層 (`packages/ui-react` 等) を切るかは Vue 対応が視野に入ってから判断
+
+現時点では React 版のみが `examples/react` として存在する。
+
 ## 全体像 (2層アーキテクチャ)
 
-Chamberlain は「常駐する Rust コア」と「開発者が書く TS トリガー」の2層で構成される。
+Chamberlain は「常駐する Rust コア」と「エージェント開発者が書く TS トリガー」の2層で構成される。
 
 ```
 ┌─────────────────────────────────────────────┐
@@ -41,10 +91,10 @@ Chamberlain は「常駐する Rust コア」と「開発者が書く TS トリ�
 ```
 
 - **Rust コア** = 永久に動いている心臓。時計、トレイ、OS 通知、JS ランタイム、永続化を担う
-- **TS トリガー** = 開発者が書くビジネスロジック。各トリガーは自分の `tick()` を提供
+- **TS トリガー** = エージェント開発者が書くビジネスロジック。各トリガーは自分の `tick()` を提供
 - **Web UI** = 秘書の動作全体を観測する窓 (詳細は [観測面](#観測面-observability-plane) 節)
 
-責務分割の要諦は [`overview.md`](overview.md) と一致する: コアが常駐性・トレイ・OS 通知・チャット UI を提供し、開発者は「いつ何を確認して何を通知するか」に集中する。
+責務分割の要諦は [`overview.md`](overview.md) と一致する: コアが常駐性・トレイ・OS 通知・チャット UI を提供し、エージェント開発者は「いつ何を確認して何を通知するか」に集中する。
 
 ## Rust コアの責務
 
@@ -88,7 +138,7 @@ Tauri の `TrayIconBuilder`。メニュー: Open Chamberlain / Send test notific
 
 pause 状態は `Arc<AtomicBool>` per trigger で in-memory 保持。再起動でリセット (MVP 判断、UX 上の必要が出た時点で永続化を検討)。
 
-## トリガーの契約 (開発者が書くもの)
+## トリガーの契約 (エージェント開発者が書くもの)
 
 ### パッケージ構造
 
@@ -280,7 +330,7 @@ TS 側 (`index.ts`) から自パッケージ内のアセット (prompt.md、sche
 
 ### shipped-app パス解決
 
-現状 `env!("CARGO_MANIFEST_DIR")` に依存しており dev-only。プロダクション配布時にトリガー群をどう bundle するか (Tauri resource dir?) と、開発者トリガーとフレームワーク組込トリガーの分離、が論点。
+現在 `packages/core::builder(config)` は `triggers_dir: PathBuf` を受け取る形になっており、位置解決はエージェント開発者側 (app crate の `main.rs` / `lib.rs`) の責務。`examples/react` では `env!("CARGO_MANIFEST_DIR")` で app crate 相対に解決しているが、これは dev-only。プロダクション配布時にトリガー群をどう bundle するか (Tauri resource dir?) と、エージェント開発者トリガーとフレームワーク組込トリガーの分離、が論点。
 
 ### ホットリロード
 

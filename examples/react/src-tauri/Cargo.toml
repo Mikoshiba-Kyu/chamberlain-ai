@@ -1,18 +1,16 @@
 [package]
-name = "chamberlain-interval-notifier"
+name = "chamberlain-example-react"
 version = "0.1.0"
-description = "Chamberlain MVP: periodic execution + OS notification demo"
+description = "Chamberlain のフレームワーク開発サイクル用サンプルアプリ (React テンプレート)"
 authors = ["Mikoshiba-Kyu"]
 edition = "2021"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [lib]
 # The `_lib` suffix may seem redundant but it is necessary
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
-name = "chamberlain_interval_notifier_lib"
-# NOTE: `cdylib` は V8 (rustyscript 経由) の TLS relocation
+name = "chamberlain_example_react_lib"
+# NOTE: `cdylib` は V8 (rustyscript 経由、chamberlain-core が依存) の TLS relocation
 # (R_X86_64_TPOFF32 against v8::internal::g_current_isolate_) と衝突するため外している。
 # モバイル向けにはいずれ復活が必要 (要 platform ごとの調整)。
 crate-type = ["staticlib", "rlib"]
@@ -21,13 +19,10 @@ crate-type = ["staticlib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon"] }
+tauri = { version = "2" }
+# NOTE: プラグインは chamberlain-core からも使われるが、Tauri の build script は
+# app crate の *直接* 依存を辿って permission manifest を集めるため、ここでも
+# 直接依存として宣言する必要がある。
 tauri-plugin-notification = "2"
 tauri-plugin-store = "2"
-tokio = { version = "1", features = ["time", "sync"] }
-serde = { version = "=1.0.219", features = ["derive"] }
-serde_json = "1"
-rustyscript = "0.12"
-
-[target.'cfg(windows)'.dependencies]
-windows-registry = "0.5"
+chamberlain-core = { path = "../../../packages/core" }

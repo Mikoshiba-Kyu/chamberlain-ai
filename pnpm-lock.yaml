@@ -6,7 +6,9 @@ settings:
 
 importers:
 
-  .:
+  .: {}
+
+  examples/react:
     dependencies:
       '@tauri-apps/api':
         specifier: ^2.11.1

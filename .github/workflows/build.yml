@@ -32,7 +32,7 @@ jobs:
       - name: Cache cargo
         uses: swatinem/rust-cache@v2
         with:
-          workspaces: src-tauri
+          workspaces: .
 
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
@@ -40,6 +40,7 @@ jobs:
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         with:
+          projectPath: examples/react
           args: --target x86_64-pc-windows-msvc
 
       - name: Upload artifact
@@ -47,6 +48,6 @@ jobs:
         with:
           name: chamberlain-windows
           path: |
-            src-tauri/target/x86_64-pc-windows-msvc/release/*.exe
-            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/**
+            target/x86_64-pc-windows-msvc/release/*.exe
+            target/x86_64-pc-windows-msvc/release/bundle/**
           if-no-files-found: error

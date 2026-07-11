@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "packages/core",
+    "examples/react/src-tauri",
+]
+resolver = "2"

@@ -6,9 +6,11 @@ node_modules
 dist
 *.tsbuildinfo
 
-# Tauri (Rust build output + CLI-generated schemas)
-src-tauri/target
-src-tauri/gen
+# Cargo build output (workspace root target/)
+target
+
+# Tauri CLI-generated schemas (per app)
+examples/*/src-tauri/gen
 
 # Claude Code
 .claude/settings.local.json

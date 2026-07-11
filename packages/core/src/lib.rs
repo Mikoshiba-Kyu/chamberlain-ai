@@ -16,6 +16,15 @@ use tauri_plugin_store::StoreExt;
 const TICK_INTERVAL: Duration = Duration::from_secs(10);
 const STATE_STORE_FILE: &str = "triggers-state.json";
 
+/// Chamberlain のフレームワーク初期化パラメータ。エージェント開発者は自分のアプリの
+/// `main.rs` で本構造体を組み立て `builder()` に渡す。
+pub struct ChamberlainConfig {
+    /// トリガーパッケージが並ぶディレクトリ。各サブディレクトリが `manifest.json` + `index.ts`
+    /// を持つ。dev では `env!("CARGO_MANIFEST_DIR")` からの相対パス、shipped 時の解決は
+    /// エージェント開発者が自分で行う (詳細: docs/architecture.md 「未確定の論点」)。
+    pub triggers_dir: PathBuf,
+}
+
 /// Activity event emitted whenever a trigger fires. This is the primary
 /// observability surface Chamberlain exposes to its UI — see issue #6
 /// ("UI as observability plane"): every trigger firing, notification, or
@@ -340,8 +349,13 @@ fn resume_trigger(id: String, triggers: State<'_, TriggersRef>) -> Result<(), St
     }
 }
 
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run() {
+/// Chamberlain のフレームワークが構成した Tauri Builder を返す。エージェント開発者は
+/// アプリの `main.rs` で本関数を呼び、返された Builder に `.run(tauri::generate_context!())`
+/// をつなげて起動する。`generate_context!` はエージェント側の `tauri.conf.json` を
+/// 参照するため、必ず app crate 側で呼ぶ必要がある。
+pub fn builder(config: ChamberlainConfig) -> tauri::Builder<tauri::Wry> {
+    let triggers_dir = config.triggers_dir;
+
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_store::Builder::default().build())
@@ -356,7 +370,7 @@ pub fn run() {
                 api.prevent_close();
             }
         })
-        .setup(|app| {
+        .setup(move |app| {
             #[cfg(windows)]
             {
                 let identifier = app.config().identifier.clone();
@@ -385,9 +399,6 @@ pub fn run() {
                 })
                 .build(app)?;
 
-            let triggers_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("..")
-                .join("triggers");
             let triggers: TriggersRef = Arc::new(discover_triggers(&triggers_dir));
             for t in triggers.iter() {
                 eprintln!(
@@ -400,6 +411,4 @@ pub fn run() {
 
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
 }

@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    chamberlain_interval_notifier_lib::run()
+    chamberlain_example_react_lib::run()
 }
