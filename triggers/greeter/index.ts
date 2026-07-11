@@ -1,6 +1,6 @@
 // 2つ目のサンプルトリガー。#8 の discovery / 独立ロード / 独立 pause を検証する。
 //
-// Ctx / CheckResult の型は sample-10s と同じ形。将来的には framework パッケージから
+// Ctx / TickResult の型は sample-10s と同じ形。将来的には framework パッケージから
 // import する形になる (# TBD)。
 
 type State = { greetCount?: number };
@@ -10,7 +10,7 @@ interface Ctx {
   state: State;
 }
 
-interface CheckResult {
+interface TickResult {
   notify?: { message: string };
   state?: State;
 }
@@ -24,7 +24,7 @@ function greeting(now: number): string {
   return "そろそろ休もう";
 }
 
-export function check(ctx: Ctx): CheckResult | null {
+export function tick(ctx: Ctx): TickResult | null {
   const next = (ctx.state.greetCount ?? 0) + 1;
   return {
     notify: { message: `${greeting(ctx.now)} (#${next})` },

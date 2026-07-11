@@ -34,7 +34,7 @@ struct NotifyPayload {
 }
 
 #[derive(Deserialize, Default)]
-struct CheckResult {
+struct TickResult {
     #[serde(default)]
     notify: Option<NotifyPayload>,
     #[serde(default)]
@@ -209,10 +209,10 @@ fn discover_triggers(triggers_dir: &Path) -> Vec<TriggerInfo> {
 }
 
 /// JS ワーカー: 単一の rustyscript Runtime に N モジュールを載せ、tick 毎に順番に
-/// check() を呼ぶ。V8 の thread affinity を守るため、Runtime はこの std::thread に閉じ込め、
+/// tick() を呼ぶ。V8 の thread affinity を守るため、Runtime はこの std::thread に閉じ込め、
 /// tokio 側からは mpsc で tick を送るだけ。
 ///
-/// Per-tick per-trigger 順序: paused判定 → state読 → check(ctx) → notify → state保存。
+/// Per-tick per-trigger 順序: paused判定 → state読 → tick(ctx) → notify → state保存。
 /// notify が state 保存より先。プロセスクラッシュ時の "at least once" を優先 (秘書は
 /// 「1回多く言う > 一言忘れる」)。
 fn spawn_trigger_worker(app: AppHandle, triggers: TriggersRef) {
@@ -274,8 +274,8 @@ fn spawn_trigger_worker(app: AppHandle, triggers: TriggersRef) {
                     "now": now_millis(),
                     "state": current_state,
                 });
-                let result: Result<Option<CheckResult>, _> =
-                    runtime.call_function(Some(handle), "check", rustyscript::json_args!(ctx));
+                let result: Result<Option<TickResult>, _> =
+                    runtime.call_function(Some(handle), "tick", rustyscript::json_args!(ctx));
                 match result {
                     Ok(Some(res)) => {
                         if let Some(notify) = res.notify {
@@ -287,7 +287,7 @@ fn spawn_trigger_worker(app: AppHandle, triggers: TriggersRef) {
                     }
                     Ok(None) => {}
                     Err(e) => {
-                        eprintln!("trigger '{}' check() error: {e}", id);
+                        eprintln!("trigger '{}' tick() error: {e}", id);
                         emit_activity(&app_for_worker, id, format!("[error] {e}"));
                     }
                 }
