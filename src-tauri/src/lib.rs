@@ -10,9 +10,11 @@ use tauri::{
     AppHandle, Emitter, Manager, State, WindowEvent,
 };
 use tauri_plugin_notification::{NotificationExt, PermissionState};
+use tauri_plugin_store::StoreExt;
 
 const SAMPLE_TRIGGER_ID: &str = "sample-10s";
 const TICK_INTERVAL: Duration = Duration::from_secs(10);
+const STATE_STORE_FILE: &str = "triggers-state.json";
 
 /// Activity event emitted whenever a trigger fires. This is the primary
 /// observability surface Chamberlain exposes to its UI — see issue #6
@@ -26,11 +28,20 @@ struct ActivityEvent {
     message: String,
 }
 
-/// The value shape Chamberlain expects a TS trigger's `check()` to return:
-/// either `null` (do nothing this tick) or `{ message: string }` (fire).
 #[derive(Deserialize)]
-struct CheckResult {
+struct NotifyPayload {
     message: String,
+}
+
+/// The value shape Chamberlain expects a TS trigger's `check()` to return.
+/// Either field may be absent (or the whole thing may be `null`) — nothing
+/// happens for the missing pieces.
+#[derive(Deserialize, Default)]
+struct CheckResult {
+    #[serde(default)]
+    notify: Option<NotifyPayload>,
+    #[serde(default)]
+    state: Option<serde_json::Value>,
 }
 
 struct AppState {
@@ -88,12 +99,41 @@ fn fire_trigger(app: &AppHandle, source: &str, message: String) {
     );
 }
 
+fn read_trigger_state(app: &AppHandle, trigger_id: &str) -> serde_json::Value {
+    match app.store(STATE_STORE_FILE) {
+        Ok(store) => store
+            .get(trigger_id)
+            .unwrap_or_else(|| serde_json::json!({})),
+        Err(e) => {
+            eprintln!("failed to open state store: {e}");
+            serde_json::json!({})
+        }
+    }
+}
+
+fn write_trigger_state(app: &AppHandle, trigger_id: &str, state: serde_json::Value) {
+    match app.store(STATE_STORE_FILE) {
+        Ok(store) => {
+            store.set(trigger_id, state);
+            if let Err(e) = store.save() {
+                eprintln!("failed to persist state for {trigger_id}: {e}");
+            }
+        }
+        Err(e) => eprintln!("failed to open state store for write: {e}"),
+    }
+}
+
 /// Spawn the sample trigger. The check logic lives in `triggers/sample-10s.ts`
 /// and is evaluated by an embedded JS runtime (deno_core via rustyscript).
 ///
 /// Threading: V8 isolates have thread affinity, so the `Runtime` is owned by
 /// a dedicated OS thread. The tokio side just produces tick signals over a
-/// channel; the JS thread does the actual `check()` call.
+/// channel; the JS thread does the actual `check()` call, state read/write,
+/// and notify/emit.
+///
+/// Per-tick order: read state → call check(ctx) → fire notify → persist state.
+/// notify precedes save so a crash mid-tick errs on "duplicate reminder" rather
+/// than "silently swallowed reminder".
 fn spawn_sample_trigger(app: AppHandle, paused: Arc<AtomicBool>) {
     let (tick_tx, tick_rx) = mpsc::channel::<()>();
     let app_for_worker = app.clone();
@@ -132,10 +172,25 @@ fn spawn_sample_trigger(app: AppHandle, paused: Arc<AtomicBool>) {
             if paused.load(Ordering::Relaxed) {
                 continue;
             }
+
+            let current_state = read_trigger_state(&app_for_worker, SAMPLE_TRIGGER_ID);
+            let ctx = serde_json::json!({
+                "now": now_millis(),
+                "state": current_state,
+            });
+
             let result: Result<Option<CheckResult>, _> =
-                runtime.call_function(Some(&handle), "check", rustyscript::json_args!());
+                runtime.call_function(Some(&handle), "check", rustyscript::json_args!(ctx));
+
             match result {
-                Ok(Some(res)) => fire_trigger(&app_for_worker, SAMPLE_TRIGGER_ID, res.message),
+                Ok(Some(res)) => {
+                    if let Some(notify) = res.notify {
+                        fire_trigger(&app_for_worker, SAMPLE_TRIGGER_ID, notify.message);
+                    }
+                    if let Some(new_state) = res.state {
+                        write_trigger_state(&app_for_worker, SAMPLE_TRIGGER_ID, new_state);
+                    }
+                }
                 Ok(None) => {}
                 Err(e) => eprintln!("trigger check() error: {e}"),
             }
@@ -173,6 +228,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_store::Builder::default().build())
         .manage(AppState {
             sample_paused: sample_paused.clone(),
         })
