@@ -276,7 +276,7 @@ AI 駆動トリガーは prompt / MD / スキーマ等のアセットを持ち�
 
 ### アセット読み込み API
 
-`index.ts` から `prompt.md` などパッケージ内のアセットを読む API。AI 駆動トリガーの実現に必須。想定される形は `ctx.readAsset("system-prompt.md")` のようなショートカット op を rustyscript 側に用意する形。
+TS 側 (`index.ts`) から自パッケージ内のアセット (prompt.md、schema.json 等) を読み出す API。AI 駆動トリガーの実現に必須 (system prompt を .md に外出しできる、等)。想定形は `ctx.readAsset("system-prompt.md")` のような呼び口を TS 側に公開し、実装は Rust 側で deno_core の op として提供する形。
 
 ### shipped-app パス解決
 
