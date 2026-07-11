@@ -1,8 +1,9 @@
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
@@ -22,6 +23,13 @@ const TICK_INTERVAL: Duration = Duration::from_secs(10);
 struct ActivityEvent {
     ts: u64,
     source: String,
+    message: String,
+}
+
+/// The value shape Chamberlain expects a TS trigger's `check()` to return:
+/// either `null` (do nothing this tick) or `{ message: string }` (fire).
+#[derive(Deserialize)]
+struct CheckResult {
     message: String,
 }
 
@@ -68,23 +76,78 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
+fn fire_trigger(app: &AppHandle, source: &str, message: String) {
+    send_notification(app, "Chamberlain", &message);
+    let _ = app.emit(
+        "activity",
+        ActivityEvent {
+            ts: now_millis(),
+            source: source.into(),
+            message,
+        },
+    );
+}
+
+/// Spawn the sample trigger. The check logic lives in `triggers/sample-10s.ts`
+/// and is evaluated by an embedded JS runtime (deno_core via rustyscript).
+///
+/// Threading: V8 isolates have thread affinity, so the `Runtime` is owned by
+/// a dedicated OS thread. The tokio side just produces tick signals over a
+/// channel; the JS thread does the actual `check()` call.
 fn spawn_sample_trigger(app: AppHandle, paused: Arc<AtomicBool>) {
-    tauri::async_runtime::spawn(async move {
-        let mut tick_count: u64 = 0;
-        loop {
-            tokio::time::sleep(TICK_INTERVAL).await;
+    let (tick_tx, tick_rx) = mpsc::channel::<()>();
+    let app_for_worker = app.clone();
+
+    std::thread::spawn(move || {
+        let mut runtime = match rustyscript::Runtime::new(rustyscript::RuntimeOptions::default()) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("failed to init JS runtime: {e}");
+                return;
+            }
+        };
+
+        let module_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("triggers")
+            .join("sample-10s.ts");
+
+        let module = match rustyscript::Module::load(&module_path) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("failed to load trigger module {module_path:?}: {e}");
+                return;
+            }
+        };
+
+        let handle = match runtime.load_module(&module) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("failed to instantiate trigger module: {e}");
+                return;
+            }
+        };
+
+        while tick_rx.recv().is_ok() {
             if paused.load(Ordering::Relaxed) {
                 continue;
             }
-            tick_count += 1;
-            let message = format!("Tick #{tick_count}");
-            send_notification(&app, "Chamberlain", &message);
-            let event = ActivityEvent {
-                ts: now_millis(),
-                source: SAMPLE_TRIGGER_ID.into(),
-                message,
-            };
-            let _ = app.emit("activity", event);
+            let result: Result<Option<CheckResult>, _> =
+                runtime.call_function(Some(&handle), "check", rustyscript::json_args!());
+            match result {
+                Ok(Some(res)) => fire_trigger(&app_for_worker, SAMPLE_TRIGGER_ID, res.message),
+                Ok(None) => {}
+                Err(e) => eprintln!("trigger check() error: {e}"),
+            }
+        }
+    });
+
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(TICK_INTERVAL).await;
+            if tick_tx.send(()).is_err() {
+                break;
+            }
         }
     });
 }

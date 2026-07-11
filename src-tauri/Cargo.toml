@@ -12,7 +12,10 @@ edition = "2021"
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 name = "chamberlain_interval_notifier_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+# NOTE: `cdylib` は V8 (rustyscript 経由) の TLS relocation
+# (R_X86_64_TPOFF32 against v8::internal::g_current_isolate_) と衝突するため外している。
+# モバイル向けにはいずれ復活が必要 (要 platform ごとの調整)。
+crate-type = ["staticlib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -20,8 +23,9 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-notification = "2"
-tokio = { version = "1", features = ["time"] }
-serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["time", "sync"] }
+serde = { version = "=1.0.219", features = ["derive"] }
+rustyscript = "0.12"
 
 [target.'cfg(windows)'.dependencies]
 windows-registry = "0.5"
