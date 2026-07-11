@@ -3,7 +3,7 @@ import { TriggersPanel } from "./panels/TriggersPanel";
 import { ActivityPanel } from "./panels/ActivityPanel";
 import { ChatPanel } from "./panels/ChatPanel";
 import { SettingsPanel } from "./panels/SettingsPanel";
-import { chamberlainApi, type ActivityEvent } from "./api";
+import { chamberlainApi, type ActivityEvent, type TriggerListItem } from "./api";
 
 type TabId = "triggers" | "activity" | "chat" | "settings";
 
@@ -19,7 +19,11 @@ const MAX_EVENTS = 200;
 export function App() {
   const [active, setActive] = useState<TabId>("triggers");
   const [events, setEvents] = useState<ActivityEvent[]>([]);
-  const [samplePaused, setSamplePaused] = useState(false);
+  const [triggers, setTriggers] = useState<TriggerListItem[]>([]);
+
+  const refreshTriggers = () => {
+    chamberlainApi.listTriggers().then(setTriggers);
+  };
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -32,21 +36,22 @@ export function App() {
         if (cancelled) fn();
         else unlisten = fn;
       });
-    chamberlainApi.sampleTriggerPaused().then(setSamplePaused);
+    refreshTriggers();
     return () => {
       cancelled = true;
       unlisten?.();
     };
   }, []);
 
-  const toggleSample = async () => {
-    if (samplePaused) {
-      await chamberlainApi.resumeSampleTrigger();
-      setSamplePaused(false);
+  const toggleTrigger = async (id: string) => {
+    const target = triggers.find((t) => t.id === id);
+    if (!target) return;
+    if (target.paused) {
+      await chamberlainApi.resumeTrigger(id);
     } else {
-      await chamberlainApi.pauseSampleTrigger();
-      setSamplePaused(true);
+      await chamberlainApi.pauseTrigger(id);
     }
+    refreshTriggers();
   };
 
   return (
@@ -68,7 +73,7 @@ export function App() {
       </nav>
       <main className="content">
         {active === "triggers" && (
-          <TriggersPanel paused={samplePaused} onToggle={toggleSample} />
+          <TriggersPanel triggers={triggers} onToggle={toggleTrigger} />
         )}
         {active === "activity" && <ActivityPanel events={events} />}
         {active === "chat" && <ChatPanel />}

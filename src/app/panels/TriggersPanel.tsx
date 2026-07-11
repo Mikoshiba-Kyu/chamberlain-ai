@@ -1,31 +1,47 @@
+import type { TriggerListItem } from "../api";
+
 interface Props {
-  paused: boolean;
-  onToggle: () => void;
+  triggers: TriggerListItem[];
+  onToggle: (id: string) => void;
 }
 
-export function TriggersPanel({ paused, onToggle }: Props) {
+export function TriggersPanel({ triggers, onToggle }: Props) {
   return (
     <section className="panel">
       <h1>トリガー</h1>
       <p className="hint">
-        開発者が定義したトリガー（いつ／何を確認して／何を通知するか）の一覧です。MVP では 1 件のサンプルのみ。
+        <code>triggers/&lt;id&gt;/manifest.json</code> と <code>index.ts</code>{" "}
+        から自動検出されたトリガーの一覧です。
       </p>
-      <ul className="trigger-list">
-        <li className="trigger-row">
-          <div className="trigger-meta">
-            <div className="trigger-name">sample-10s</div>
-            <div className="trigger-desc">10秒ごとに通知を発火するサンプル</div>
-          </div>
-          <div className="trigger-status">
-            <span className={paused ? "status status-paused" : "status status-running"}>
-              {paused ? "停止中" : "実行中"}
-            </span>
-            <button className="btn" onClick={onToggle}>
-              {paused ? "再開" : "停止"}
-            </button>
-          </div>
-        </li>
-      </ul>
+      {triggers.length === 0 ? (
+        <p className="placeholder">検出されたトリガーはありません。</p>
+      ) : (
+        <ul className="trigger-list">
+          {triggers.map((t) => (
+            <li key={t.id} className="trigger-row">
+              <div className="trigger-meta">
+                <div className="trigger-name">{t.id}</div>
+                <div className="trigger-desc">
+                  {t.name}
+                  {t.description ? ` — ${t.description}` : ""}
+                </div>
+              </div>
+              <div className="trigger-status">
+                <span
+                  className={
+                    t.paused ? "status status-paused" : "status status-running"
+                  }
+                >
+                  {t.paused ? "停止中" : "実行中"}
+                </span>
+                <button className="btn" onClick={() => onToggle(t.id)}>
+                  {t.paused ? "再開" : "停止"}
+                </button>
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
     </section>
   );
 }

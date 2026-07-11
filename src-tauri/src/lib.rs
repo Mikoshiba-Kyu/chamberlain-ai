@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -12,7 +13,6 @@ use tauri::{
 use tauri_plugin_notification::{NotificationExt, PermissionState};
 use tauri_plugin_store::StoreExt;
 
-const SAMPLE_TRIGGER_ID: &str = "sample-10s";
 const TICK_INTERVAL: Duration = Duration::from_secs(10);
 const STATE_STORE_FILE: &str = "triggers-state.json";
 
@@ -33,9 +33,6 @@ struct NotifyPayload {
     message: String,
 }
 
-/// The value shape Chamberlain expects a TS trigger's `check()` to return.
-/// Either field may be absent (or the whole thing may be `null`) — nothing
-/// happens for the missing pieces.
 #[derive(Deserialize, Default)]
 struct CheckResult {
     #[serde(default)]
@@ -44,8 +41,34 @@ struct CheckResult {
     state: Option<serde_json::Value>,
 }
 
-struct AppState {
-    sample_paused: Arc<AtomicBool>,
+#[derive(Clone, Deserialize)]
+struct TriggerManifest {
+    id: String,
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    author: Option<String>,
+    entry: String,
+}
+
+struct TriggerInfo {
+    manifest: TriggerManifest,
+    dir: PathBuf,
+    paused: Arc<AtomicBool>,
+}
+
+type TriggersRef = Arc<Vec<TriggerInfo>>;
+
+/// UI が受け取るトリガー一覧の要素。manifest 由来 + 現在の paused 状態。
+#[derive(Serialize)]
+struct TriggerListItem {
+    id: String,
+    name: String,
+    description: Option<String>,
+    paused: bool,
 }
 
 fn show_main_window(app: &AppHandle) {
@@ -87,8 +110,7 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
-fn fire_trigger(app: &AppHandle, source: &str, message: String) {
-    send_notification(app, "Chamberlain", &message);
+fn emit_activity(app: &AppHandle, source: &str, message: String) {
     let _ = app.emit(
         "activity",
         ActivityEvent {
@@ -97,6 +119,11 @@ fn fire_trigger(app: &AppHandle, source: &str, message: String) {
             message,
         },
     );
+}
+
+fn fire_trigger(app: &AppHandle, source: &str, message: String) {
+    send_notification(app, "Chamberlain", &message);
+    emit_activity(app, source, message);
 }
 
 fn read_trigger_state(app: &AppHandle, trigger_id: &str) -> serde_json::Value {
@@ -123,18 +150,72 @@ fn write_trigger_state(app: &AppHandle, trigger_id: &str, state: serde_json::Val
     }
 }
 
-/// Spawn the sample trigger. The check logic lives in `triggers/sample-10s.ts`
-/// and is evaluated by an embedded JS runtime (deno_core via rustyscript).
+/// `triggers/*/manifest.json` を走査して有効なトリガーだけを拾う。
+/// - manifest 読み取り失敗 / JSON 不正 → その 1 個をスキップ、他は続行
+/// - id 重複 → 先勝ち、後発をスキップして log
+/// - 実行順序を安定させるため id 昇順にソート
+fn discover_triggers(triggers_dir: &Path) -> Vec<TriggerInfo> {
+    let entries = match std::fs::read_dir(triggers_dir) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("failed to read triggers dir {triggers_dir:?}: {e}");
+            return Vec::new();
+        }
+    };
+
+    let mut result: Vec<TriggerInfo> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let manifest_path = path.join("manifest.json");
+        if !manifest_path.exists() {
+            continue;
+        }
+        let text = match std::fs::read_to_string(&manifest_path) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("failed to read {manifest_path:?}: {e}");
+                continue;
+            }
+        };
+        let manifest: TriggerManifest = match serde_json::from_str(&text) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("invalid manifest {manifest_path:?}: {e}");
+                continue;
+            }
+        };
+        result.push(TriggerInfo {
+            manifest,
+            dir: path,
+            paused: Arc::new(AtomicBool::new(false)),
+        });
+    }
+
+    let mut seen = HashSet::new();
+    let mut deduped: Vec<TriggerInfo> = Vec::new();
+    for t in result {
+        if seen.insert(t.manifest.id.clone()) {
+            deduped.push(t);
+        } else {
+            eprintln!("duplicate trigger id '{}', skipping", t.manifest.id);
+        }
+    }
+
+    deduped.sort_by(|a, b| a.manifest.id.cmp(&b.manifest.id));
+    deduped
+}
+
+/// JS ワーカー: 単一の rustyscript Runtime に N モジュールを載せ、tick 毎に順番に
+/// check() を呼ぶ。V8 の thread affinity を守るため、Runtime はこの std::thread に閉じ込め、
+/// tokio 側からは mpsc で tick を送るだけ。
 ///
-/// Threading: V8 isolates have thread affinity, so the `Runtime` is owned by
-/// a dedicated OS thread. The tokio side just produces tick signals over a
-/// channel; the JS thread does the actual `check()` call, state read/write,
-/// and notify/emit.
-///
-/// Per-tick order: read state → call check(ctx) → fire notify → persist state.
-/// notify precedes save so a crash mid-tick errs on "duplicate reminder" rather
-/// than "silently swallowed reminder".
-fn spawn_sample_trigger(app: AppHandle, paused: Arc<AtomicBool>) {
+/// Per-tick per-trigger 順序: paused判定 → state読 → check(ctx) → notify → state保存。
+/// notify が state 保存より先。プロセスクラッシュ時の "at least once" を優先 (秘書は
+/// 「1回多く言う > 一言忘れる」)。
+fn spawn_trigger_worker(app: AppHandle, triggers: TriggersRef) {
     let (tick_tx, tick_rx) = mpsc::channel::<()>();
     let app_for_worker = app.clone();
 
@@ -147,52 +228,69 @@ fn spawn_sample_trigger(app: AppHandle, paused: Arc<AtomicBool>) {
             }
         };
 
-        let module_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("triggers")
-            .join("sample-10s.ts");
-
-        let module = match rustyscript::Module::load(&module_path) {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("failed to load trigger module {module_path:?}: {e}");
-                return;
-            }
-        };
-
-        let handle = match runtime.load_module(&module) {
-            Ok(h) => h,
-            Err(e) => {
-                eprintln!("failed to instantiate trigger module: {e}");
-                return;
-            }
-        };
+        // 起動時に全モジュールをロード。ロード失敗したものはスキップ (他トリガーは動く)。
+        let mut loaded: Vec<(usize, rustyscript::ModuleHandle)> = Vec::new();
+        for (idx, t) in triggers.iter().enumerate() {
+            let entry_path = t.dir.join(&t.manifest.entry);
+            let module = match rustyscript::Module::load(&entry_path) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!(
+                        "failed to load trigger '{}' at {:?}: {e}",
+                        t.manifest.id, entry_path
+                    );
+                    emit_activity(
+                        &app_for_worker,
+                        &t.manifest.id,
+                        format!("[load error] {e}"),
+                    );
+                    continue;
+                }
+            };
+            let handle = match runtime.load_module(&module) {
+                Ok(h) => h,
+                Err(e) => {
+                    eprintln!("failed to instantiate trigger '{}': {e}", t.manifest.id);
+                    emit_activity(
+                        &app_for_worker,
+                        &t.manifest.id,
+                        format!("[instantiate error] {e}"),
+                    );
+                    continue;
+                }
+            };
+            loaded.push((idx, handle));
+        }
 
         while tick_rx.recv().is_ok() {
-            if paused.load(Ordering::Relaxed) {
-                continue;
-            }
-
-            let current_state = read_trigger_state(&app_for_worker, SAMPLE_TRIGGER_ID);
-            let ctx = serde_json::json!({
-                "now": now_millis(),
-                "state": current_state,
-            });
-
-            let result: Result<Option<CheckResult>, _> =
-                runtime.call_function(Some(&handle), "check", rustyscript::json_args!(ctx));
-
-            match result {
-                Ok(Some(res)) => {
-                    if let Some(notify) = res.notify {
-                        fire_trigger(&app_for_worker, SAMPLE_TRIGGER_ID, notify.message);
+            for (idx, handle) in &loaded {
+                let trigger = &triggers[*idx];
+                if trigger.paused.load(Ordering::Relaxed) {
+                    continue;
+                }
+                let id = &trigger.manifest.id;
+                let current_state = read_trigger_state(&app_for_worker, id);
+                let ctx = serde_json::json!({
+                    "now": now_millis(),
+                    "state": current_state,
+                });
+                let result: Result<Option<CheckResult>, _> =
+                    runtime.call_function(Some(handle), "check", rustyscript::json_args!(ctx));
+                match result {
+                    Ok(Some(res)) => {
+                        if let Some(notify) = res.notify {
+                            fire_trigger(&app_for_worker, id, notify.message);
+                        }
+                        if let Some(new_state) = res.state {
+                            write_trigger_state(&app_for_worker, id, new_state);
+                        }
                     }
-                    if let Some(new_state) = res.state {
-                        write_trigger_state(&app_for_worker, SAMPLE_TRIGGER_ID, new_state);
+                    Ok(None) => {}
+                    Err(e) => {
+                        eprintln!("trigger '{}' check() error: {e}", id);
+                        emit_activity(&app_for_worker, id, format!("[error] {e}"));
                     }
                 }
-                Ok(None) => {}
-                Err(e) => eprintln!("trigger check() error: {e}"),
             }
         }
     });
@@ -208,34 +306,49 @@ fn spawn_sample_trigger(app: AppHandle, paused: Arc<AtomicBool>) {
 }
 
 #[tauri::command]
-fn pause_sample_trigger(state: State<'_, AppState>) {
-    state.sample_paused.store(true, Ordering::Relaxed);
+fn list_triggers(triggers: State<'_, TriggersRef>) -> Vec<TriggerListItem> {
+    triggers
+        .iter()
+        .map(|t| TriggerListItem {
+            id: t.manifest.id.clone(),
+            name: t.manifest.name.clone(),
+            description: t.manifest.description.clone(),
+            paused: t.paused.load(Ordering::Relaxed),
+        })
+        .collect()
 }
 
 #[tauri::command]
-fn resume_sample_trigger(state: State<'_, AppState>) {
-    state.sample_paused.store(false, Ordering::Relaxed);
+fn pause_trigger(id: String, triggers: State<'_, TriggersRef>) -> Result<(), String> {
+    match triggers.iter().find(|t| t.manifest.id == id) {
+        Some(t) => {
+            t.paused.store(true, Ordering::Relaxed);
+            Ok(())
+        }
+        None => Err(format!("unknown trigger: {id}")),
+    }
 }
 
 #[tauri::command]
-fn sample_trigger_status(state: State<'_, AppState>) -> bool {
-    state.sample_paused.load(Ordering::Relaxed)
+fn resume_trigger(id: String, triggers: State<'_, TriggersRef>) -> Result<(), String> {
+    match triggers.iter().find(|t| t.manifest.id == id) {
+        Some(t) => {
+            t.paused.store(false, Ordering::Relaxed);
+            Ok(())
+        }
+        None => Err(format!("unknown trigger: {id}")),
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let sample_paused = Arc::new(AtomicBool::new(false));
-
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_store::Builder::default().build())
-        .manage(AppState {
-            sample_paused: sample_paused.clone(),
-        })
         .invoke_handler(tauri::generate_handler![
-            pause_sample_trigger,
-            resume_sample_trigger,
-            sample_trigger_status,
+            list_triggers,
+            pause_trigger,
+            resume_trigger,
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
@@ -243,7 +356,7 @@ pub fn run() {
                 api.prevent_close();
             }
         })
-        .setup(move |app| {
+        .setup(|app| {
             #[cfg(windows)]
             {
                 let identifier = app.config().identifier.clone();
@@ -272,7 +385,18 @@ pub fn run() {
                 })
                 .build(app)?;
 
-            spawn_sample_trigger(app.handle().clone(), sample_paused.clone());
+            let triggers_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("triggers");
+            let triggers: TriggersRef = Arc::new(discover_triggers(&triggers_dir));
+            for t in triggers.iter() {
+                eprintln!(
+                    "discovered trigger: {} ({}) — entry {}",
+                    t.manifest.id, t.manifest.name, t.manifest.entry
+                );
+            }
+            app.manage(triggers.clone());
+            spawn_trigger_worker(app.handle().clone(), triggers);
 
             Ok(())
         })
