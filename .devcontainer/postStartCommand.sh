@@ -59,22 +59,3 @@ else
     echo "          gh auth login"
     echo ""
 fi
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Claude Code 認証確認
-# ─────────────────────────────────────────────────────────────────────────────
-echo "  [*] Claude Code の認証状態を確認しています..."
-if claude --version &>/dev/null && claude config get -g &>/dev/null 2>&1; then
-    echo "  [ok] Claude Code は認証済みです"
-else
-    echo ""
-    echo "  [!] Claude Code が未認証または未設定です。"
-    echo "      設定を永続化するには devcontainer.json に以下のマウントを追加してください:"
-    echo ""
-    echo "          \"mounts\": [\"source=claude-data,target=/home/node/.claude,type=volume\"]"
-    echo ""
-    echo "      認証するには以下のコマンドを実行してください:"
-    echo ""
-    echo "          claude"
-    echo ""
-fi
