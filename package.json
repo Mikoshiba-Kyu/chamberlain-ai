@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "pnpm --filter chamberlain-example-react dev",
     "build": "pnpm --filter chamberlain-example-react build",
-    "tauri": "pnpm --filter chamberlain-example-react tauri"
+    "tauri": "pnpm --filter chamberlain-example-react tauri",
+    "scaffold:create": "node packages/create-chamberlain/bin/create.js",
+    "scaffold:clean": "node packages/create-chamberlain/bin/clean.js"
   }
 }

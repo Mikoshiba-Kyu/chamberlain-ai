@@ -1,0 +1,13 @@
+{
+  "name": "create-chamberlain",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Chamberlain の scaffold CLI (段階A・publish なし)",
+  "type": "module",
+  "bin": {
+    "create-chamberlain": "bin/create.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
