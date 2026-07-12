@@ -19,7 +19,7 @@ crate-type = ["staticlib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2" }
+tauri = { version = "2", features = [] }
 # NOTE: プラグインは chamberlain-core からも使われるが、Tauri の build script は
 # app crate の *直接* 依存を辿って permission manifest を集めるため、ここでも
 # 直接依存として宣言する必要がある。

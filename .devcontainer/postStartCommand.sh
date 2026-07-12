@@ -4,6 +4,35 @@ set -euo pipefail
 echo "[*] postStartCommand.sh を実行しています..."
 
 # ─────────────────────────────────────────────────────────────────────────────
+# D-Bus セッションバスと gnome-keyring を起動
+# 目的: chamberlain の secret store (keyring クレート → Secret Service backend)
+#       が devcontainer 内でも動作するようにする
+# 詳細: README「DevContainer 内で動く / 動かないもの」
+# ─────────────────────────────────────────────────────────────────────────────
+echo "  [*] D-Bus / gnome-keyring を起動しています..."
+
+if ! pgrep -f "dbus-daemon --session" > /dev/null 2>&1; then
+    ADDR=$(dbus-daemon --session --fork --print-address)
+    echo "export DBUS_SESSION_BUS_ADDRESS='$ADDR'" > "$HOME/.dbus-env"
+    echo "  [ok] D-Bus session bus を起動しました ($ADDR)"
+else
+    echo "  [skip] D-Bus session bus は既に起動しています"
+fi
+
+# 以降の gnome-keyring 呼び出しのためこのシェルにも load
+source "$HOME/.dbus-env"
+
+if ! pgrep -f "gnome-keyring-daemon" > /dev/null 2>&1; then
+    # dummy password で自動 unlock。devcontainer 内の secret を保護する意味は無いので
+    # 固定値で OK。実 Windows/Mac 側では OS の keychain を素直に使う。
+    echo -n "devcontainer" | gnome-keyring-daemon --daemonize --unlock --components=secrets > /dev/null 2>&1
+    echo "  [ok] gnome-keyring-daemon を起動しました"
+else
+    echo "  [skip] gnome-keyring-daemon は既に起動しています"
+fi
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # GitHub CLI 認証確認
 # ─────────────────────────────────────────────────────────────────────────────
 echo "  [*] GitHub CLI の認証状態を確認しています..."

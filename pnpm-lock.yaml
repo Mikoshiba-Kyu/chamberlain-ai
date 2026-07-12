@@ -39,6 +39,8 @@ importers:
         specifier: ^7.0.4
         version: 7.3.6
 
+  packages/create-chamberlain: {}
+
 packages:
 
   '@babel/code-frame@7.29.7':

@@ -30,8 +30,26 @@ pub mod store {
         Entry::new(service, name)
     }
 
+    /// name を env var 名に変換する。`github_token` -> `CHAMBERLAIN_SECRET_GITHUB_TOKEN`。
+    fn env_var_name(name: &str) -> String {
+        format!(
+            "CHAMBERLAIN_SECRET_{}",
+            name.to_uppercase().replace('-', "_")
+        )
+    }
+
     /// 未設定 (NoEntry) は `Ok(None)`、その他のエラーは `Err`。
+    ///
+    /// **env-var fallback**: keyring を叩く前に `CHAMBERLAIN_SECRET_<UPPERCASE>` を
+    /// 見る。dev 環境で `.env` 経由で secret を注入したいときの逃げ道。keyring 環境で
+    /// セットしなければ透過 (従来通り)。builder() 起動時に dotenvy が呼ばれるので、
+    /// `.env` に書けば自動でロードされる。
     pub fn get(service: &str, name: &str) -> Result<Option<String>, Error> {
+        if let Ok(v) = std::env::var(env_var_name(name)) {
+            if !v.is_empty() {
+                return Ok(Some(v));
+            }
+        }
         match entry(service, name)?.get_password() {
             Ok(v) => Ok(Some(v)),
             Err(Error::NoEntry) => Ok(None),
@@ -43,7 +61,8 @@ pub mod store {
         entry(service, name)?.set_password(value)
     }
 
-    /// 存在しないエントリの削除は成功扱い (`Ok(())`)。
+    /// 存在しないエントリの削除は成功扱い (`Ok(())`)。env-var 側は触らない
+    /// (プロセス外の設定なのでコマンド経由で削除できない)。
     pub fn delete(service: &str, name: &str) -> Result<(), Error> {
         match entry(service, name)?.delete_credential() {
             Ok(()) => Ok(()),

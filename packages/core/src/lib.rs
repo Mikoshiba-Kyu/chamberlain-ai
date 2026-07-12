@@ -410,6 +410,11 @@ fn list_declared_secrets(triggers: State<'_, TriggersRef>) -> Vec<DeclaredSecret
 /// をつなげて起動する。`generate_context!` はエージェント側の `tauri.conf.json` を
 /// 参照するため、必ず app crate 側で呼ぶ必要がある。
 pub fn builder(config: ChamberlainConfig) -> tauri::Builder<tauri::Wry> {
+    // dev 環境の逃げ道: cwd 起点で `.env` を探して load。既存の env-var は上書きしない。
+    // `CHAMBERLAIN_SECRET_*` はここで拾われて `secrets::store::get` の env fallback で
+    // 参照される (詳細は README「env-var fallback」)。
+    let _ = dotenvy::dotenv();
+
     let triggers_dir = config.triggers_dir;
 
     tauri::Builder::default()

@@ -37,6 +37,9 @@ deno_error = "0.7"
 # Anthropic Messages API を叩くための HTTP client (Type II 秘書 AI + Type I トリガー
 # 共通の chamberlain.ai.complete で使う)。async, rustls バックエンドで OpenSSL 非依存。
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# builder() 起動時に .env を読み込むために使う。dev で `CHAMBERLAIN_SECRET_*` を
+# 手軽に注入するためだけの用途 (詳細は README「env-var fallback」)。
+dotenvy = "0.15"
 # bitflags 2.13.0 は serde_core =1.0.228 を要求し、我々の serde =1.0.219 pin と
 # 衝突する。ここでは deno_core → v8 → bitflags の連鎖で入ってくるので、Cargo が
 # 上位バージョンに寄せないよう 2.9.x に固定する。serde ピン解除時に外せる。

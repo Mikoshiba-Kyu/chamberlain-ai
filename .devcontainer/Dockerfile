@@ -25,6 +25,9 @@ RUN apt-get update && apt-get install -y \
 # ─────────────────────────────────────────────────────────────────────────────
 # Tauri用のネイティブ依存（Linux: WebKitGTK/appindicator backend）
 # ＋ cargo-xwin でのWindowsクロスコンパイルに必要なclang/lld
+# ＋ D-Bus / gnome-keyring: keyring クレート (Secret Service backend) 用。
+#    postStartCommand.sh で自動起動する。これにより chamberlain の secret store
+#    が devcontainer 内でも動作する。
 # ─────────────────────────────────────────────────────────────────────────────
 RUN apt-get update && apt-get install -y \
     pkg-config \
@@ -34,6 +37,9 @@ RUN apt-get update && apt-get install -y \
     clang \
     lld \
     llvm \
+    dbus-x11 \
+    libsecret-1-0 \
+    gnome-keyring \
     && apt-get autoremove -y \
     && apt-get clean -y \
     && rm -rf /var/lib/apt/lists/*
@@ -103,6 +109,7 @@ RUN SCRIPT_URL="https://github.com/deluan/zsh-in-docker/releases/download/v1.2.0
         -a 'setopt SHARE_HISTORY INC_APPEND_HISTORY' \
         -a 'export DISPLAY="${DISPLAY:-:0}"' \
         -a 'export PATH="$HOME/.local/bin:$PATH"' \
+        -a '[ -f "$HOME/.dbus-env" ] && source "$HOME/.dbus-env"' \
         -x \
     && rm -f /tmp/zsh-in-docker.sh
 
