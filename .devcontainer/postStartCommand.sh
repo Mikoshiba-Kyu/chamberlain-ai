@@ -31,6 +31,18 @@ else
     echo "  [skip] gnome-keyring-daemon は既に起動しています"
 fi
 
+# ~/.zshenv に .dbus-env の source 行を冪等に入れる。
+# base image (typescript-node) の common-utils feature が .zshrc を書き換えるため
+# Dockerfile 側の zsh-in-docker -a フラグは残らない。.zshenv は zsh が常に最初に
+# 読むので、テーマや plugins に関係なく生き残る。
+DBUS_ENV_LINE='[ -f "$HOME/.dbus-env" ] && source "$HOME/.dbus-env"'
+if ! grep -Fqx "$DBUS_ENV_LINE" "$HOME/.zshenv" 2>/dev/null; then
+    echo "$DBUS_ENV_LINE" >> "$HOME/.zshenv"
+    echo "  [ok] ~/.zshenv に dbus-env の source 行を追加しました"
+else
+    echo "  [skip] ~/.zshenv には既に dbus-env の source 行があります"
+fi
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GitHub CLI 認証確認
