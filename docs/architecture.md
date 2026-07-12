@@ -45,7 +45,7 @@ Chamberlain という秘書の persona そのもの。
 ### 実装的な棲み分け
 
 - Type II は core が提供する。エージェント開発者は persona 実装をカスタムしない (create したテンプレの UI ソースは触れるが、Type II の AI 実装は core 由来)
-- Type I の実装は各トリガー内。core は plumbing (secret store、共通 `ctx.ai.complete` 等) を提供する
+- Type I の実装は各トリガー内。core は plumbing (secret store、共通 `chamberlain.ai.complete` 等) を提供する
 - **共通の依存**: 両方とも API キーが必要で、同じ secret store から読む
 
 ### 議論の規律
@@ -54,7 +54,9 @@ Chamberlain という秘書の persona そのもの。
 
 ### 現状の実装状況
 
-Type I / Type II ともに **未実装**。framework 側の共通基盤 (secret store と `ctx.ai.complete`) を先に整備する予定 (#13, #14)。初の実装例として Type I トリガーを 1 個作る予定 (#15)。
+- **Type II**: 実装済み (#14)。秘書チャット (`ChatPanel`) が Anthropic Messages API を叩き、履歴を `tauri-plugin-store` に永続化する
+- **共通基盤**: secret store 実装済み (#13)。keyring クレート + Settings UI + dev 環境用の env-var fallback (`CHAMBERLAIN_SECRET_<UPPERCASE>`)
+- **Type I**: 未実装。初の実装例として `github-issues-count` サンプルトリガーを予定 (#15)
 
 ## レポ構造 (workspace)
 
@@ -164,11 +166,19 @@ Tauri の `TrayIconBuilder`。メニュー: Open Chamberlain / Send test notific
 
 ### UI 向け invoke commands
 
-現時点で 3 つ:
+トリガー制御:
 
 - `list_triggers() -> Vec<TriggerListItem>` — 起動時に discover したトリガーを UI 表示用に返す
-- `pause_trigger(id: String)` — 指定 ID を停止
-- `resume_trigger(id: String)` — 指定 ID を再開
+- `pause_trigger(id: String)` / `resume_trigger(id: String)`
+
+Secret store (#13):
+
+- `list_declared_secrets() -> Vec<DeclaredSecretItem>` — トリガー manifest の `requiredSecrets` を集約して UI に返す。framework 必須の `anthropic_api_key` を先頭に含む
+- `has_secret(name) -> bool` / `set_secret(name, value)` / `delete_secret(name)`
+
+Type II チャット (#14):
+
+- `chat_history() -> Vec<ChatMessage>` / `chat_send(message) -> ChatMessage` / `chat_clear()`
 
 pause 状態は `Arc<AtomicBool>` per trigger で in-memory 保持。再起動でリセット (MVP 判断、UX 上の必要が出た時点で永続化を検討)。
 
@@ -195,19 +205,18 @@ Chrome 拡張 / VS Code 拡張 / npm package と同じ mental model。単一フ�
   "id": "sample-10s",
   "name": "10秒サンプル",
   "description": "10秒ごとにテスト通知を出す",
-  "version": "0.1.0",
-  "author": "Mikoshiba-Kyu",
-  "entry": "index.ts"
+  "entry": "index.ts",
+  "requiredSecrets": ["github_token"]
 }
 ```
 
-Rust 側で `serde_json` によりパース。
+Rust 側で `serde_json` によりパース。unknown フィールドは silently 無視される (serde デフォルト)。
 
 - `id` (必須) — namespace キー、activity source、UI 表示に使う。alphabetical で execution order が決まる。重複した場合は先勝ちで後発をスキップ + stderr log
 - `name` (必須) — UI に表示する人間可読名
 - `description` (任意) — UI 詳細表示用
-- `version`, `author` (任意) — 現状 UI には露出していないが、将来コミュニティ配布・marketplace 用のメタとして parse だけしておく
 - `entry` (必須) — パッケージ dir 相対のエントリスクリプトパス。通常は `"index.ts"`
+- `requiredSecrets` (任意) — このトリガーが `chamberlain.getSecret(name)` で読む予定の secret 名一覧。Settings UI が「未設定です」の表示に使う (#13)
 
 manifest を分離ファイルにする理由は「Rust が JS を動かさずに一覧を作れる」「Chrome/VS Code/npm と同じパターンで開発者に説明不要」「将来 marketplace の話が出た時にそのまま嵌る」など。決定の経緯は #8。
 
@@ -240,6 +249,22 @@ export function tick(ctx: Ctx): TickResult | null {
 - `{ state }` — state を丸ごと差し替えて永続化 (部分更新は自前スプレッド)
 - `{ notify, state }` — 両方
 - `{}` — 何もしない (`null` と等価)
+
+### ambient global `chamberlain.*`
+
+`ctx` は tick に渡される純粋データ (`{ now, state }`)。副作用のある API は ambient global の `chamberlain.*` として分離してある。deno_core の op で提供され、TS 側からは await で呼ぶ:
+
+```typescript
+chamberlain.getSecret(name: string): Promise<string | null>
+chamberlain.ai.complete(opts: {
+  prompt: string;
+  system?: string;
+  model?: string;    // 省略時は claude-sonnet-5
+  maxTokens?: number;
+}): Promise<string>
+```
+
+なぜ `ctx` に入れず ambient global にしたか: `ctx` は「今 tick のスナップショット」で pure data。keyring 参照や外部 API 呼び出しはスナップショットではないので分ける。将来 `chamberlain.readAsset(...)` 等もここに増える (未確定の論点参照)。
 
 ## 状態モデル
 
@@ -360,7 +385,7 @@ AI 駆動トリガーは prompt / MD / スキーマ等のアセットを持ち�
 
 ### アセット読み込み API
 
-TS 側 (`index.ts`) から自パッケージ内のアセット (prompt.md、schema.json 等) を読み出す API。AI 駆動トリガーの実現に必須 (system prompt を .md に外出しできる、等)。想定形は `ctx.readAsset("system-prompt.md")` のような呼び口を TS 側に公開し、実装は Rust 側で deno_core の op として提供する形。
+TS 側 (`index.ts`) から自パッケージ内のアセット (prompt.md、schema.json 等) を読み出す API。AI 駆動トリガーの実現に必須 (system prompt を .md に外出しできる、等)。想定形は `chamberlain.readAsset("system-prompt.md")` のような呼び口を TS 側に公開し、実装は Rust 側で deno_core の op として提供する形 (`chamberlain.getSecret` / `chamberlain.ai.complete` と同じレイヤ)。
 
 ### shipped-app パス解決
 
