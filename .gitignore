@@ -1,6 +1,12 @@
 .tmp
 .pnpm-store
 
+# ローカルの API キー等 (dotenvy が cwd 起点で walk-up して読む)。
+# 詳細は README「env-var fallback」。
+.env
+.env.local
+.env.*.local
+
 # Node
 node_modules
 dist

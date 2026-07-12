@@ -68,15 +68,19 @@ Chamberlain の秘書 chat (`ChatPanel`) や `chamberlain.ai.complete` を使う
 
 `chamberlain.getSecret(name)` は keyring を叩く前に `CHAMBERLAIN_SECRET_<UPPERCASE_NAME>` を先に見る。dev 環境で `.env` に書いておけば、`builder()` が起動時に dotenvy で読み込むので Settings UI での保存を省略できる。
 
+**推奨位置**: workspace root (`/workspaces/chamberlain-ai/.env` 相当)。dotenvy は cwd 起点で親ディレクトリを辿るので、`examples/react/src-tauri/` から起動しても workspace root の `.env` が見つかる。
+
 例:
 
 ```
-# examples/react/src-tauri/.env
+# <workspace root>/.env
 CHAMBERLAIN_SECRET_ANTHROPIC_API_KEY=sk-ant-...
 CHAMBERLAIN_SECRET_GITHUB_TOKEN=ghp_...
 ```
 
-env-var が設定されていれば keyring より優先。設定されていなければ従来通り keyring を使う (`.env` は git 管理外)。
+env-var が設定されていれば keyring より優先。設定されていなければ従来通り keyring を使う。`.env` / `.env.local` / `.env.*.local` は `.gitignore` 済み。
+
+**scaffold で作った外部プロジェクトを使うとき** (`pnpm scaffold:create` 後) は、生成先ディレクトリの中に `.env` を置く (workspace root からは cwd 的に届かないため)。
 
 ## DevContainer
 
