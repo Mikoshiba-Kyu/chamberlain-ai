@@ -22,6 +22,40 @@ Chamberlain には常に 3 種類の役割が登場する。「ユーザー」�
 
 以降のドキュメントと Issue ではこの 3 語で明示的に呼び分ける。
 
+## AI の 2 種類 (Type I / Type II)
+
+Chamberlain には性質の異なる 2 種類の AI が存在する。設計・実装を議論するときは常にこの区別を明示する。
+
+### Type I: タスク AI
+
+個別のトリガーが必要に応じて呼ぶ LLM。
+
+- モデル・provider・prompt は **エージェント開発者の裁量**
+- 短命 — 1 tick の中で API 呼び出しが完結する
+- 例: GitHub issue の要約、届いたメールの分類、コード変更のレビュー
+
+### Type II: 秘書自身の AI
+
+Chamberlain という秘書の persona そのもの。
+
+- チャットで会話する主体、ユーザーの習慣・好みを学習する主体
+- **framework 側 (`packages/core`) の責務**
+- 長命 — 会話履歴とユーザーモデルが永続する
+
+### 実装的な棲み分け
+
+- Type II は core が提供する。エージェント開発者は persona 実装をカスタムしない (create したテンプレの UI ソースは触れるが、Type II の AI 実装は core 由来)
+- Type I の実装は各トリガー内。core は plumbing (secret store、共通 `ctx.ai.complete` 等) を提供する
+- **共通の依存**: 両方とも API キーが必要で、同じ secret store から読む
+
+### 議論の規律
+
+「Chamberlain が AI で〜」と言ったら通常は Type II、「トリガーで AI を使う」と言ったら Type I を指す。混同すると「チャット機能をトリガーごとに書くのか?」のような設計上おかしな話が発生する。曖昧なときはどちらを指しているか明示する。
+
+### 現状の実装状況
+
+Type I / Type II ともに **未実装**。framework 側の共通基盤 (secret store と `ctx.ai.complete`) を先に整備する予定 (#13, #14)。初の実装例として Type I トリガーを 1 個作る予定 (#15)。
+
 ## レポ構造 (workspace)
 
 Chamberlain は cargo + pnpm の 2 系統 workspace として構成される (フレームワーク開発サイクルの詳細は #11 参照)。
