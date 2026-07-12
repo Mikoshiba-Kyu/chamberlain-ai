@@ -62,10 +62,6 @@ struct TriggerManifest {
     name: String,
     #[serde(default)]
     description: Option<String>,
-    #[serde(default)]
-    version: Option<String>,
-    #[serde(default)]
-    author: Option<String>,
     entry: String,
     /// トリガーが動作するために必要な secret 名の一覧。設定 UI に自動的に露出される。
     /// トリガーコードは `chamberlain.getSecret(name)` で任意名を読めるが、この宣言があると

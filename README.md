@@ -106,6 +106,14 @@ VS Code Remote-Containers を使うと、以下が自動でセットアップさ
 
 上記が問題になるのは「トレイをクリックしたときの挙動を目で見たい」「通知の見た目を確認したい」といったケース。それらは CI ビルドの Windows exe で確認する。
 
+### 出るが無害な警告 (WSLg 特有)
+
+- `libayatana-appindicator is deprecated ...` — Tauri が依存する系統トレイライブラリの upstream 警告。うちからは直せない
+- `Gtk-CRITICAL ... gtk_widget_get_scale_factor: assertion 'GTK_IS_WIDGET (widget)' failed` — WSLg で tray widget が取れないときに Tauri 内部が吐く警告。動作には影響しない
+- `Couldn't get key from code: Backquote` (等) — WebKitGTK が WSLg 環境の keyboard layout で一部 keycode の変換に失敗したときの警告。日本語入力ができないのも同じ層 (WSLg → WebKitGTK IME ブリッジ未整備) の話
+
+いずれも Windows 実機ビルドでは出ない。
+
 ## トリガー側から見える API (現状)
 
 トリガー (`triggers/*/index.ts`) は ambient global `chamberlain.*` を通じて Rust 側と対話する。
