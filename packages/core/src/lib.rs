@@ -1,3 +1,5 @@
+mod ai;
+mod chat;
 mod secrets;
 
 use std::collections::{BTreeMap, HashSet};
@@ -130,7 +132,7 @@ fn send_notification(app: &AppHandle, title: &str, body: &str) {
     }
 }
 
-fn now_millis() -> u64 {
+pub(crate) fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -378,11 +380,19 @@ fn resume_trigger(id: String, triggers: State<'_, TriggersRef>) -> Result<(), St
     }
 }
 
-/// 全トリガーの manifest から `requiredSecrets` を集約する。名前の重複は 1 要素に
-/// まとめ、`required_by` に要求元トリガー ID を列挙する。BTreeMap で name 昇順。
+/// 「今 UI が集める必要がある secret 名」を返す。framework 由来 (Chamberlain 本体が
+/// 必ず要求するもの、例: anthropic_api_key) と、各トリガー manifest の
+/// `requiredSecrets` を合流させる。名前の重複は 1 要素にまとめ、`required_by` に
+/// 要求元 (トリガー ID or "Chamberlain") を列挙する。BTreeMap で name 昇順。
 #[tauri::command]
 fn list_declared_secrets(triggers: State<'_, TriggersRef>) -> Vec<DeclaredSecretItem> {
     let mut map: BTreeMap<String, Vec<String>> = BTreeMap::new();
+
+    // framework-required (Type II 秘書 chat + 共通 chamberlain.ai.complete)
+    map.entry(secrets::ANTHROPIC_API_KEY_NAME.to_string())
+        .or_default()
+        .push("Chamberlain".to_string());
+
     for t in triggers.iter() {
         for name in &t.manifest.required_secrets {
             map.entry(name.clone())
@@ -413,6 +423,9 @@ pub fn builder(config: ChamberlainConfig) -> tauri::Builder<tauri::Wry> {
             secrets::set_secret,
             secrets::has_secret,
             secrets::delete_secret,
+            chat::chat_history,
+            chat::chat_send,
+            chat::chat_clear,
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {

@@ -19,6 +19,10 @@ use tauri::State;
 #[derive(Clone)]
 pub struct SecretsService(pub String);
 
+/// framework-required secret: Chamberlain 本体の Type II 秘書 AI と、共通の
+/// `chamberlain.ai.complete` op がここから API キーを引く。設定 UI に必ず現れる。
+pub const ANTHROPIC_API_KEY_NAME: &str = "anthropic_api_key";
+
 pub mod store {
     use keyring::{Entry, Error};
 
@@ -86,7 +90,10 @@ pub fn op_chamberlain_get_secret(
 
 extension!(
     chamberlain_ops,
-    ops = [op_chamberlain_get_secret],
+    ops = [
+        op_chamberlain_get_secret,
+        crate::ai::op_chamberlain_ai_complete,
+    ],
     esm_entry_point = "ext:chamberlain_ops/bootstrap.js",
     esm = [dir "src", "bootstrap.js"],
 );

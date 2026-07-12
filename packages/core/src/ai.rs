@@ -1,0 +1,148 @@
+//! Anthropic Messages API の薄いクライアント。
+//!
+//! - Type II (chamberlain-core が提供する秘書 chat) と Type I (トリガーが呼ぶタスク AI) の
+//!   両方から共有される
+//! - MVP スコープ: chat completion のみ。streaming / tool use は扱わない
+//! - API キーは secret store の `anthropic_api_key` から取る (呼び出し側の責務)
+
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use deno_core::{op2, OpState};
+use deno_error::JsErrorBox;
+use serde::{Deserialize, Serialize};
+
+use crate::secrets::{store as secret_store, SecretsService, ANTHROPIC_API_KEY_NAME};
+
+pub const DEFAULT_MODEL: &str = "claude-sonnet-5";
+pub const DEFAULT_MAX_TOKENS: u32 = 4096;
+pub const ANTHROPIC_URL: &str = "https://api.anthropic.com/v1/messages";
+pub const ANTHROPIC_VERSION: &str = "2023-06-01";
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    User,
+    Assistant,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Message {
+    pub role: Role,
+    pub content: String,
+}
+
+#[derive(Serialize)]
+struct RequestBody<'a> {
+    model: &'a str,
+    max_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system: Option<&'a str>,
+    messages: &'a [Message],
+}
+
+#[derive(Deserialize)]
+struct ResponseContent {
+    #[serde(rename = "type")]
+    _type: String,
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct ResponseBody {
+    content: Vec<ResponseContent>,
+}
+
+/// Anthropic Messages API に POST し、assistant のテキスト応答を返す。
+///
+/// - `model` が `None` の場合は `DEFAULT_MODEL` を使う
+/// - `system` は文字列そのままシステムプロンプトとして渡る
+/// - `messages` は user / assistant の交互ログ (呼び出し側で組み立てる)
+pub async fn complete(
+    api_key: &str,
+    model: Option<&str>,
+    system: Option<&str>,
+    messages: &[Message],
+) -> Result<String, String> {
+    let client = reqwest::Client::new();
+    let body = RequestBody {
+        model: model.unwrap_or(DEFAULT_MODEL),
+        max_tokens: DEFAULT_MAX_TOKENS,
+        system,
+        messages,
+    };
+
+    let response = client
+        .post(ANTHROPIC_URL)
+        .header("x-api-key", api_key)
+        .header("anthropic-version", ANTHROPIC_VERSION)
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("http request failed: {e}"))?;
+
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|e| format!("failed to read response body: {e}"))?;
+
+    if !status.is_success() {
+        return Err(format!("anthropic API error {status}: {text}"));
+    }
+
+    let parsed: ResponseBody = serde_json::from_str(&text)
+        .map_err(|e| format!("failed to parse anthropic response: {e} — body: {text}"))?;
+
+    parsed
+        .content
+        .into_iter()
+        .next()
+        .map(|c| c.text)
+        .ok_or_else(|| "anthropic response had no content".to_string())
+}
+
+// --- deno_core op (JS runtime から `chamberlain.ai.complete(...)` として呼ばれる) ---
+
+/// トリガーが渡してくる引数 (JSON) の形。フィールドはいずれも optional。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CompleteArgs {
+    prompt: String,
+    #[serde(default)]
+    system: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+}
+
+#[op2(async)]
+#[string]
+pub async fn op_chamberlain_ai_complete(
+    state: Rc<RefCell<OpState>>,
+    #[serde] args: CompleteArgs,
+) -> Result<String, JsErrorBox> {
+    // await 前に必要な情報を全部同期的に取り出しておく。
+    // OpState を await 越しに保持しないための定型パターン。
+    let api_key = {
+        let state = state.borrow();
+        let service = state.borrow::<SecretsService>().0.clone();
+        secret_store::get(&service, ANTHROPIC_API_KEY_NAME)
+            .map_err(|e| JsErrorBox::generic(format!("failed to read anthropic_api_key: {e}")))?
+            .ok_or_else(|| JsErrorBox::generic("anthropic_api_key is not set"))?
+    };
+
+    let messages = vec![Message {
+        role: Role::User,
+        content: args.prompt,
+    }];
+
+    complete(
+        &api_key,
+        args.model.as_deref(),
+        args.system.as_deref(),
+        &messages,
+    )
+    .await
+    .map_err(JsErrorBox::generic)
+}

@@ -19,6 +19,12 @@ export interface DeclaredSecretItem {
   requiredBy: string[];
 }
 
+export interface ChatMessage {
+  role: "user" | "assistant";
+  content: string;
+  ts: number;
+}
+
 export const chamberlainApi = {
   listTriggers: () => invoke<TriggerListItem[]>("list_triggers"),
   pauseTrigger: (id: string) => invoke<void>("pause_trigger", { id }),
@@ -31,4 +37,8 @@ export const chamberlainApi = {
   setSecret: (name: string, value: string) =>
     invoke<void>("set_secret", { name, value }),
   deleteSecret: (name: string) => invoke<void>("delete_secret", { name }),
+
+  chatHistory: () => invoke<ChatMessage[]>("chat_history"),
+  chatSend: (message: string) => invoke<ChatMessage>("chat_send", { message }),
+  chatClear: () => invoke<void>("chat_clear"),
 };

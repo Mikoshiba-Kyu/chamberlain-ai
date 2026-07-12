@@ -5,15 +5,20 @@
 // Currently exposed:
 //   chamberlain.getSecret(name: string): Promise<string | null>
 //     -- Read a named secret from the OS credential manager. null if not set.
-//
-// Future entry points (chamberlain.ai.complete, chamberlain.readAsset, etc.)
-// will be added to this same object. See docs/architecture.md for
-// "AI types" and "future decisions".
+//   chamberlain.ai.complete(opts): Promise<string>
+//     opts: { prompt: string, system?: string, model?: string }
+//     -- Call the Anthropic Messages API using the anthropic_api_key secret.
+//        Rejects if the key is not set. Default model is server-side.
 
 const { core } = Deno;
 
 globalThis.chamberlain = {
   async getSecret(name) {
     return await core.ops.op_chamberlain_get_secret(name);
+  },
+  ai: {
+    async complete(opts) {
+      return await core.ops.op_chamberlain_ai_complete(opts);
+    },
   },
 };
