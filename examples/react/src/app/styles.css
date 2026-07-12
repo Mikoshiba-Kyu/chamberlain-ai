@@ -263,3 +263,142 @@ body {
     color: #a1a1a6;
   }
 }
+
+/* Settings — secrets */
+.panel h2 {
+  margin: 24px 0 8px;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.error {
+  color: #b3261e;
+  font-size: 13px;
+}
+
+.secrets {
+  list-style: none;
+  padding: 0;
+  margin: 12px 0 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.secret-row {
+  padding: 12px 14px;
+  border: 1px solid rgba(0, 0, 0, 0.1);
+  border-radius: 6px;
+  background: #fff;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+@media (prefers-color-scheme: dark) {
+  .secret-row {
+    border-color: rgba(255, 255, 255, 0.12);
+    background: #232326;
+  }
+}
+
+.secret-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.secret-name {
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  font-weight: 600;
+}
+
+.secret-status {
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 10px;
+}
+
+.secret-status.set {
+  background: rgba(52, 199, 89, 0.18);
+  color: #1a7f38;
+}
+
+.secret-status.unset {
+  background: rgba(142, 142, 147, 0.22);
+  color: #55565a;
+}
+
+@media (prefers-color-scheme: dark) {
+  .secret-status.set {
+    color: #7ee2a1;
+  }
+  .secret-status.unset {
+    color: #c8c8cd;
+  }
+}
+
+.secret-requiredby {
+  font-size: 12px;
+  color: #6b6b6f;
+}
+
+@media (prefers-color-scheme: dark) {
+  .secret-requiredby {
+    color: #a1a1a6;
+  }
+}
+
+.secret-controls {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.secret-controls input {
+  flex: 1;
+  padding: 6px 10px;
+  border: 1px solid rgba(0, 0, 0, 0.15);
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  .secret-controls input {
+    border-color: rgba(255, 255, 255, 0.16);
+  }
+}
+
+.secret-controls button {
+  padding: 5px 12px;
+  font-size: 13px;
+  border: 1px solid rgba(0, 0, 0, 0.15);
+  background: #f6f6f7;
+  border-radius: 4px;
+  cursor: pointer;
+  color: inherit;
+}
+
+.secret-controls button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.secret-controls button.danger {
+  border-color: rgba(179, 38, 30, 0.3);
+  color: #b3261e;
+}
+
+@media (prefers-color-scheme: dark) {
+  .secret-controls button {
+    background: #2e2e31;
+    border-color: rgba(255, 255, 255, 0.16);
+  }
+}
+
+.secret-error {
+  font-size: 12px;
+  color: #b3261e;
+}

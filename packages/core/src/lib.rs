@@ -1,4 +1,6 @@
-use std::collections::HashSet;
+mod secrets;
+
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -12,6 +14,8 @@ use tauri::{
 };
 use tauri_plugin_notification::{NotificationExt, PermissionState};
 use tauri_plugin_store::StoreExt;
+
+use crate::secrets::SecretsService;
 
 const TICK_INTERVAL: Duration = Duration::from_secs(10);
 const STATE_STORE_FILE: &str = "triggers-state.json";
@@ -61,6 +65,11 @@ struct TriggerManifest {
     #[serde(default)]
     author: Option<String>,
     entry: String,
+    /// トリガーが動作するために必要な secret 名の一覧。設定 UI に自動的に露出される。
+    /// トリガーコードは `chamberlain.getSecret(name)` で任意名を読めるが、この宣言があると
+    /// UI が「そのキーが未設定です」を提示できるようになる。
+    #[serde(default, rename = "requiredSecrets")]
+    required_secrets: Vec<String>,
 }
 
 struct TriggerInfo {
@@ -78,6 +87,15 @@ struct TriggerListItem {
     name: String,
     description: Option<String>,
     paused: bool,
+}
+
+/// UI が受け取る「要求されている secret」の集約。同じ名前を複数トリガーが要求する
+/// ことがあるので、requiredBy に要求元 trigger id を列挙する形。
+#[derive(Serialize)]
+struct DeclaredSecretItem {
+    name: String,
+    #[serde(rename = "requiredBy")]
+    required_by: Vec<String>,
 }
 
 fn show_main_window(app: &AppHandle) {
@@ -224,18 +242,29 @@ fn discover_triggers(triggers_dir: &Path) -> Vec<TriggerInfo> {
 /// Per-tick per-trigger 順序: paused判定 → state読 → tick(ctx) → notify → state保存。
 /// notify が state 保存より先。プロセスクラッシュ時の "at least once" を優先 (秘書は
 /// 「1回多く言う > 一言忘れる」)。
-fn spawn_trigger_worker(app: AppHandle, triggers: TriggersRef) {
+fn spawn_trigger_worker(app: AppHandle, triggers: TriggersRef, secrets_service: SecretsService) {
     let (tick_tx, tick_rx) = mpsc::channel::<()>();
     let app_for_worker = app.clone();
 
     std::thread::spawn(move || {
-        let mut runtime = match rustyscript::Runtime::new(rustyscript::RuntimeOptions::default()) {
+        let mut runtime = match rustyscript::Runtime::new(rustyscript::RuntimeOptions {
+            extensions: vec![secrets::chamberlain_ops::init()],
+            ..Default::default()
+        }) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("failed to init JS runtime: {e}");
                 return;
             }
         };
+
+        // OpState に SecretsService を注入。op_chamberlain_get_secret がここから
+        // service 名 (tauri identifier) を借りて keyring を叩く。
+        runtime
+            .deno_runtime()
+            .op_state()
+            .borrow_mut()
+            .put(secrets_service);
 
         // 起動時に全モジュールをロード。ロード失敗したものはスキップ (他トリガーは動く)。
         let mut loaded: Vec<(usize, rustyscript::ModuleHandle)> = Vec::new();
@@ -349,6 +378,23 @@ fn resume_trigger(id: String, triggers: State<'_, TriggersRef>) -> Result<(), St
     }
 }
 
+/// 全トリガーの manifest から `requiredSecrets` を集約する。名前の重複は 1 要素に
+/// まとめ、`required_by` に要求元トリガー ID を列挙する。BTreeMap で name 昇順。
+#[tauri::command]
+fn list_declared_secrets(triggers: State<'_, TriggersRef>) -> Vec<DeclaredSecretItem> {
+    let mut map: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for t in triggers.iter() {
+        for name in &t.manifest.required_secrets {
+            map.entry(name.clone())
+                .or_default()
+                .push(t.manifest.id.clone());
+        }
+    }
+    map.into_iter()
+        .map(|(name, required_by)| DeclaredSecretItem { name, required_by })
+        .collect()
+}
+
 /// Chamberlain のフレームワークが構成した Tauri Builder を返す。エージェント開発者は
 /// アプリの `main.rs` で本関数を呼び、返された Builder に `.run(tauri::generate_context!())`
 /// をつなげて起動する。`generate_context!` はエージェント側の `tauri.conf.json` を
@@ -363,6 +409,10 @@ pub fn builder(config: ChamberlainConfig) -> tauri::Builder<tauri::Wry> {
             list_triggers,
             pause_trigger,
             resume_trigger,
+            list_declared_secrets,
+            secrets::set_secret,
+            secrets::has_secret,
+            secrets::delete_secret,
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
@@ -406,8 +456,14 @@ pub fn builder(config: ChamberlainConfig) -> tauri::Builder<tauri::Wry> {
                     t.manifest.id, t.manifest.name, t.manifest.entry
                 );
             }
+
+            // Secret store の service 名として tauri.conf.json の identifier を使う。
+            // Tauri state (UI commands 用) と OpState (JS op 用) の両方に持たせる。
+            let secrets_service = SecretsService(app.config().identifier.clone());
+            app.manage(secrets_service.clone());
+
             app.manage(triggers.clone());
-            spawn_trigger_worker(app.handle().clone(), triggers);
+            spawn_trigger_worker(app.handle().clone(), triggers, secrets_service);
 
             Ok(())
         })

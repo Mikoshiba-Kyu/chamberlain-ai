@@ -18,6 +18,26 @@ tokio = { version = "1", features = ["time", "sync"] }
 serde = { version = "=1.0.219", features = ["derive"] }
 serde_json = "1"
 rustyscript = "0.12"
+# OS credential manager 経由の secret store。Windows=Credential Manager,
+# Linux=Secret Service (D-Bus / libsecret 経由)。Linux devcontainer には bus が
+# 無いので実行時エラー、これは既知 (devcontainer 検証対象外)。
+#
+# v4 は apple-native-keyring-store が無条件 dep として付いてきて、その裏で
+# security-framework 3.7 が bitflags ^2.11 を要求 → serde =1.0.219 pin と衝突する。
+# v3 は feature フラグで切り離せるので、macOS を捨てる代わりに v3 を使う
+# (macOS 対応は本 Issue のスコープ外)。
+keyring = { version = "3", default-features = false, features = ["windows-native", "sync-secret-service"] }
+# op_chamberlain_get_secret の実装で直接使う。rustyscript が再エクスポート
+# している (rustyscript::deno_core) が、op2 マクロ経由の展開で `deno_core`
+# クレートが top-level に見える必要があるので、こちらでも直接依存させる。
+deno_core = "0.355"
+# op が返す error 型として JsErrorBox が必要。deno_core が要求する JsErrorClass
+# trait の実装が付いている。
+deno_error = "0.7"
+# bitflags 2.13.0 は serde_core =1.0.228 を要求し、我々の serde =1.0.219 pin と
+# 衝突する。ここでは deno_core → v8 → bitflags の連鎖で入ってくるので、Cargo が
+# 上位バージョンに寄せないよう 2.9.x に固定する。serde ピン解除時に外せる。
+bitflags = "=2.9.4"
 
 [target.'cfg(windows)'.dependencies]
 windows-registry = "0.5"
