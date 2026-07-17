@@ -1,0 +1,9 @@
+{
+  "id": "github-issues-count",
+  "name": "GitHub Issues カウンター",
+  "description": "対象リポの open/closed Issue 数を GitHub API から取得し、AI に一言添えさせる (Type I 初実装)",
+  "version": "0.1.0",
+  "author": "chamberlain",
+  "entry": "index.ts",
+  "requiredSecrets": ["github_token"]
+}
