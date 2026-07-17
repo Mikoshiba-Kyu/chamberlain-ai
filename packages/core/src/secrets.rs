@@ -112,6 +112,7 @@ extension!(
     ops = [
         op_chamberlain_get_secret,
         crate::ai::op_chamberlain_ai_complete,
+        crate::http::op_chamberlain_http_fetch,
     ],
     esm_entry_point = "ext:chamberlain_ops/bootstrap.js",
     esm = [dir "src", "bootstrap.js"],

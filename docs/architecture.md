@@ -233,7 +233,7 @@ interface Ctx {
 }
 
 interface TickResult {
-  notify?: { message: string };
+  notify?: { title?: string; body: string };
   state?: State;
 }
 
@@ -250,6 +250,8 @@ export function tick(ctx: Ctx): TickResult | null {
 - `{ notify, state }` — 両方
 - `{}` — 何もしない (`null` と等価)
 
+`notify.title` を省略した場合、フレームワークが `manifest.name` を通知タイトルに使う。「どのタスクから来た通知か」は manifest が既に知っているので、トリガー側は通常 `body` だけを書けば良い。トリガー側で明示的に title を出したいとき (例: 同じトリガーが「エラー通知」と「成功通知」を出し分ける) だけ title を渡す。
+
 ### ambient global `chamberlain.*`
 
 `ctx` は tick に渡される純粋データ (`{ now, state }`)。副作用のある API は ambient global の `chamberlain.*` として分離してある。deno_core の op で提供され、TS 側からは await で呼ぶ:
@@ -262,9 +264,16 @@ chamberlain.ai.complete(opts: {
   model?: string;    // 省略時は claude-sonnet-5
   maxTokens?: number;
 }): Promise<string>
+chamberlain.http.fetch(url: string, opts?: {
+  method?: string;                   // 省略時 GET
+  headers?: Record<string, string>;
+  body?: string;
+}): Promise<{ status: number; body: string }>
 ```
 
 なぜ `ctx` に入れず ambient global にしたか: `ctx` は「今 tick のスナップショット」で pure data。keyring 参照や外部 API 呼び出しはスナップショットではないので分ける。将来 `chamberlain.readAsset(...)` 等もここに増える (未確定の論点参照)。
+
+`chamberlain.http.fetch` が独立した op として存在するのは、rustyscript の JS runtime に Web `fetch` が入っていないため。「HTTP は core が握る (JS 側は薄い呼び出しだけ)」という方針を選んだ。理由は (1) 既に `ai.complete` で HTTP が core にある、(2) tauri app の権限モデル / ネットワーク境界を将来 core 側で一元管理しやすい、(3) rustyscript の web feature を有効化すると runtime が肥大化し JS 側挙動の予測性が下がる、の 3 点。
 
 ## 状態モデル
 

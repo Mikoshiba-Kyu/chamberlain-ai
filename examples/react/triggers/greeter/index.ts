@@ -11,7 +11,7 @@ interface Ctx {
 }
 
 interface TickResult {
-  notify?: { message: string };
+  notify?: { title?: string; body: string };
   state?: State;
 }
 
@@ -27,7 +27,7 @@ function greeting(now: number): string {
 export function tick(ctx: Ctx): TickResult | null {
   const next = (ctx.state.greetCount ?? 0) + 1;
   return {
-    notify: { message: `${greeting(ctx.now)} (#${next})` },
+    notify: { body: `${greeting(ctx.now)} (#${next})` },
     state: { greetCount: next },
   };
 }

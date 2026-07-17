@@ -1,5 +1,6 @@
 mod ai;
 mod chat;
+mod http;
 mod secrets;
 
 use std::collections::{BTreeMap, HashSet};
@@ -45,7 +46,10 @@ struct ActivityEvent {
 
 #[derive(Deserialize)]
 struct NotifyPayload {
-    message: String,
+    /// 省略時は fire_trigger 側で manifest.name をデフォルトに使う
+    #[serde(default)]
+    title: Option<String>,
+    body: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -146,9 +150,18 @@ fn emit_activity(app: &AppHandle, source: &str, message: String) {
     );
 }
 
-fn fire_trigger(app: &AppHandle, source: &str, message: String) {
-    send_notification(app, "Chamberlain", &message);
-    emit_activity(app, source, message);
+/// トリガー tick が返した notify を OS 通知 + activity イベントに流す。
+/// title は明示 > manifest.name の順で決まる (activity 側は body だけを流す)。
+fn fire_trigger(
+    app: &AppHandle,
+    trigger_id: &str,
+    trigger_name: &str,
+    title: Option<String>,
+    body: String,
+) {
+    let effective_title = title.unwrap_or_else(|| trigger_name.to_string());
+    send_notification(app, &effective_title, &body);
+    emit_activity(app, trigger_id, body);
 }
 
 fn read_trigger_state(app: &AppHandle, trigger_id: &str) -> serde_json::Value {
@@ -315,7 +328,13 @@ fn spawn_trigger_worker(app: AppHandle, triggers: TriggersRef, secrets_service: 
                 match result {
                     Ok(Some(res)) => {
                         if let Some(notify) = res.notify {
-                            fire_trigger(&app_for_worker, id, notify.message);
+                            fire_trigger(
+                                &app_for_worker,
+                                id,
+                                &trigger.manifest.name,
+                                notify.title,
+                                notify.body,
+                            );
                         }
                         if let Some(new_state) = res.state {
                             write_trigger_state(&app_for_worker, id, new_state);
