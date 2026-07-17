@@ -39,12 +39,6 @@ pnpm tauri dev
 
 `packages/core` を触ると workspace 経由で自動反映される。`examples/react` が **フレームワーク開発者の日常サイクル用の常設プレイグラウンド**。DevContainer からでも WSLg 経由で窓が Windows 側に描画される (詳細は下記「DevContainer」節)。
 
-### Windows exe を作る (CI 経由)
-
-`main` に push すると GitHub Actions (`.github/workflows/build.yml`) が **windows-latest** で `examples/react` を Tauri でビルドし、`.exe` と bundle をアーティファクトとしてアップロードする。手元での cross-compile は現状使わない (メモリ `feedback_tauri_ci_windows_build` の教訓)。
-
-Actions の実行後にアーティファクト `chamberlain-windows` をダウンロードし、Windows 実機で起動して確認する。
-
 ### scaffold の設計検証 (時々)
 
 「別プロジェクトから core を呼び出しても動くか」を確かめたいときに:
