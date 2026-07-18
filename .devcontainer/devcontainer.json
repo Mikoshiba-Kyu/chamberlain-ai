@@ -9,6 +9,15 @@
 		"ghcr.io/devcontainers/features/github-cli:1": {}
 	},
 
+	// トリガー内 (rustyscript の V8) と UI (WebKitGTK) の両方が親プロセスの TZ を継承する。
+	// デフォルトの Etc/UTC のままだと greeter の `getHours()` や ActivityPanel の時刻表示が
+	// UTC になり、JST の昼に「夜遅くまで働いてる？」等の誤発火が起きる。
+	// UTC 圏の開発者は下の値を自分のタイムゾーン (例: America/Los_Angeles) に書き換え。
+	// shipped Tauri アプリは端末 OS の TZ を使うので本番挙動には影響しない。
+	"containerEnv": {
+		"TZ": "Asia/Tokyo"
+	},
+
 	// Use 'forwardPorts' to make a list of ports inside the container available locally.
 	// "forwardPorts": [],
 

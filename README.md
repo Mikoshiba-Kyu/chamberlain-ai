@@ -83,6 +83,7 @@ VS Code Remote-Containers を使うと、以下が自動でセットアップさ
 - **WSLg 経由の display 転送** — `DISPLAY=:1`, `WAYLAND_DISPLAY`, `/tmp/.X11-unix` マウント。`pnpm tauri dev` の窓は Windows 側に描画される
 - **WebKitGTK + 日本語フォント** (`.devcontainer/Dockerfile`)
 - **D-Bus セッションバス + gnome-keyring** — `postStartCommand.sh` が起動時に立ち上げる。dummy password で auto-unlock される。keyring クレート → Secret Service backend が動作する
+- **TZ=Asia/Tokyo** (`containerEnv`) — トリガー内 (rustyscript の V8) と UI (WebKitGTK) の両方が親プロセスの TZ を継承する。デフォルトの UTC のままだと greeter や ActivityPanel の時刻が UTC になり誤発火・混乱の原因になる。UTC 圏の開発者は `.devcontainer/devcontainer.json` の `containerEnv.TZ` を自分のタイムゾーン (例: `America/Los_Angeles`) に書き換えてリビルド。shipped Tauri アプリは端末 OS の TZ を使うのでこの設定は dev-only。
 
 ### 動くもの
 
