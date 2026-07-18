@@ -106,7 +106,8 @@ Chamberlain は「常駐する Rust コア」と「エージェント開発者�
 ┌─────────────────────────────────────────────┐
 │            Rust コア (常駐)                   │
 │                                             │
-│  ・永久 tick timer (現状 10s)                 │
+│  ・永久 tick timer (1m / dev 10s)             │
+│  ・per-trigger schedule 判定 (5m 以上)         │
 │  ・tray icon                                │
 │  ・OS notification                          │
 │  ・JS runtime host (deno_core embedded)     │
@@ -136,9 +137,24 @@ Chamberlain は「常駐する Rust コア」と「エージェント開発者�
 
 ### Heartbeat tick
 
-`tokio::time::sleep(TICK_INTERVAL)` を回す非同期タスク。現在 `TICK_INTERVAL = 10s`。将来的には 1〜5 分程度 (「早すぎず遅すぎず」) を framework の約束とする方向で、cadence の議論は未確定 (別 Issue 予定)。
+`tokio::time::sleep(TICK_INTERVAL)` を回す非同期タスク。心拍は通常 `1m`、`CHAMBERLAIN_DEV=1` 時は `10s` に切り替わる (#17)。心拍は「発火判定を回す粒度」であり、実際の発火頻度はトリガー毎の `manifest.schedule` で決まる。
 
 一度動き出したら停止イベントは無く、プロセスが生きている限り tick が刻まれる。TS 側が壊れても心臓は止まらない、という設計の要。
+
+### Per-trigger schedule 判定 (#17)
+
+心拍で回されるのは「発火判定」であって、実際に tick() を呼ぶかは per-trigger の schedule で決まる。
+
+- 判定式: `now - last_fire_at >= schedule`。初回 (`last_fire_at` が無い) は即発火する
+- `last_fire_at` は tick() を呼んだら常に `now` に更新される (成功・エラー・null 返しに関わらず)。schedule の意味を「発火試行の頻度」に統一し、エラー時に毎心拍リトライになるノイズを避けるため
+- catch-up: `last_fire_at` を `now` に上書きするので、プロセス停止で溜まった発火は捨てられる (「1 回だけ発火」)
+- `last_fire_at` の保存先: `triggers-state.json` の予約 namespace `__meta__.fire_times` (詳細: [状態モデル](#状態モデル) 節)
+- schedule 最小粒度: 通常 `5m`、`CHAMBERLAIN_DEV=1` 時は `10s` (discovery で下限バリデーション)
+- schedule 省略 → discovery で完全に捨てる (manifest 不正と同じ扱い)
+- schedule パース失敗 / 下限違反 → **トリガー自体は list_triggers に `error` フィールド付きで残す**。worker は load / tick しない。stderr と activity にも `[schedule error]` で流すが、activity は `.setup()` 内で emit されるため UI 未接続で捨てられる可能性が高く、`list_triggers().error` が実質的な観測面
+- 予約 id `__meta__` → discovery で完全に捨てる (framework 内部用の namespace 衝突)
+
+dev モードは compile-time feature ではなく env-var 単独判定。「本番配布ビルドでは env を渡す口が Tauri bundle 側で塞がっている」ことを暗黙の前提にしている (詳細議論は #17)。
 
 ### Trigger discovery と runtime
 
@@ -202,20 +218,22 @@ Chrome 拡張 / VS Code 拡張 / npm package と同じ mental model。単一フ�
 
 ```json
 {
-  "id": "sample-10s",
-  "name": "10秒サンプル",
-  "description": "10秒ごとにテスト通知を出す",
+  "id": "github-issues-count",
+  "name": "GitHub Issues カウンター",
+  "description": "対象リポの Issue 数を取り AI が一言添える",
   "entry": "index.ts",
+  "schedule": "1h",
   "requiredSecrets": ["github_token"]
 }
 ```
 
 Rust 側で `serde_json` によりパース。unknown フィールドは silently 無視される (serde デフォルト)。
 
-- `id` (必須) — namespace キー、activity source、UI 表示に使う。alphabetical で execution order が決まる。重複した場合は先勝ちで後発をスキップ + stderr log
+- `id` (必須) — namespace キー、activity source、UI 表示に使う。alphabetical で execution order が決まる。重複した場合は先勝ちで後発をスキップ + stderr log。予約語 `__meta__` は使えない (framework 内部用)
 - `name` (必須) — UI に表示する人間可読名
 - `description` (任意) — UI 詳細表示用
 - `entry` (必須) — パッケージ dir 相対のエントリスクリプトパス。通常は `"index.ts"`
+- `schedule` (必須) — 発火頻度の DSL 文字列。`"5m"` / `"1h"` / `"6h"` 形式。単位は `s` / `m` / `h`。意味は「前回 fire から N 経過したら次 fire」。最小粒度は通常 `5m`、dev 時は `10s` (#17)
 - `requiredSecrets` (任意) — このトリガーが `chamberlain.getSecret(name)` で読む予定の secret 名一覧。Settings UI が「未設定です」の表示に使う (#13)
 
 manifest を分離ファイルにする理由は「Rust が JS を動かさずに一覧を作れる」「Chrome/VS Code/npm と同じパターンで開発者に説明不要」「将来 marketplace の話が出た時にそのまま嵌る」など。決定の経緯は #8。
@@ -295,10 +313,12 @@ chamberlain.http.fetch(url: string, opts?: {
 per-trigger per-tick で以下の順で実行される:
 
 1. `paused` 判定 → true ならスキップ
-2. state store から namespace `id` の値を読み出し (未保存なら `{}`)
-3. TS `tick({ now, state })` を呼ぶ
-4. 戻り値の `notify` を fire (OS 通知 + activity emit)
-5. 戻り値の `state` を store に書き込み → save
+2. schedule 判定 → `now - last_fire_at < schedule` ならスキップ (詳細: [Per-trigger schedule 判定](#per-trigger-schedule-判定-17) 節)
+3. state store から namespace `id` の値を読み出し (未保存なら `{}`)
+4. TS `tick({ now, state })` を呼ぶ
+5. 戻り値の `notify` を fire (OS 通知 + activity emit)
+6. 戻り値の `state` を store に書き込み → save
+7. `__meta__.fire_times[id]` に `now` を書き込み → save
 
 **notify が state 保存より先** である点は意図的。プロセスクラッシュ時の "at least once" を優先する: 秘書は「1回多く言う > 一言忘れる」。同じイベントを2回通知する方が、忘れて未通知になるより秘書として望ましい。
 
@@ -306,13 +326,20 @@ per-trigger per-tick で以下の順で実行される:
 
 ```json
 {
-  "sample-10s": { "tickCount": 259 },
   "greeter": { "greetCount": 42 },
-  "stretch-reminder": { "lastFire": 1721000000000 }
+  "stretch-reminder": { "lastFire": 1721000000000 },
+  "__meta__": {
+    "fire_times": {
+      "greeter": 1721000000000,
+      "stretch-reminder": 1721000060000
+    }
+  }
 }
 ```
 
 トップレベルのキーがトリガー ID (自動 namespace)。値は任意 JSON。framework は中身を関知しない。
+
+**予約 namespace `__meta__`**: framework が内部管理する情報を置くための予約領域 (#17)。現在は `fire_times`: 「トリガー ID → 最終 fire 時刻 (ms since epoch)」のマップだけを持つ。この ID を名乗るトリガーは discovery で reject される。
 
 保存先は Tauri が管理する `<app_data>/triggers-state.json`:
 
@@ -406,7 +433,15 @@ TS 側 (`index.ts`) から自パッケージ内のアセット (prompt.md、sche
 
 ### cadence / 精度 / DSL
 
-現状は全トリガー同一チック (10s)。将来は 1〜5 分の framework 約束 + トリガーごとの hint (`warnBefore: "1h"` 等) を DSL で表現する方向。精度の framework 約束をどう明示するかも論点。
+Phase 1 (#17) で「framework がスケジューラを持ち、manifest でトリガー毎に interval を宣言する」形に着地した (`schedule: "1h"` 等)。上記 [Per-trigger schedule 判定](#per-trigger-schedule-判定-17) 節を参照。
+
+未確定なのは Phase 2 の wall-clock 表現 (`"@daily 09:00"` / cron-lite):
+
+- TZ セマンティクス (user local / UTC / manifest 指定)
+- missed-fire policy: wall-clock 系は skip が自然
+- greeter は本来この形式で書きたい (時間帯挨拶)
+
+実運用トリガーが増えて wall-clock 需要が明確になってから着手する予定。
 
 ### notify API の一般化
 

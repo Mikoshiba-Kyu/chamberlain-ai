@@ -1,8 +1,9 @@
 {
   "id": "greeter",
   "name": "挨拶さん",
-  "description": "毎tick時刻に応じた挨拶を出す。discovery と独立実行の検証用",
+  "description": "1時間ごとに時間帯に応じた挨拶を出す。discovery と独立実行の検証用",
   "version": "0.1.0",
   "author": "chamberlain",
-  "entry": "index.ts"
+  "entry": "index.ts",
+  "schedule": "1h"
 }

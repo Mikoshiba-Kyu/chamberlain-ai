@@ -12,6 +12,19 @@ export interface TriggerListItem {
   name: string;
   description: string | null;
   paused: boolean;
+  /**
+   * 次回発火予定時刻 (ms since epoch)。
+   * まだ 1 度も fire していないトリガー / error 付きは null。
+   * framework が持っている情報を露出しているだけで、UI 側の表示レイアウトは #17 Phase 1 外。
+   */
+  nextFireAt: number | null;
+  /**
+   * 起動時 discovery で見つかった構成エラー (例: schedule パース失敗・下限違反)。
+   * このフィールドが非 null の間、そのトリガーは load/tick されない。
+   * UI 上で「壊れてる」ことを可視化するのが目的 (activity は startup 時に UI 未接続で
+   * 捨てられる可能性が高いため、ここが実質的な観測面)。
+   */
+  error: string | null;
 }
 
 export interface DeclaredSecretItem {

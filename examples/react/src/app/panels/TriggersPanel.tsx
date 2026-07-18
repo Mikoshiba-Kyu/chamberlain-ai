@@ -25,18 +25,29 @@ export function TriggersPanel({ triggers, onToggle }: Props) {
                   {t.name}
                   {t.description ? ` — ${t.description}` : ""}
                 </div>
+                {t.error ? (
+                  <div className="trigger-error">エラー: {t.error}</div>
+                ) : null}
               </div>
               <div className="trigger-status">
-                <span
-                  className={
-                    t.paused ? "status status-paused" : "status status-running"
-                  }
-                >
-                  {t.paused ? "停止中" : "実行中"}
-                </span>
-                <button className="btn" onClick={() => onToggle(t.id)}>
-                  {t.paused ? "再開" : "停止"}
-                </button>
+                {t.error ? (
+                  <span className="status status-error">構成エラー</span>
+                ) : (
+                  <>
+                    <span
+                      className={
+                        t.paused
+                          ? "status status-paused"
+                          : "status status-running"
+                      }
+                    >
+                      {t.paused ? "停止中" : "実行中"}
+                    </span>
+                    <button className="btn" onClick={() => onToggle(t.id)}>
+                      {t.paused ? "再開" : "停止"}
+                    </button>
+                  </>
+                )}
               </div>
             </li>
           ))}

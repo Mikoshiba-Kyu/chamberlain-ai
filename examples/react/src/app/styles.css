@@ -190,12 +190,30 @@ body {
   color: #55565a;
 }
 
+.status-error {
+  background: rgba(255, 59, 48, 0.18);
+  color: #b3261e;
+}
+
+.trigger-error {
+  margin-top: 4px;
+  font-size: 12px;
+  color: #b3261e;
+  word-break: break-word;
+}
+
 @media (prefers-color-scheme: dark) {
   .status-running {
     color: #7ee2a1;
   }
   .status-paused {
     color: #c8c8cd;
+  }
+  .status-error {
+    color: #ff8a80;
+  }
+  .trigger-error {
+    color: #ff8a80;
   }
 }
 

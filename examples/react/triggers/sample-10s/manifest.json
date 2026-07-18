@@ -1,8 +1,0 @@
-{
-  "id": "sample-10s",
-  "name": "10秒サンプル",
-  "description": "10秒ごとにテスト通知を出す。tickCount を state に永続化",
-  "version": "0.1.0",
-  "author": "chamberlain",
-  "entry": "index.ts"
-}
