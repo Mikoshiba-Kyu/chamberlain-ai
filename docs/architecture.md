@@ -141,18 +141,66 @@ Chamberlain は「常駐する Rust コア」と「エージェント開発者�
 
 一度動き出したら停止イベントは無く、プロセスが生きている限り tick が刻まれる。TS 側が壊れても心臓は止まらない、という設計の要。
 
-### Per-trigger schedule 判定 (#17)
+### Per-trigger schedule 判定 (#17 / #18)
 
 心拍で回されるのは「発火判定」であって、実際に tick() を呼ぶかは per-trigger の schedule で決まる。
 
-- 判定式: `now - last_fire_at >= schedule`。初回 (`last_fire_at` が無い) は即発火する
+`manifest.schedule` は 1 フィールドで 2 系統を扱う。先頭文字で判別:
+
+- 数字始まり (`"5m"` / `"1h"` 等) → **interval schedule** (#17 Phase 1)
+- `@` 始まり (`"@daily 09:00"` 等) → **wall-clock schedule** (#18 Phase 2)
+
+manifest フィールドが増えないのでエージェント開発者の学習コストが低い。パースは [`crate::schedule`] モジュールに一元化。
+
+共通ルール:
+
 - `last_fire_at` は tick() を呼んだら常に `now` に更新される (成功・エラー・null 返しに関わらず)。schedule の意味を「発火試行の頻度」に統一し、エラー時に毎心拍リトライになるノイズを避けるため
-- catch-up: `last_fire_at` を `now` に上書きするので、プロセス停止で溜まった発火は捨てられる (「1 回だけ発火」)
 - `last_fire_at` の保存先: `triggers-state.json` の予約 namespace `__meta__.fire_times` (詳細: [状態モデル](#状態モデル) 節)
-- schedule 最小粒度: 通常 `5m`、`CHAMBERLAIN_DEV=1` 時は `10s` (discovery で下限バリデーション)
 - schedule 省略 → discovery で完全に捨てる (manifest 不正と同じ扱い)
-- schedule パース失敗 / 下限違反 → **トリガー自体は list_triggers に `error` フィールド付きで残す**。worker は load / tick しない。stderr と activity にも `[schedule error]` で流すが、activity は `.setup()` 内で emit されるため UI 未接続で捨てられる可能性が高く、`list_triggers().error` が実質的な観測面
+- schedule パース失敗 / interval 下限違反 / tz 解決失敗 → **トリガー自体は list_triggers に `error` フィールド付きで残す**。worker は load / tick しない。stderr と activity にも `[schedule error]` で流すが、activity は `.setup()` 内で emit されるため UI 未接続で捨てられる可能性が高く、`list_triggers().error` が実質的な観測面
 - 予約 id `__meta__` → discovery で完全に捨てる (framework 内部用の namespace 衝突)
+
+#### interval schedule (#17)
+
+- DSL: `"5m"` / `"1h"` / `"10s"`。単位は `s` / `m` / `h`。単位無し・複合単位 (`1h30m`) は非対応
+- 意味: 「前回 fire から N 経過したら次 fire」。TZ 非依存
+- 判定式: `now - last_fire_at >= schedule`。初回 (`last_fire_at` が無い) は即発火する
+- 最小粒度: 通常 `5m`、`CHAMBERLAIN_DEV=1` 時は `10s` (discovery で下限バリデーション)
+- catch-up: `last_fire_at` を `now` に上書きするので、プロセス停止で溜まった発火は捨てられる (「1 回だけ発火」)
+
+#### wall-clock schedule (#18)
+
+- DSL: 5 種類の cron-lite エイリアス
+  - `@hourly` — 毎時 :00
+  - `@daily HH:MM` — 毎日 HH:MM
+  - `@weekly [MON|TUE|WED|THU|FRI|SAT|SUN] HH:MM` — 毎週指定曜日の HH:MM (英字 3 文字大文字)
+  - `@monthly D HH:MM` — 毎月 D 日 HH:MM。D が存在しない月 (2 月の 30 日等) は skip
+  - `@at YYYY-MM-DDTHH:MM` — 特定日時に 1 回だけ fire、以降永久 skip
+- full 5-field cron (`0 9 * * *`) は採らない (秘書用途では表現力過剰、cron parser クレート依存を避けたい、意味論を背負い込みたくない)
+- 意味: TZ に紐付いた wall-clock 時刻で fire
+- 判定式: `next_scheduled_after(last_fire_at, spec, tz) <= now`
+- 最小粒度チェックは無し (wall-clock は最短でも `@hourly` = 60m で interval 最小 5m を大きく上回るため)
+- **missed-fire policy: skip**。プロセス停止中に過ぎた予定は「秘書として今更 09:00 の挨拶しても不自然」なので捨てる
+  - 実装: worker 起動時に「fire_times に履歴の無い wall-clock トリガー」を `startup_now` で seed。以降の判定は上記式で行われ、「起動時点で過ぎている当日の予定」は自然に skip される
+  - 例: `@daily 09:00` のアプリを 10:00 に起動 → 今日の 09:00 は捨てて明日 09:00 を待つ
+  - `@at` で期日が既に past の場合も同じ仕組みで永久 skip される (`next_scheduled_after` が `None` を返す)
+
+#### TZ セマンティクス (#18)
+
+- **デフォルト: user local** (OS TZ を [`iana_time_zone`] クレートで解決 → [`chrono_tz`] で TimeZone を取得)
+- **上書き: `manifest.tz`** に IANA name (例: `"Asia/Tokyo"`)。省略時は user local
+- interval schedule は TZ 非依存なので `tz` は wall-clock schedule のみ影響する
+- shipped Tauri アプリはユーザーの OS TZ が正しく設定されている前提。dev container の TZ 問題は `.devcontainer/devcontainer.json` の `containerEnv.TZ` で解決済み (#17)
+
+#### DST 明文化 (#18)
+
+user local を採用した副作用として:
+
+- **spring-forward (存在しない時刻)**: skip。「02:30 にセット→ 3 月の DST 日は 02:30 が存在しない」→ その日は fire しない、翌日 02:30 が返される
+- **fall-back (重複時刻)**: 1 回だけ fire。「02:30 にセット→ 秋の DST 日は 02:30 が 2 回来る」→ 1 回目 (earlier UTC) のみ発火。2 回目の UTC 時刻 `X+1h` に対して `next_scheduled_after(X, ...)` は翌日の予定を返すので、2 回目は判定式で自然に skip される
+- `@at` が spring-forward の gap にヒットした場合も skip (永久 fire しない)
+
+JST は現状 DST 無しなので日本ユーザーには直接影響しないが、将来的にユーザーが海外環境で使う場合の期待挙動として明文化する。
 
 dev モードは compile-time feature ではなく env-var 単独判定。「本番配布ビルドでは env を渡す口が Tauri bundle 側で塞がっている」ことを暗黙の前提にしている (詳細議論は #17)。
 
@@ -218,12 +266,13 @@ Chrome 拡張 / VS Code 拡張 / npm package と同じ mental model。単一フ�
 
 ```json
 {
-  "id": "github-issues-count",
-  "name": "GitHub Issues カウンター",
-  "description": "対象リポの Issue 数を取り AI が一言添える",
+  "id": "greeter-morning",
+  "name": "朝の挨拶",
+  "description": "毎朝 06:00 におはようと言う",
   "entry": "index.ts",
-  "schedule": "1h",
-  "requiredSecrets": ["github_token"]
+  "schedule": "@daily 06:00",
+  "tz": "Asia/Tokyo",
+  "requiredSecrets": []
 }
 ```
 
@@ -233,7 +282,10 @@ Rust 側で `serde_json` によりパース。unknown フィールドは silentl
 - `name` (必須) — UI に表示する人間可読名
 - `description` (任意) — UI 詳細表示用
 - `entry` (必須) — パッケージ dir 相対のエントリスクリプトパス。通常は `"index.ts"`
-- `schedule` (必須) — 発火頻度の DSL 文字列。`"5m"` / `"1h"` / `"6h"` 形式。単位は `s` / `m` / `h`。意味は「前回 fire から N 経過したら次 fire」。最小粒度は通常 `5m`、dev 時は `10s` (#17)
+- `schedule` (必須) — 発火頻度の DSL 文字列
+  - interval: `"5m"` / `"1h"` / `"6h"` 形式。単位は `s` / `m` / `h`。意味は「前回 fire から N 経過したら次 fire」。最小粒度は通常 `5m`、dev 時は `10s` (#17)
+  - wall-clock: `"@daily 09:00"` / `"@weekly MON 09:00"` / `"@monthly 15 09:00"` / `"@hourly"` / `"@at 2026-08-01T18:30"` (#18)
+- `tz` (任意) — wall-clock schedule 用の IANA TZ 名 (例: `"Asia/Tokyo"`)。省略時は OS の user local を [`iana_time_zone`] で解決。interval schedule では無視される (#18)
 - `requiredSecrets` (任意) — このトリガーが `chamberlain.getSecret(name)` で読む予定の secret 名一覧。Settings UI が「未設定です」の表示に使う (#13)
 
 manifest を分離ファイルにする理由は「Rust が JS を動かさずに一覧を作れる」「Chrome/VS Code/npm と同じパターンで開発者に説明不要」「将来 marketplace の話が出た時にそのまま嵌る」など。決定の経緯は #8。
@@ -431,17 +483,15 @@ TS 側 (`index.ts`) から自パッケージ内のアセット (prompt.md、sche
 
 `triggers/**/*.ts` や manifest.json の変更を検出して Runtime を再構築する仕組み。dev DX 向上に効くが、V8 の再初期化コストと state 継続性の扱いが論点。
 
-### cadence / 精度 / DSL
+### cadence / 精度 / DSL (Phase 3 以降)
 
-Phase 1 (#17) で「framework がスケジューラを持ち、manifest でトリガー毎に interval を宣言する」形に着地した (`schedule: "1h"` 等)。上記 [Per-trigger schedule 判定](#per-trigger-schedule-判定-17) 節を参照。
+Phase 1 (#17) で interval schedule、Phase 2 (#18) で wall-clock schedule と TZ セマンティクスに着地した。詳細は上記 [Per-trigger schedule 判定](#per-trigger-schedule-判定-17--18) 節を参照。
 
-未確定なのは Phase 2 の wall-clock 表現 (`"@daily 09:00"` / cron-lite):
+Phase 3 以降で議論する余地がある論点:
 
-- TZ セマンティクス (user local / UTC / manifest 指定)
-- missed-fire policy: wall-clock 系は skip が自然
-- greeter は本来この形式で書きたい (時間帯挨拶)
-
-実運用トリガーが増えて wall-clock 需要が明確になってから着手する予定。
+- `chamberlain.time.tz` op (トリガー内で「今 UTC / user local で何時か」を TZ-aware に取れる op)。interval schedule + 動的判定パターン (MTG 30 分前通知等) を書けるようにする
+- カレンダー統合トリガー (MTG N 分前通知の実応用例)
+- 動的相対時刻 (`"MTG - 30m"` 等の DSL 表現) — 現状はトリガー内ロジックで書く方針
 
 ### notify API の一般化
 

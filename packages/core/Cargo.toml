@@ -44,6 +44,14 @@ dotenvy = "0.15"
 # 衝突する。ここでは deno_core → v8 → bitflags の連鎖で入ってくるので、Cargo が
 # 上位バージョンに寄せないよう 2.9.x に固定する。serde ピン解除時に外せる。
 bitflags = "=2.9.4"
+# #18 (Phase 2): wall-clock schedule DSL と TZ セマンティクスの実装で使う。
+# chrono は wall-clock 時刻計算、chrono-tz は IANA name → TZ 解決、iana-time-zone は
+# OS TZ の検出 (user local)。default-features を落として serde 依存を避ける
+# (chrono の serde feature は serde 1.x と互換だが、我々の =1.0.219 pin と衝突する
+# 可能性を最小化するためオフのままにする)。
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+chrono-tz = { version = "0.10", default-features = false }
+iana-time-zone = "0.1"
 
 [target.'cfg(windows)'.dependencies]
 windows-registry = "0.5"

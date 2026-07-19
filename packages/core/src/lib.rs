@@ -1,6 +1,7 @@
 mod ai;
 mod chat;
 mod http;
+mod schedule;
 mod secrets;
 
 use std::collections::{BTreeMap, HashSet};
@@ -18,6 +19,7 @@ use tauri::{
 use tauri_plugin_notification::{NotificationExt, PermissionState};
 use tauri_plugin_store::StoreExt;
 
+use crate::schedule::{next_scheduled_after, parse_schedule, resolve_tz, Schedule};
 use crate::secrets::SecretsService;
 
 /// 心臓周期。#17 で「トリガー毎に schedule を宣言 (最小 5m)」の設計になり、
@@ -42,61 +44,6 @@ const META_FIRE_TIMES_KEY: &str = "fire_times";
 /// CHAMBERLAIN_DEV=1 が立っているか。builder() 起動時に一度だけ evaluate する。
 fn dev_mode_enabled() -> bool {
     matches!(std::env::var("CHAMBERLAIN_DEV").ok().as_deref(), Some("1"))
-}
-
-/// schedule DSL のパーサ。`5m` / `1h` / `10s` の形式のみ受け付ける。
-/// 単位無し・複合単位 (`1h30m`) は非対応 (Phase 2 の cron-lite に譲る)。
-fn parse_schedule(s: &str) -> Result<Duration, String> {
-    let trimmed = s.trim();
-    // char 単位で末尾を切り分ける (byte offset で split すると multi-byte char で panic する)
-    let mut chars = trimmed.chars();
-    let unit = chars
-        .next_back()
-        .ok_or_else(|| format!("empty schedule: '{s}'"))?;
-    let num_part = chars.as_str();
-    if num_part.is_empty() {
-        return Err(format!("schedule missing number: '{s}'"));
-    }
-    let n: u64 = num_part
-        .parse()
-        .map_err(|_| format!("invalid schedule number in '{s}'"))?;
-    if n == 0 {
-        return Err(format!("schedule must be positive: '{s}'"));
-    }
-    let secs = match unit {
-        's' => n,
-        'm' => n
-            .checked_mul(60)
-            .ok_or_else(|| format!("schedule overflow: '{s}'"))?,
-        'h' => n
-            .checked_mul(60 * 60)
-            .ok_or_else(|| format!("schedule overflow: '{s}'"))?,
-        other => return Err(format!("unknown schedule unit '{other}' in '{s}'")),
-    };
-    Ok(Duration::from_secs(secs))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_schedule_basic() {
-        assert_eq!(parse_schedule("10s").unwrap(), Duration::from_secs(10));
-        assert_eq!(parse_schedule("5m").unwrap(), Duration::from_secs(300));
-        assert_eq!(parse_schedule("1h").unwrap(), Duration::from_secs(3600));
-        assert_eq!(parse_schedule(" 1h ").unwrap(), Duration::from_secs(3600));
-    }
-
-    #[test]
-    fn parse_schedule_rejects() {
-        assert!(parse_schedule("").is_err());
-        assert!(parse_schedule("m").is_err());
-        assert!(parse_schedule("0m").is_err());
-        assert!(parse_schedule("1d").is_err());
-        assert!(parse_schedule("1h30m").is_err());
-        assert!(parse_schedule("💾").is_err()); // multi-byte, no panic
-    }
 }
 
 /// Chamberlain のフレームワーク初期化パラメータ。エージェント開発者は自分のアプリの
@@ -148,22 +95,32 @@ struct TriggerManifest {
     /// UI が「そのキーが未設定です」を提示できるようになる。
     #[serde(default, rename = "requiredSecrets")]
     required_secrets: Vec<String>,
-    /// 発火頻度を DSL 文字列で宣言 (例: `"5m"` / `"1h"`)。必須。
-    /// 意味: 「前回 fire から N 経過したら次 fire」。単位は `s` / `m` / `h`。
-    /// 最小粒度は通常 `5m`、`CHAMBERLAIN_DEV=1` 時は `10s`。省略・不正値・
-    /// 下限違反は discovery で reject される (詳細: #17)。
+    /// 発火頻度を DSL 文字列で宣言。必須。
+    ///
+    /// - 数字始まり (`"5m"` / `"1h"`) → interval schedule (#17)
+    /// - `@` 始まり (`"@daily 09:00"` 等) → wall-clock schedule (#18)
+    ///
+    /// 詳細は [`crate::schedule`] モジュール参照。
     schedule: String,
+    /// wall-clock schedule 用の IANA TZ 名 (例: `"Asia/Tokyo"`)。省略時は OS の user local を
+    /// [`iana_time_zone`] で解決する。interval schedule は TZ 非依存なので値は使われない。
+    /// dev container の TZ 問題は `.devcontainer/devcontainer.json` の `containerEnv.TZ` で解決済み。
+    #[serde(default)]
+    tz: Option<String>,
 }
 
 struct TriggerInfo {
     manifest: TriggerManifest,
     dir: PathBuf,
     paused: Arc<AtomicBool>,
-    /// パース済み schedule。worker ループの発火判定と list_triggers の
+    /// パース済み schedule (Interval / WallClock)。worker ループの発火判定と list_triggers の
     /// nextFireAt 算出の両方で使う。schedule_error があるトリガーではダミー値
-    /// (Duration::ZERO)。worker は error を先に見て skip するので値は参照されない。
-    schedule: Duration,
-    /// schedule パース失敗 / 下限違反時のメッセージ。Some のトリガーは worker が
+    /// (Interval(Duration::ZERO))。worker は error を先に見て skip するので値は参照されない。
+    schedule: Schedule,
+    /// wall-clock schedule 用に解決済みの TZ。manifest.tz か user local。
+    /// schedule_error があるトリガーではダミー値 (UTC)。同上、参照されない。
+    tz: chrono_tz::Tz,
+    /// schedule パース失敗 / 下限違反 / tz 解決失敗時のメッセージ。Some のトリガーは worker が
     /// load/tick しない。UI 側 (list_triggers) には「壊れたトリガー」として残す。
     /// 目的は「1t とタイポしたトリガーが影も形も無くなる」UX を避けること。
     /// load/instantiate error は現状 activity のみ、この gap は将来 unify したい。
@@ -335,8 +292,13 @@ fn write_fire_time(app: &AppHandle, trigger_id: &str, ts: u64) {
 /// - manifest 読み取り失敗 / JSON 不正 → その 1 個をスキップ、他は続行
 /// - id 重複 → 先勝ち、後発をスキップして log
 /// - id が予約語 `__meta__` → reject
-/// - schedule 不正 / 下限違反 → reject し activity にも `[schedule error]` で流す
+/// - schedule 不正 / 下限違反 (interval のみ) / tz 解決失敗 → reject し activity にも
+///   `[schedule error]` で流す
 /// - 実行順序を安定させるため id 昇順にソート
+///
+/// wall-clock schedule (`@daily 09:00` 等) は interval 最小粒度チェックの対象外。理由:
+/// wall-clock は本質的に「時刻ベース」で、`@hourly` = 60m 以上・`@daily` = 24h と、
+/// interval 最小粒度 5m を大きく上回るので下限チェックが意味を持たない (#18)。
 fn discover_triggers(app: &AppHandle, triggers_dir: &Path, dev_mode: bool) -> Vec<TriggerInfo> {
     let entries = match std::fs::read_dir(triggers_dir) {
         Ok(e) => e,
@@ -389,8 +351,8 @@ fn discover_triggers(app: &AppHandle, triggers_dir: &Path, dev_mode: bool) -> Ve
         // discovery が .setup() 内で走る都合上 UI リスナー未接続で捨てられる可能性が
         // 高いため、list_triggers の error フィールドが実質的な観測面。
         let (schedule, schedule_error) = match parse_schedule(&manifest.schedule) {
-            Ok(d) if d >= min_schedule => (d, None),
-            Ok(d) => {
+            Ok(Schedule::Interval(d)) if d >= min_schedule => (Schedule::Interval(d), None),
+            Ok(Schedule::Interval(d)) => {
                 let msg = format!(
                     "schedule '{}' is below minimum ({}s); minimum is {}s{}",
                     manifest.schedule,
@@ -404,15 +366,33 @@ fn discover_triggers(app: &AppHandle, triggers_dir: &Path, dev_mode: bool) -> Ve
                 );
                 eprintln!("trigger '{}' schedule error: {msg}", manifest.id);
                 emit_activity(app, &manifest.id, format!("[schedule error] {msg}"));
-                (Duration::ZERO, Some(msg))
+                (Schedule::Interval(Duration::ZERO), Some(msg))
             }
+            Ok(wc @ Schedule::WallClock(_)) => (wc, None),
             Err(e) => {
                 eprintln!(
                     "invalid schedule for trigger '{}': {e} ({manifest_path:?})",
                     manifest.id
                 );
                 emit_activity(app, &manifest.id, format!("[schedule error] {e}"));
-                (Duration::ZERO, Some(e))
+                (Schedule::Interval(Duration::ZERO), Some(e))
+            }
+        };
+
+        // tz 解決は schedule error があっても走らせるが、失敗した場合はエラーを追記する
+        // (interval は tz 非依存なので、interval のみのトリガーで tz 解決が失敗しても
+        // 実害はない。ただし manifest に tz 指定があった場合はタイポの可能性が高いので
+        // 混在せず素直に schedule_error に載せる)。
+        let (tz, schedule_error) = match resolve_tz(manifest.tz.as_deref()) {
+            Ok(t) => (t, schedule_error),
+            Err(e) => {
+                eprintln!("trigger '{}' tz error: {e}", manifest.id);
+                emit_activity(app, &manifest.id, format!("[schedule error] {e}"));
+                let combined = match schedule_error {
+                    Some(prev) => Some(format!("{prev}; {e}")),
+                    None => Some(e),
+                };
+                (chrono_tz::UTC, combined)
             }
         };
 
@@ -421,6 +401,7 @@ fn discover_triggers(app: &AppHandle, triggers_dir: &Path, dev_mode: bool) -> Ve
             dir: path,
             paused: Arc::new(AtomicBool::new(false)),
             schedule,
+            tz,
             schedule_error,
         });
     }
@@ -449,8 +430,13 @@ fn discover_triggers(app: &AppHandle, triggers_dir: &Path, dev_mode: bool) -> Ve
 ///   「1回多く言う > 一言忘れる」)
 /// - fire_time は tick() を呼んだら常に更新 (エラー時も含む)。schedule の意味を
 ///   「発火試行の頻度」に統一し、エラーで毎心拍リトライになるノイズを避ける
-/// - 初回 (fire_times に履歴無し) は即発火。「まだ一度も動いていない = 1 回分溜まっている」扱い
-/// - catch-up: fire_time を now に上書きするので missed fires は捨てられる (#17 の合意)
+///
+/// missed-fire policy (schedule variant で異なる):
+/// - Interval: 初回 (fire_times に履歴無し) は即発火。「まだ一度も動いていない = 1 回分溜まっている」扱い。
+///   catch-up は fire_time を now に上書きすることで missed 分を捨てる (#17)
+/// - WallClock: skip。プロセス停止中に過ぎた予定は「秘書として今更 09:00 の挨拶しても不自然」なので捨てる (#18)。
+///   実装: worker 起動時に「初出の wall-clock トリガー」の fire_times を startup_now で
+///   seed する。以降 should_fire は `next_scheduled_after(last) <= now` で判定する
 fn spawn_trigger_worker(
     app: AppHandle,
     triggers: TriggersRef,
@@ -519,6 +505,24 @@ fn spawn_trigger_worker(
             loaded.push((idx, handle));
         }
 
+        // wall-clock トリガーの初回起動 seed。fire_times に履歴が無い wall-clock
+        // トリガーだけ startup_now を書いておく。以降の should_fire は
+        // `next_scheduled_after(last) <= now` で判定するので、これで missed-fire
+        // (例: @daily 09:00 のアプリを 10:00 に起動 → 今日の 09:00 は捨てて明日 09:00 を待つ) を
+        // skip できる。interval は「初回即発火」のセマンティクスを維持するため seed しない。
+        {
+            let startup_now = now_millis();
+            let existing = read_fire_times(&app_for_worker);
+            for (idx, _) in &loaded {
+                let trigger = &triggers[*idx];
+                let id = &trigger.manifest.id;
+                if matches!(trigger.schedule, Schedule::WallClock(_)) && !existing.contains_key(id)
+                {
+                    write_fire_time(&app_for_worker, id, startup_now);
+                }
+            }
+        }
+
         while tick_rx.recv().is_ok() {
             let now = now_millis();
             // 心拍の頭で一括で読み、以降は per-trigger で個別に write する。
@@ -531,10 +535,25 @@ fn spawn_trigger_worker(
                 }
                 let id = &trigger.manifest.id;
 
-                let schedule_ms = trigger.schedule.as_millis() as u64;
-                let should_fire = match fire_times.get(id) {
-                    None => true,
-                    Some(last) => now.saturating_sub(*last) >= schedule_ms,
+                let should_fire = match &trigger.schedule {
+                    Schedule::Interval(dur) => {
+                        // #17 の catch-up 1 回ルール: 履歴無し = 初回即発火、
+                        // 履歴あり = 前回から dur 経過したら発火。
+                        let schedule_ms = dur.as_millis() as u64;
+                        match fire_times.get(id) {
+                            None => true,
+                            Some(last) => now.saturating_sub(*last) >= schedule_ms,
+                        }
+                    }
+                    Schedule::WallClock(spec) => {
+                        // last は必ず存在する (worker 起動時 seed 済み)。
+                        // 万一無い場合は now を代入 = missed-fire skip 相当の防御。
+                        let last = fire_times.get(id).copied().unwrap_or(now);
+                        match next_scheduled_after(last, spec, &trigger.tz) {
+                            Some(next) => next <= now,
+                            None => false, // @at の期日が既に過ぎている等
+                        }
+                    }
                 };
                 if !should_fire {
                     continue;
@@ -586,17 +605,23 @@ fn spawn_trigger_worker(
 #[tauri::command]
 fn list_triggers(app: AppHandle, triggers: State<'_, TriggersRef>) -> Vec<TriggerListItem> {
     let fire_times = read_fire_times(&app);
+    let now = now_millis();
     triggers
         .iter()
         .map(|t| {
             // error 付きトリガーは worker が load すらしないので next_fire_at も意味を持たない。
-            // last_fire が無い (=まだ一度も動いていない) 場合も算出不能なので None。
             let next_fire_at = if t.schedule_error.is_some() {
                 None
             } else {
-                fire_times
-                    .get(&t.manifest.id)
-                    .map(|last| last.saturating_add(t.schedule.as_millis() as u64))
+                match &t.schedule {
+                    // Interval: last + duration。まだ一度も fire していないなら算出不能 (None)。
+                    Schedule::Interval(dur) => fire_times
+                        .get(&t.manifest.id)
+                        .map(|last| last.saturating_add(dur.as_millis() as u64)),
+                    // WallClock: 「今から見て次の予定時刻」。fire_times に依らず常に算出できる。
+                    // @at で期日が過ぎたトリガーは None (もう fire しない)。
+                    Schedule::WallClock(spec) => next_scheduled_after(now, spec, &t.tz),
+                }
             };
             TriggerListItem {
                 id: t.manifest.id.clone(),
@@ -734,12 +759,15 @@ pub fn builder(config: ChamberlainConfig) -> tauri::Builder<tauri::Wry> {
             let triggers: TriggersRef =
                 Arc::new(discover_triggers(app.handle(), &triggers_dir, dev_mode));
             for t in triggers.iter() {
+                let schedule_desc = match &t.schedule {
+                    Schedule::Interval(d) => format!("interval {}s", d.as_secs()),
+                    Schedule::WallClock(_) => {
+                        format!("wall-clock '{}' tz={:?}", t.manifest.schedule, t.tz)
+                    }
+                };
                 eprintln!(
-                    "discovered trigger: {} ({}) — entry {}, schedule {}s",
-                    t.manifest.id,
-                    t.manifest.name,
-                    t.manifest.entry,
-                    t.schedule.as_secs()
+                    "discovered trigger: {} ({}) — entry {}, schedule {}",
+                    t.manifest.id, t.manifest.name, t.manifest.entry, schedule_desc
                 );
             }
 
