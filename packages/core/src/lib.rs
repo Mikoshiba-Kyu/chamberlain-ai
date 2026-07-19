@@ -13,6 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use tauri::{
     menu::{Menu, MenuItem},
+    path::BaseDirectory,
     tray::TrayIconBuilder,
     AppHandle, Emitter, Manager, State, WindowEvent,
 };
@@ -44,15 +45,6 @@ const META_FIRE_TIMES_KEY: &str = "fire_times";
 /// CHAMBERLAIN_DEV=1 が立っているか。builder() 起動時に一度だけ evaluate する。
 fn dev_mode_enabled() -> bool {
     matches!(std::env::var("CHAMBERLAIN_DEV").ok().as_deref(), Some("1"))
-}
-
-/// Chamberlain のフレームワーク初期化パラメータ。エージェント開発者は自分のアプリの
-/// `main.rs` で本構造体を組み立て `builder()` に渡す。
-pub struct ChamberlainConfig {
-    /// トリガーパッケージが並ぶディレクトリ。各サブディレクトリが `manifest.json` + `index.ts`
-    /// を持つ。dev では `env!("CARGO_MANIFEST_DIR")` からの相対パス、shipped 時の解決は
-    /// エージェント開発者が自分で行う (詳細: docs/architecture.md 「未確定の論点」)。
-    pub triggers_dir: PathBuf,
 }
 
 /// Activity event emitted whenever a trigger fires. This is the primary
@@ -686,13 +678,17 @@ fn list_declared_secrets(triggers: State<'_, TriggersRef>) -> Vec<DeclaredSecret
 /// アプリの `main.rs` で本関数を呼び、返された Builder に `.run(tauri::generate_context!())`
 /// をつなげて起動する。`generate_context!` はエージェント側の `tauri.conf.json` を
 /// 参照するため、必ず app crate 側で呼ぶ必要がある。
-pub fn builder(config: ChamberlainConfig) -> tauri::Builder<tauri::Wry> {
+///
+/// トリガーの探索先は `tauri.conf.json` の `bundle.resources` で `triggers/**/*` を
+/// 宣言してもらった上で、`BaseDirectory::Resource` 経由で解決する。dev では
+/// `target/{debug,release}/triggers/`、shipped では platform ごとの resource dir
+/// (Windows: exe と同居 / Linux: `/usr/lib/{name}/` or `${APPDIR}/usr/lib/{name}/` /
+/// macOS: `{name}.app/Contents/Resources/`) を指す (詳細: #19)。
+pub fn builder() -> tauri::Builder<tauri::Wry> {
     // dev 環境の逃げ道: cwd 起点で `.env` を探して load。既存の env-var は上書きしない。
     // `CHAMBERLAIN_SECRET_*` はここで拾われて `secrets::store::get` の env fallback で
     // 参照される (詳細は README「env-var fallback」)。
     let _ = dotenvy::dotenv();
-
-    let triggers_dir = config.triggers_dir;
 
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
@@ -756,6 +752,17 @@ pub fn builder(config: ChamberlainConfig) -> tauri::Builder<tauri::Wry> {
                 eprintln!("CHAMBERLAIN_DEV=1: relaxing schedule minimum and heartbeat to 10s");
             }
 
+            // トリガーは `bundle.resources` で `triggers/**/*` を宣言してもらった上で、
+            // BaseDirectory::Resource 経由で解決する (#19)。resolve 自体は path 構築
+            // だけで存在検証はしないので通常 err にはならない。万一失敗しても discover
+            // は read_dir で無害な空リストを返して観測面 (list_triggers) にエラーが出る。
+            let triggers_dir = match app.path().resolve("triggers", BaseDirectory::Resource) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("failed to resolve triggers resource dir: {e}");
+                    PathBuf::new()
+                }
+            };
             let triggers: TriggersRef =
                 Arc::new(discover_triggers(app.handle(), &triggers_dir, dev_mode));
             for t in triggers.iter() {

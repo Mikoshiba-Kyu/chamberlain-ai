@@ -208,6 +208,8 @@ dev モードは compile-time feature ではなく env-var 単独判定。「本
 
 起動時に `triggers/*/manifest.json` を走査し、各パッケージから `id`, `entry` を得る。同一の rustyscript Runtime に N モジュールをロードして保持する (V8 isolate は 1 つだけ)。
 
+トリガーディレクトリの位置は Tauri の resource dir 経由で解決する (#19)。エージェント開発者の `tauri.conf.json` に `bundle.resources: { "../triggers/": "triggers/" }` を宣言してもらうと、`tauri-build` (build.rs) が dev では `target/{debug,release}/triggers/` に、shipped では platform ごとの resource dir (Windows: exe と同居 / Linux: `/usr/lib/{name}/` or `${APPDIR}/usr/lib/{name}/` / macOS: `{name}.app/Contents/Resources/`) にコピーする。core は `app.path().resolve("triggers", BaseDirectory::Resource)` で常に統一的に解決する。エージェント開発者の app crate 側には dev/shipped の分岐コードが要らない。
+
 Runtime は V8 の thread affinity を守るため、専用の `std::thread` に閉じ込める。tokio 側からは `std::sync::mpsc` で tick 信号を送るだけ。JS 実行は常にこの 1 スレッド上で直列に行われる。
 
 失敗は隔離される: 1トリガーの load / instantiate / tick() が失敗しても、そのトリガーだけスキップされ、他は続行する。エラーは activity ストリームに `[error]` / `[load error]` / `[instantiate error]` プレフィックス付きで emit される。
@@ -459,6 +461,10 @@ AI 駆動トリガーは prompt / MD / スキーマ等のアセットを持ち�
 
 プロセスクラッシュ時の "at least once" を優先。1回多く言う > 忘れる。
 
+### トリガーの配置とパス解決 — Tauri resource dir に統一 (#19)
+
+`tauri.conf.json` の `bundle.resources` で `../triggers/` を宣言し、runtime は `app.path().resolve("triggers", BaseDirectory::Resource)` で解決。dev/shipped の分岐が消え、エージェント開発者の main.rs から `env!("CARGO_MANIFEST_DIR")` ハックが消えた。0.x publish 前に API 表面を薄くするため `ChamberlainConfig` を撤去し、`builder()` は引数なしに単純化した。
+
 ### 既知の gotcha
 
 新規に rustyscript / deno_core を導入する時に踏む可能性が高いので明記しておく。
@@ -474,10 +480,6 @@ AI 駆動トリガーは prompt / MD / スキーマ等のアセットを持ち�
 ### アセット読み込み API
 
 TS 側 (`index.ts`) から自パッケージ内のアセット (prompt.md、schema.json 等) を読み出す API。AI 駆動トリガーの実現に必須 (system prompt を .md に外出しできる、等)。想定形は `chamberlain.readAsset("system-prompt.md")` のような呼び口を TS 側に公開し、実装は Rust 側で deno_core の op として提供する形 (`chamberlain.getSecret` / `chamberlain.ai.complete` と同じレイヤ)。
-
-### shipped-app パス解決
-
-現在 `packages/core::builder(config)` は `triggers_dir: PathBuf` を受け取る形になっており、位置解決はエージェント開発者側 (app crate の `main.rs` / `lib.rs`) の責務。`examples/react` では `env!("CARGO_MANIFEST_DIR")` で app crate 相対に解決しているが、これは dev-only。プロダクション配布時にトリガー群をどう bundle するか (Tauri resource dir?) と、エージェント開発者トリガーとフレームワーク組込トリガーの分離、が論点。
 
 ### ホットリロード
 
