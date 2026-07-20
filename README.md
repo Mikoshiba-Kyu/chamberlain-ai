@@ -7,18 +7,35 @@
 - [`docs/architecture.md`](docs/architecture.md) — 今の骨格 (責務分割・契約・意思決定)
 - [`AGENTS.md`](AGENTS.md) — 共同開発者としての振る舞い方 (人間 / エージェント問わず)
 
+## 状態
+
+**0.x = unstable.** minor バージョンで破壊的変更を入れます (Rust / npm どちらの 0.x 慣行にも沿う)。破壊的変更を semver で明文化する契約・CHANGELOG 規律・1.0 昇格の判断は 1.0 手前で別途扱います (#10 のスコープ外)。
+
 ## レポ構造 (概略)
 
 ```
 packages/
-  core/                       # フレームワーク本体 (Rust クレート)
-  create-chamberlain/         # scaffold CLI (段階A、publish なし)
+  core/                            # フレームワーク本体 (Rust クレート)
+                                   #   → crates.io: chamberlain-core
+  create-chamberlain/              # scaffold CLI
+                                   #   → npm: create-chamberlain
+    templates/react/               # React テンプレ (CLI に同梱、version 依存で配布)
 examples/
-  react/                      # 常設プレイグラウンド (フル Tauri + React アプリ)
-docs/                         # 設計文書
+  react/                           # フレームワーク開発者向けの常設プレイグラウンド
+                                   #   (path 依存、workspace 内で dev サイクルに使う)
+docs/                              # 設計文書
 ```
 
 詳細は `docs/architecture.md` の「レポ構造 (workspace)」節。
+
+### `templates/react` と `examples/react` の関係
+
+役割が違うので併存させています:
+
+- **`examples/react`** — フレームワーク開発者用。`chamberlain-core` を `path` で参照し、workspace 内で `pnpm tauri dev` の日常サイクルに使う
+- **`packages/create-chamberlain/templates/react`** — エージェント開発者に配布する雛形。`chamberlain-core = "0.1"` の version 依存で書かれ、`create-chamberlain` が npm パッケージに同梱する
+
+**同期ルール**: どちらか一方の shape (トリガー構成、UI パネル、Cargo/pnpm 設定) を変更したら、もう一方にも手で反映してください。テンプレの Cargo.toml / tauri.conf.json は placeholder な既定値 (`chamberlain-app`, `Chamberlain App`, `com.example.chamberlain-app` 等) にしてあり、scaffold 時に `create-chamberlain` の CLI が実 name に書き換えます。
 
 ## 前提
 
@@ -39,16 +56,21 @@ pnpm tauri dev
 
 `packages/core` を触ると workspace 経由で自動反映される。`examples/react` が **フレームワーク開発者の日常サイクル用の常設プレイグラウンド**。DevContainer からでも WSLg 経由で窓が Windows 側に描画される (詳細は下記「DevContainer」節)。
 
-### scaffold の設計検証 (時々)
+### scaffold の動作検証 (時々)
 
-「別プロジェクトから core を呼び出しても動くか」を確かめたいときに:
+publish された `create-chamberlain` のふるまいを確認したいとき:
 
 ```
-pnpm scaffold:create     # $HOME/.chamberlain-scaffold-check に生成
-pnpm scaffold:clean      # 生成物を削除
+node packages/create-chamberlain/bin/create.js /tmp/chamberlain-scaffold-check
 ```
 
-生成物は使い捨て。フレームワーク開発の日常サイクルには使わない (それは `examples/react` の仕事)。詳細は #9 のクローズコメント参照。
+生成物は使い捨て。フレームワーク開発の日常サイクルには使わない (それは `examples/react` の仕事)。**publish 前は生成物の `cargo check` が「`chamberlain-core = "0.1"` が crates.io に無い」で失敗するのが正常** — テンプレは配布状態を前提に書かれています。
+
+publish 済みの使い方 (エージェント開発者向け):
+
+```
+npm create chamberlain@latest my-secretary
+```
 
 ## API キー・シークレットの投入
 
@@ -74,7 +96,7 @@ CHAMBERLAIN_SECRET_GITHUB_TOKEN=ghp_...
 
 env-var が設定されていれば keyring より優先。設定されていなければ従来通り keyring を使う。`.env` / `.env.local` / `.env.*.local` は `.gitignore` 済み。
 
-**scaffold で作った外部プロジェクトを使うとき** (`pnpm scaffold:create` 後) は、生成先ディレクトリの中に `.env` を置く (workspace root からは cwd 的に届かないため)。
+**scaffold で作った外部プロジェクトを使うとき** (`npm create chamberlain` 後、または `node packages/create-chamberlain/bin/create.js` で作った場合) は、生成先ディレクトリの中に `.env` を置く (workspace root からは cwd 的に届かないため)。テンプレには `.env.example` が同梱されているのでコピーして値を埋める。
 
 ## DevContainer
 

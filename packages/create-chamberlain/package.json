@@ -1,12 +1,37 @@
 {
   "name": "create-chamberlain",
-  "private": true,
-  "version": "0.0.0",
-  "description": "Chamberlain の scaffold CLI (段階A・publish なし)",
+  "version": "0.1.0",
+  "description": "Scaffold a new Chamberlain agent app (常駐する秘書エージェント / Tauri desktop)",
   "type": "module",
   "bin": {
     "create-chamberlain": "bin/create.js"
   },
+  "files": [
+    "bin/create.js",
+    "templates",
+    "README.md",
+    "LICENSE-MIT",
+    "LICENSE-APACHE"
+  ],
+  "keywords": [
+    "chamberlain",
+    "agent",
+    "tauri",
+    "scaffold",
+    "create-app",
+    "assistant"
+  ],
+  "author": "Mikoshiba-Kyu",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Mikoshiba-Kyu/chamberlain-ai.git",
+    "directory": "packages/create-chamberlain"
+  },
+  "bugs": {
+    "url": "https://github.com/Mikoshiba-Kyu/chamberlain-ai/issues"
+  },
+  "homepage": "https://github.com/Mikoshiba-Kyu/chamberlain-ai#readme",
   "engines": {
     "node": ">=20"
   }

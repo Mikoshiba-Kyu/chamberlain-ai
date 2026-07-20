@@ -1,123 +1,146 @@
 #!/usr/bin/env node
-// examples/react を種にして、workspace の *外* に単体プロジェクトを生成する。
-// 目的は #9 の「別プロジェクトから core を呼び出しても動くか」検証のみ。
-// publish されるまでは path 依存が絶対パスなので、生成物は使い捨て。
+// create-chamberlain: Chamberlain の scaffold CLI。
+// 使い方:
+//   npm create chamberlain            # target/name を対話的に決める代わりに引数で
+//   npm create chamberlain <target>
+//   npm create chamberlain <target> --template react
+//   npm create chamberlain <target> <name>
+//   npm create chamberlain <target> <name> --template react
+//
+// テンプレは同梱の templates/<name>/ をコピーし、project 固有の name/identifier を
+// 書き換えるだけの薄い CLI。Vue 版などのスタックが増えたら templates/ に並べる。
 
-import { cp, readFile, writeFile } from "node:fs/promises";
+import { cp, readFile, readdir, rename, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-// packages/create-chamberlain/bin -> workspace root
-const workspaceRoot = path.resolve(__dirname, "..", "..", "..");
-const templateDir = path.join(workspaceRoot, "examples", "react");
-const coreDir = path.join(workspaceRoot, "packages", "core");
+// packages/create-chamberlain/bin -> packages/create-chamberlain
+const packageRoot = path.resolve(__dirname, "..");
+const templatesRoot = path.join(packageRoot, "templates");
 
 // --- args ---
-// usage: create.js [target-dir] [project-name]
-const [targetArg, nameArg] = process.argv.slice(2);
+const { positional, options } = parseArgs(process.argv.slice(2));
+const [targetArg, nameArg] = positional;
 
-// デフォルト生成先は $HOME/.chamberlain-scaffold-check。
-// 意図的に workspace の外に置く: Cargo/pnpm workspace の解決で
-// 「同居によるごまかし」を再生産しないため。
-const targetDir = path.resolve(
-  targetArg ?? path.join(homedir(), ".chamberlain-scaffold-check"),
-);
-
-const projectName = sanitizeName(
-  nameArg ?? deriveNameFromDir(targetDir) ?? "chamberlain-scaffold-check",
-);
-const projectLibName = projectName.replaceAll("-", "_") + "_lib";
-
-// --- guards ---
-if (
-  targetDir === workspaceRoot ||
-  targetDir.startsWith(workspaceRoot + path.sep)
-) {
-  console.error(
-    `refusing to scaffold inside the source workspace: ${targetDir}`,
-  );
-  console.error(
-    `pick a location outside ${workspaceRoot} so path deps prove out end-to-end.`,
-  );
-  process.exit(1);
+if (!targetArg) {
+  usage("target directory is required");
 }
 
+const template = options.template ?? "react";
+const templateDir = path.join(templatesRoot, template);
+if (!existsSync(templateDir)) {
+  const available = (await listTemplates()).join(", ") || "(none)";
+  usage(`unknown template: "${template}" (available: ${available})`);
+}
+
+const targetDir = path.resolve(targetArg);
+const projectName = sanitizeName(nameArg ?? path.basename(targetDir));
+const projectLibName = projectName.replaceAll("-", "_") + "_lib";
+const projectIdentifier = `com.example.${projectName.replaceAll("-", "_")}`;
+
+// --- guards ---
 if (existsSync(targetDir)) {
   console.error(`target already exists: ${targetDir}`);
-  console.error(`run: pnpm scaffold:clean`);
   process.exit(1);
 }
 
 // --- copy ---
-const SKIP = new Set([
-  "node_modules",
-  "dist",
-  "target",
-  "gen",
-  ".DS_Store",
-]);
-
-await cp(templateDir, targetDir, {
-  recursive: true,
-  filter: (src) => {
-    const base = path.basename(src);
-    if (SKIP.has(base)) return false;
-    if (base.endsWith(".tsbuildinfo")) return false;
-    return true;
-  },
-});
+await cp(templateDir, targetDir, { recursive: true });
 
 // --- transforms ---
+await renameDotfiles();
 await transformCargoToml();
 await transformMainRs();
 await transformTauriConf();
 await transformPackageJson();
-await writeGitignore();
 
 console.log("");
 console.log(`scaffolded ${projectName} at ${targetDir}`);
 console.log("");
 console.log("next:");
-console.log(`  cd ${targetDir}`);
+console.log(`  cd ${path.relative(process.cwd(), targetDir) || "."}`);
 console.log("  pnpm install");
 console.log("  pnpm tauri dev");
 console.log("");
-console.log("cleanup (from source repo):");
-console.log("  pnpm scaffold:clean");
+console.log(
+  "secrets: copy .env.example to .env and fill in your API keys, or use the Settings tab after launch.",
+);
 
 // --- helpers ---
+
+function parseArgs(argv) {
+  const positional = [];
+  const options = {};
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--template" || a === "-t") {
+      options.template = argv[++i];
+    } else if (a.startsWith("--template=")) {
+      options.template = a.slice("--template=".length);
+    } else if (a === "--help" || a === "-h") {
+      usage();
+    } else if (a.startsWith("-")) {
+      usage(`unknown option: ${a}`);
+    } else {
+      positional.push(a);
+    }
+  }
+  return { positional, options };
+}
+
+function usage(msg) {
+  if (msg) console.error(`error: ${msg}\n`);
+  console.error(
+    "usage: create-chamberlain <target-dir> [project-name] [--template <name>]",
+  );
+  console.error("");
+  console.error("options:");
+  console.error(
+    "  --template, -t <name>   template to use (default: react)",
+  );
+  console.error("");
+  process.exit(msg ? 1 : 0);
+}
+
+async function listTemplates() {
+  try {
+    const entries = await readdir(templatesRoot, { withFileTypes: true });
+    return entries.filter((e) => e.isDirectory()).map((e) => e.name);
+  } catch {
+    return [];
+  }
+}
+
+// npm publish は tarball から .gitignore を落とす (仕様)。テンプレ内では
+// `_gitignore` として保存しておき、scaffold 時に本来の名前に戻す。
+async function renameDotfiles() {
+  const from = path.join(targetDir, "_gitignore");
+  if (existsSync(from)) {
+    await rename(from, path.join(targetDir, ".gitignore"));
+  }
+}
 
 async function transformCargoToml() {
   const p = path.join(targetDir, "src-tauri", "Cargo.toml");
   let s = await readFile(p, "utf8");
-
-  s = s.replace(
-    /^name = "chamberlain-example-react"$/m,
-    `name = "${projectName}"`,
-  );
+  s = s.replace(/^name = "chamberlain-app"$/m, `name = "${projectName}"`);
   s = s.replace(
     /^description = ".*"$/m,
-    `description = "${projectName} — Chamberlain agent app (scaffolded via create-chamberlain)"`,
+    `description = "${projectName} — Chamberlain agent app"`,
   );
   s = s.replace(
-    /^name = "chamberlain_example_react_lib"$/m,
+    /^name = "chamberlain_app_lib"$/m,
     `name = "${projectLibName}"`,
   );
-  s = s.replace(
-    /^chamberlain-core = \{ path = "\.\.\/\.\.\/\.\.\/packages\/core" \}$/m,
-    `chamberlain-core = { path = "${toPosix(coreDir)}" }`,
-  );
-
   await writeFile(p, s);
 }
 
 async function transformMainRs() {
   const p = path.join(targetDir, "src-tauri", "src", "main.rs");
   let s = await readFile(p, "utf8");
-  s = s.replaceAll("chamberlain_example_react_lib", projectLibName);
+  s = s.replaceAll("chamberlain_app_lib", projectLibName);
   await writeFile(p, s);
 }
 
@@ -125,7 +148,7 @@ async function transformTauriConf() {
   const p = path.join(targetDir, "src-tauri", "tauri.conf.json");
   const conf = JSON.parse(await readFile(p, "utf8"));
   conf.productName = projectName;
-  conf.identifier = `dev.chamberlain.scaffold.${projectName.replaceAll("-", "_")}`;
+  conf.identifier = projectIdentifier;
   if (conf.app?.windows?.[0]) {
     conf.app.windows[0].title = projectName;
   }
@@ -139,18 +162,6 @@ async function transformPackageJson() {
   await writeFile(p, JSON.stringify(pkg, null, 2) + "\n");
 }
 
-async function writeGitignore() {
-  const body = [
-    "node_modules",
-    "dist",
-    "*.tsbuildinfo",
-    "src-tauri/target",
-    "src-tauri/gen",
-    "",
-  ].join("\n");
-  await writeFile(path.join(targetDir, ".gitignore"), body);
-}
-
 function sanitizeName(raw) {
   const name = raw.toLowerCase().replace(/^\.+/, "");
   if (!/^[a-z][a-z0-9-]*$/.test(name)) {
@@ -160,13 +171,4 @@ function sanitizeName(raw) {
     process.exit(1);
   }
   return name;
-}
-
-function deriveNameFromDir(dir) {
-  const base = path.basename(dir).replace(/^\.+/, "");
-  return base || null;
-}
-
-function toPosix(p) {
-  return p.split(path.sep).join("/");
 }

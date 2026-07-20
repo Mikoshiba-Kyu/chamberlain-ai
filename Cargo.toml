@@ -3,4 +3,10 @@ members = [
     "packages/core",
     "examples/react/src-tauri",
 ]
+# NOTE: templates/ 配下は create-chamberlain の同梱リソース。cargo は workspace
+# root 以下の Cargo.toml を virtual member として拾おうとするので、明示的に外す。
+# テンプレ自体は crates.io から chamberlain-core を version 依存で拾う独立プロジェクト。
+exclude = [
+    "packages/create-chamberlain/templates",
+]
 resolver = "2"

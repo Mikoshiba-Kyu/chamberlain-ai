@@ -1,0 +1,9 @@
+{
+  "id": "greeter-noon",
+  "name": "昼の挨拶",
+  "description": "毎朝 10:00 にこんにちはと言う。#18 wall-clock schedule DSL の実運用サンプル",
+  "version": "0.1.0",
+  "author": "chamberlain",
+  "entry": "index.ts",
+  "schedule": "@daily 10:00"
+}

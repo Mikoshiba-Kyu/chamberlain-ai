@@ -4,6 +4,24 @@ version = "0.1.0"
 description = "Chamberlain framework core: heartbeat tick, trigger discovery, JS runtime host, state store, OS notification, tray"
 authors = ["Mikoshiba-Kyu"]
 edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Mikoshiba-Kyu/chamberlain-ai"
+homepage = "https://github.com/Mikoshiba-Kyu/chamberlain-ai"
+documentation = "https://docs.rs/chamberlain-core"
+readme = "README.md"
+keywords = ["chamberlain", "agent", "tauri", "assistant", "desktop"]
+categories = ["gui", "development-tools"]
+# NOTE: 明示 include。deno_core の `extension!` マクロが `src/bootstrap.js` を
+# コンパイル時に取り込むため、デフォルトの Cargo publish include (src/**/*.rs) には
+# 載らない .js を明示的に含める必要がある。LICENSE-* も同様。
+include = [
+    "src/**/*.rs",
+    "src/**/*.js",
+    "Cargo.toml",
+    "README.md",
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+]
 
 # NOTE: 意図的に `crate-type` を指定しない (デフォルト `rlib`)。`cdylib` は V8
 # (rustyscript 経由) の TLS relocation (R_X86_64_TPOFF32 against

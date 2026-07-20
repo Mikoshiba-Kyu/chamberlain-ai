@@ -1,0 +1,27 @@
+[package]
+name = "chamberlain-app"
+version = "0.1.0"
+description = "Chamberlain agent app (scaffolded via create-chamberlain)"
+edition = "2021"
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "chamberlain_app_lib"
+# NOTE: `cdylib` は V8 (rustyscript 経由、chamberlain-core が依存) の TLS relocation
+# (R_X86_64_TPOFF32 against v8::internal::g_current_isolate_) と衝突するため外している。
+# モバイル向けにはいずれ platform ごとの調整が必要。
+crate-type = ["staticlib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+# NOTE: プラグインは chamberlain-core からも使われるが、Tauri の build script は
+# app crate の *直接* 依存を辿って permission manifest を集めるため、ここでも
+# 直接依存として宣言する必要がある。
+tauri-plugin-notification = "2"
+tauri-plugin-store = "2"
+chamberlain-core = "0.1"
