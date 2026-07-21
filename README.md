@@ -14,6 +14,10 @@
 
 **English** | [日本語](README.ja.md)
 
+<p align="center">
+  <img src="./assets/brand/chamberlain-lockup.svg" alt="Chamberlain" height="56">
+</p>
+
 Chamberlain is a Tauri-based framework for building autonomous desktop applications that behave like a personal secretary, with minimal code on the developer's side.
 
 A Rust core runs in the background and executes each trigger on its schedule; developers write the schedule, decision logic, and notification behavior in JavaScript / TypeScript. Agent developers can start from a scaffold with `npm create chamberlain@latest`.

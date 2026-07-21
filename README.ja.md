@@ -14,6 +14,10 @@
 
 [English](README.md) | **日本語**
 
+<p align="center">
+  <img src="./assets/brand/chamberlain-lockup.svg" alt="Chamberlain" height="56">
+</p>
+
 Chamberlain は、秘書のように振る舞う自律型デスクトップアプリケーションを、開発者が最小限のコードで構築するための Tauri ベースのフレームワークです。
 
 Rust コアが常駐して各トリガーを定期的に実行し、開発者は JavaScript / TypeScript でスケジュール・判定ロジック・通知を記述します。エージェント開発者は `npm create chamberlain@latest` で雛形から始められます。

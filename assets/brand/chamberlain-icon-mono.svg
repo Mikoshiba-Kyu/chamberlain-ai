@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" width="96" height="96" role="img" aria-label="Chamberlain">
+  <title>Chamberlain</title>
+  <style>
+    .ink { fill: #1D1F26; }
+    @media (prefers-color-scheme: dark) {
+      .ink { fill: #E9E8E1; }
+    }
+  </style>
+  <path class="ink" d="M60 20.5A30 30 0 1 0 60 75.5L60 67.08A20 20 0 1 1 60 28.92Z"/>
+  <rect class="ink" x="4" y="45" width="72" height="6" rx="3"/>
+  <circle class="ink" cx="56" cy="48" r="6.5"/>
+</svg>

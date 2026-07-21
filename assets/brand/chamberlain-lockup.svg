@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 620 96" width="620" height="96" role="img" aria-label="Chamberlain">
+  <title>Chamberlain</title>
+  <style>
+    .ink { fill: #1D1F26; }
+    .brass { fill: #A78148; }
+    .divider { stroke: #1D1F26; stroke-opacity: 0.28; }
+    @media (prefers-color-scheme: dark) {
+      .ink { fill: #E9E8E1; }
+      .brass { fill: #C9A25D; }
+      .divider { stroke: #E9E8E1; }
+    }
+  </style>
+  <path class="ink" d="M60 20.5A30 30 0 1 0 60 75.5L60 67.08A20 20 0 1 1 60 28.92Z"/>
+  <rect class="ink" x="4" y="45" width="72" height="6" rx="3"/>
+  <circle class="brass" cx="56" cy="48" r="6.5"/>
+  <line class="divider" x1="112" y1="18" x2="112" y2="78" stroke-width="1"/>
+  <text class="ink" x="128" y="76" font-family="Inter, system-ui, -apple-system, 'Segoe UI', Roboto, Arial, sans-serif" font-size="80" font-weight="500" letter-spacing="-1.44">Chamberlain<tspan class="brass">.</tspan></text>
+</svg>
