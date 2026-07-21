@@ -12,14 +12,13 @@
 	// トリガー内 (rustyscript の V8) と UI (WebKitGTK) の両方が親プロセスの TZ を継承する。
 	// デフォルトの Etc/UTC のままだと greeter の `getHours()` や ActivityPanel の時刻表示が
 	// UTC になり、JST の昼に「夜遅くまで働いてる？」等の誤発火が起きる。
-	// UTC 圏の開発者は下の値を自分のタイムゾーン (例: America/Los_Angeles) に書き換え。
+	// host の TZ 環境変数を継承し、未設定なら Asia/Tokyo にフォールバック。
+	// 他の TZ で開発する場合はホスト側で `export TZ=America/Los_Angeles` 等を設定する
+	// (Windows は `setx TZ "America/Los_Angeles"`)。コミットには含めない運用。
 	// shipped Tauri アプリは端末 OS の TZ を使うので本番挙動には影響しない。
 	"containerEnv": {
-		"TZ": "Asia/Tokyo"
+		"TZ": "${localEnv:TZ:Asia/Tokyo}"
 	},
-
-	// Use 'forwardPorts' to make a list of ports inside the container available locally.
-	// "forwardPorts": [],
 
 	"postCreateCommand": "bash .devcontainer/postCreateCommand.sh",
 	"postStartCommand": "bash .devcontainer/postStartCommand.sh",
@@ -29,7 +28,11 @@
 		"vscode": {
 			"settings": {
 				"terminal.integrated.defaultProfile.linux": "zsh"
-			}
+			},
+			"extensions": [
+				"ms-azuretools.vscode-containers",
+				"tauri-apps.tauri-vscode"
+			]
 		}
 	},
 
