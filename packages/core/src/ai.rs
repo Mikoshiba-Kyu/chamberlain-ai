@@ -7,6 +7,8 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::LazyLock;
+use std::time::Duration;
 
 use deno_core::{op2, OpState};
 use deno_error::JsErrorBox;
@@ -18,6 +20,22 @@ pub const DEFAULT_MODEL: &str = "claude-sonnet-5";
 pub const DEFAULT_MAX_TOKENS: u32 = 4096;
 pub const ANTHROPIC_URL: &str = "https://api.anthropic.com/v1/messages";
 pub const ANTHROPIC_VERSION: &str = "2023-06-01";
+
+/// Anthropic Messages API 呼び出しの timeout。sonnet 系は通常 5–30s だが、
+/// max_tokens=4096 で長い応答を吐くと 60s 近くまで伸びる。90s を上限にする。
+/// これが無いと API 側 hang で worker の tick 全体が引きずられる (Issue #21 #2)。
+const ANTHROPIC_TIMEOUT_SECS: u64 = 90;
+
+/// Anthropic 用の reqwest Client を 1 個だけ持ち、connection pool と TLS session を
+/// 使い回す。以前は呼び出しごとに `Client::new()` していて TLS handshake が毎回
+/// 走っていた (Issue #21 #12)。build 失敗は起動時 (初回参照時) に panic するが、
+/// timeout 指定と rustls-tls feature の組合せで失敗する構成上の理由が無いので許容。
+static ANTHROPIC_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(ANTHROPIC_TIMEOUT_SECS))
+        .build()
+        .expect("failed to build reqwest client for Anthropic")
+});
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "lowercase")]
@@ -64,7 +82,6 @@ pub async fn complete(
     system: Option<&str>,
     messages: &[Message],
 ) -> Result<String, String> {
-    let client = reqwest::Client::new();
     let body = RequestBody {
         model: model.unwrap_or(DEFAULT_MODEL),
         max_tokens: DEFAULT_MAX_TOKENS,
@@ -72,7 +89,7 @@ pub async fn complete(
         messages,
     };
 
-    let response = client
+    let response = ANTHROPIC_CLIENT
         .post(ANTHROPIC_URL)
         .header("x-api-key", api_key)
         .header("anthropic-version", ANTHROPIC_VERSION)

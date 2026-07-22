@@ -31,11 +31,21 @@ pub mod store {
     }
 
     /// name を env var 名に変換する。`github_token` -> `CHAMBERLAIN_SECRET_GITHUB_TOKEN`。
+    ///
+    /// env var 名として有効な `[A-Z0-9_]` 以外の文字 (`-` / `.` / 空白 / 多バイト文字等) は
+    /// すべて `_` に丸める。旧実装は `-` だけを潰していたため、`github.token` のような
+    /// 名前で env fallback が silent に効かなかった (Issue #21 #11)。
     fn env_var_name(name: &str) -> String {
-        format!(
-            "CHAMBERLAIN_SECRET_{}",
-            name.to_uppercase().replace('-', "_")
-        )
+        let mut out = String::with_capacity("CHAMBERLAIN_SECRET_".len() + name.len());
+        out.push_str("CHAMBERLAIN_SECRET_");
+        for c in name.chars() {
+            if c.is_ascii_alphanumeric() {
+                out.push(c.to_ascii_uppercase());
+            } else {
+                out.push('_');
+            }
+        }
+        out
     }
 
     /// 未設定 (NoEntry) は `Ok(None)`、その他のエラーは `Err`。
@@ -68,6 +78,41 @@ pub mod store {
             Ok(()) => Ok(()),
             Err(Error::NoEntry) => Ok(()),
             Err(e) => Err(e),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::env_var_name;
+
+        #[test]
+        fn env_var_name_basic() {
+            assert_eq!(
+                env_var_name("anthropic_api_key"),
+                "CHAMBERLAIN_SECRET_ANTHROPIC_API_KEY"
+            );
+        }
+
+        #[test]
+        fn env_var_name_replaces_non_alnum() {
+            assert_eq!(
+                env_var_name("github-token"),
+                "CHAMBERLAIN_SECRET_GITHUB_TOKEN"
+            );
+            assert_eq!(
+                env_var_name("github.token"),
+                "CHAMBERLAIN_SECRET_GITHUB_TOKEN"
+            );
+            assert_eq!(
+                env_var_name("github token"),
+                "CHAMBERLAIN_SECRET_GITHUB_TOKEN"
+            );
+        }
+
+        #[test]
+        fn env_var_name_multibyte() {
+            // マルチバイト char (JIS 用途で名前をつける事故想定) も 1 char = 1 `_` に潰す
+            assert_eq!(env_var_name("トークン"), "CHAMBERLAIN_SECRET_____");
         }
     }
 }

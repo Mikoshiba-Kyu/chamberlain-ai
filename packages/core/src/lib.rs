@@ -123,14 +123,22 @@ type TriggersRef = Arc<Vec<TriggerInfo>>;
 
 /// UI が受け取るトリガー一覧の要素。manifest 由来 + 現在の paused 状態 +
 /// framework が持っている「次発火予定時刻」+ 起動時 discovery で見つかった構成エラー。
-/// nextFireAt は「前回 fire から schedule 経過した時刻」で、初回 (まだ fire していない)
-/// と error 有りは None を返す。
+///
+/// `nextFireAt` の意味論は `scheduleType` で分岐する (Issue #21 #8):
+/// - `"interval"`: `last_fire + duration`。過去値になり得る (missed-fire を catch-up する
+///   ポリシーなので、「本来ここで fire するはずだった」= 遅延中の意味を持つ)
+/// - `"wall-clock"`: 「今から見て次の予定時刻」で常に未来 (missed-fire は skip する)
+///
+/// UI は type を見て「遅延中バッジ」を出す/出さないを判断する。両者の非対称は
+/// missed-fire policy の設計 (interval catch-up / wall-clock skip) に由来する。
 #[derive(Serialize)]
 struct TriggerListItem {
     id: String,
     name: String,
     description: Option<String>,
     paused: bool,
+    #[serde(rename = "scheduleType")]
+    schedule_type: &'static str,
     #[serde(rename = "nextFireAt")]
     next_fire_at: Option<u64>,
     /// schedule パース失敗 / 下限違反等、discovery 時点で見つかった構成エラー。
@@ -166,16 +174,18 @@ fn register_aumid(app_id: &str, display_name: &str) {
 fn send_notification(app: &AppHandle, title: &str, body: &str) {
     let notification = app.notification();
 
-    let granted = match notification.permission_state() {
-        Ok(PermissionState::Granted) => true,
-        Ok(_) => matches!(notification.request_permission(), Ok(PermissionState::Granted)),
-        Err(_) => false,
-    };
-
-    if granted {
-        let _ = notification.builder().title(title).body(body).show();
-    } else {
-        eprintln!("notification permission not granted");
+    // permission dialog は builder().setup 側で main thread から先んじて叩いておく
+    // (Issue #21 #9)。ここで request_permission() を呼ぶと worker thread から OS
+    // ダイアログが上がり、そのブロッキングで tick 全体が固まる可能性がある。
+    // 未取得のまま呼ばれた場合は静かに skip する (activity には出さない: 通知 UI と
+    // 二重に見えて煩わしい)。
+    match notification.permission_state() {
+        Ok(PermissionState::Granted) => {
+            let _ = notification.builder().title(title).body(body).show();
+        }
+        _ => {
+            eprintln!("notification permission not granted; skipping");
+        }
     }
 }
 
@@ -253,27 +263,44 @@ fn read_fire_times(app: &AppHandle) -> BTreeMap<String, u64> {
         .unwrap_or_default()
 }
 
-fn write_fire_time(app: &AppHandle, trigger_id: &str, ts: u64) {
+/// `__meta__` の fire_times に複数エントリをまとめて書き込む。tick 中に fire した
+/// 全トリガー分と、worker 起動時 seed の全 wall-clock 分をそれぞれ 1 回の
+/// read-modify-write + fsync で捌く (Issue #21 #7 / #13)。
+///
+/// `__meta__` が何らかの理由で JSON object でなくなっていた場合は fresh object で
+/// 上書きする。旧実装は `.expect()` で worker を silent death させていた (#21 #1)。
+fn write_fire_times_batch(app: &AppHandle, updates: &BTreeMap<String, u64>) {
+    if updates.is_empty() {
+        return;
+    }
     match app.store(STATE_STORE_FILE) {
         Ok(store) => {
             let mut meta = store
                 .get(META_NAMESPACE)
                 .unwrap_or_else(|| serde_json::json!({}));
-            let map = meta
-                .as_object_mut()
-                .expect("__meta__ namespace should be a JSON object");
+            if !meta.is_object() {
+                eprintln!(
+                    "__meta__ namespace was not a JSON object; resetting (was: {})",
+                    meta
+                );
+                meta = serde_json::json!({});
+            }
+            // is_object() を通過したので as_object_mut() は必ず Some。
+            let map = meta.as_object_mut().expect("meta is object");
             let mut fire_times: BTreeMap<String, u64> = map
                 .get(META_FIRE_TIMES_KEY)
                 .and_then(|v| serde_json::from_value(v.clone()).ok())
                 .unwrap_or_default();
-            fire_times.insert(trigger_id.to_string(), ts);
+            for (id, ts) in updates {
+                fire_times.insert(id.clone(), *ts);
+            }
             map.insert(
                 META_FIRE_TIMES_KEY.to_string(),
                 serde_json::to_value(&fire_times).unwrap_or(serde_json::json!({})),
             );
             store.set(META_NAMESPACE, meta);
             if let Err(e) = store.save() {
-                eprintln!("failed to persist fire_time for {trigger_id}: {e}");
+                eprintln!("failed to persist fire_times: {e}");
             }
         }
         Err(e) => eprintln!("failed to open state store for meta write: {e}"),
@@ -398,6 +425,13 @@ fn discover_triggers(app: &AppHandle, triggers_dir: &Path, dev_mode: bool) -> Ve
         });
     }
 
+    // sort → dedup の順にしないと、id 重複時にどちらが生き残るかが read_dir 順
+    // (filesystem 順) 依存で非決定になる (Issue #21 #6)。id 昇順にしてから先勝ちなら、
+    // 「同じ id が複数ある時は最初に見つかった dir が勝つ」が dir 名の辞書順で決まる。
+    // ソートキーは manifest.id なので dir 名で完全に決まる訳ではないが、少なくとも
+    // 同じ input からは同じ結果が出る。
+    result.sort_by(|a, b| a.manifest.id.cmp(&b.manifest.id));
+
     let mut seen = HashSet::new();
     let mut deduped: Vec<TriggerInfo> = Vec::new();
     for t in result {
@@ -407,8 +441,6 @@ fn discover_triggers(app: &AppHandle, triggers_dir: &Path, dev_mode: bool) -> Ve
             eprintln!("duplicate trigger id '{}', skipping", t.manifest.id);
         }
     }
-
-    deduped.sort_by(|a, b| a.manifest.id.cmp(&b.manifest.id));
     deduped
 }
 
@@ -502,24 +534,31 @@ fn spawn_trigger_worker(
         // `next_scheduled_after(last) <= now` で判定するので、これで missed-fire
         // (例: @daily 09:00 のアプリを 10:00 に起動 → 今日の 09:00 は捨てて明日 09:00 を待つ) を
         // skip できる。interval は「初回即発火」のセマンティクスを維持するため seed しない。
+        //
+        // per-trigger の write は使わず、1 回の RMW+fsync にまとめる (Issue #21 #13)。
         {
             let startup_now = now_millis();
             let existing = read_fire_times(&app_for_worker);
+            let mut seed_updates: BTreeMap<String, u64> = BTreeMap::new();
             for (idx, _) in &loaded {
                 let trigger = &triggers[*idx];
                 let id = &trigger.manifest.id;
                 if matches!(trigger.schedule, Schedule::WallClock(_)) && !existing.contains_key(id)
                 {
-                    write_fire_time(&app_for_worker, id, startup_now);
+                    seed_updates.insert(id.clone(), startup_now);
                 }
             }
+            write_fire_times_batch(&app_for_worker, &seed_updates);
         }
 
         while tick_rx.recv().is_ok() {
             let now = now_millis();
-            // 心拍の頭で一括で読み、以降は per-trigger で個別に write する。
+            // 心拍の頭で一括で読み、tick 末に 1 回だけ書く (Issue #21 #7)。
             // 同一 tick 内で先に fire したトリガーの fire_time は次 tick 以降で反映される。
+            // interval 下限 (5m / dev 10s) > tick 間隔 (1m / dev 10s) なので同 tick 二重発火は
+            // 起きず、この 1 世代遅れは実害を持たない (Issue #21 #14)。
             let fire_times = read_fire_times(&app_for_worker);
+            let mut tick_updates: BTreeMap<String, u64> = BTreeMap::new();
             for (idx, handle) in &loaded {
                 let trigger = &triggers[*idx];
                 if trigger.paused.load(Ordering::Relaxed) {
@@ -579,8 +618,11 @@ fn spawn_trigger_worker(
                         emit_activity(&app_for_worker, id, format!("[error] {e}"));
                     }
                 }
-                write_fire_time(&app_for_worker, id, now);
+                // tick() が呼ばれたら常に更新 (エラー時も含む)。schedule を
+                // 「発火試行の頻度」に統一し、エラーで毎心拍リトライになるノイズを避ける。
+                tick_updates.insert(id.clone(), now);
             }
+            write_fire_times_batch(&app_for_worker, &tick_updates);
         }
     });
 
@@ -615,11 +657,16 @@ fn list_triggers(app: AppHandle, triggers: State<'_, TriggersRef>) -> Vec<Trigge
                     Schedule::WallClock(spec) => next_scheduled_after(now, spec, &t.tz),
                 }
             };
+            let schedule_type = match &t.schedule {
+                Schedule::Interval(_) => "interval",
+                Schedule::WallClock(_) => "wall-clock",
+            };
             TriggerListItem {
                 id: t.manifest.id.clone(),
                 name: t.manifest.name.clone(),
                 description: t.manifest.description.clone(),
                 paused: t.paused.load(Ordering::Relaxed),
+                schedule_type,
                 next_fire_at,
                 error: t.schedule_error.clone(),
             }
@@ -721,6 +768,20 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
                     .clone()
                     .unwrap_or_else(|| identifier.clone());
                 register_aumid(&identifier, &display_name);
+            }
+
+            // 通知の permission は main thread のここで 1 回だけ request しておく。
+            // 以後 worker から send_notification が呼ばれても request_permission に
+            // 落ちない (worker 側は permission_state だけ見る)。UX 上、初回起動時に
+            // 通知ダイアログが早めに出る方が自然でもある (Issue #21 #9)。
+            {
+                let notification = app.notification();
+                if !matches!(
+                    notification.permission_state(),
+                    Ok(PermissionState::Granted)
+                ) {
+                    let _ = notification.request_permission();
+                }
             }
 
             let open_item = MenuItem::with_id(app, "open", "Open Chamberlain", true, None::<&str>)?;

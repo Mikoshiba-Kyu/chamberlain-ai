@@ -36,7 +36,20 @@ fn load_history(app: &AppHandle) -> Vec<ChatMessage> {
     let value = store
         .get(CHAT_MESSAGES_KEY)
         .unwrap_or_else(|| serde_json::json!([]));
-    serde_json::from_value(value).unwrap_or_default()
+    match serde_json::from_value::<Vec<ChatMessage>>(value.clone()) {
+        Ok(msgs) => msgs,
+        Err(e) => {
+            // 破損を silent に消さず、別キーに退避してから空扱いにする。
+            // これを入れないと次の save で完全上書きされて復旧手段が消える。
+            let backup_key = format!("messages_corrupted_{}", crate::now_millis());
+            eprintln!(
+                "chat history parse error: {e}; preserving corrupt copy at '{backup_key}'"
+            );
+            store.set(&backup_key, value);
+            let _ = store.save();
+            Vec::new()
+        }
+    }
 }
 
 fn save_history(app: &AppHandle, msgs: &[ChatMessage]) -> Result<(), String> {
@@ -85,6 +98,10 @@ pub async fn chat_send(
     while history.len() > MAX_HISTORY {
         history.remove(0);
     }
+
+    // AI 呼び出し前に user メッセージを永続化。API キー未設定や API 側の失敗で
+    // `?` return したとき、ユーザーが送った文言まで巻き添えで消えるのを防ぐ。
+    save_history(&app, &history)?;
 
     let ai_messages: Vec<ai::Message> = history
         .iter()

@@ -248,7 +248,11 @@ pub(crate) fn resolve_tz(name: Option<&str>) -> Result<Tz, String> {
 ///   2 回目が返ることは無い)
 /// - None (spring-forward) は該当日 / 該当時刻を飛ばして次候補を探索
 pub(crate) fn next_scheduled_after(after_ms: u64, spec: &WallClockSpec, tz: &Tz) -> Option<u64> {
-    let after_utc = DateTime::<chrono::Utc>::from_timestamp_millis(after_ms as i64)?;
+    // now_millis() が u64 なので、`as i64` だと u64::MAX 近辺の値が負値に化ける。
+    // 現実的な運用では発生しないが、破損した state store から巨大な値を読んだ場合の
+    // silent skip を避けるため try_from で早期に None に落とす (Issue #21 #15)。
+    let after_i64 = i64::try_from(after_ms).ok()?;
+    let after_utc = DateTime::<chrono::Utc>::from_timestamp_millis(after_i64)?;
     let local_after = after_utc.with_timezone(tz);
 
     match spec {
@@ -337,12 +341,14 @@ pub(crate) fn next_scheduled_after(after_ms: u64, spec: &WallClockSpec, tz: &Tz)
 
 /// NaiveDateTime (local wall-clock) を tz で解決して ms since epoch (UTC) を返す。
 /// Ambiguous (fall-back) は earlier を採用、None (spring-forward gap) は None を返す。
+/// pre-epoch (1970 以前) は返り値 u64 に載らないので None (Issue #21 #10)。
 fn pick_earlier_utc(tz: &Tz, naive: &NaiveDateTime) -> Option<u64> {
-    match tz.from_local_datetime(naive) {
-        MappedLocalTime::Single(dt) => Some(dt.timestamp_millis() as u64),
-        MappedLocalTime::Ambiguous(earlier, _) => Some(earlier.timestamp_millis() as u64),
-        MappedLocalTime::None => None,
-    }
+    let dt = match tz.from_local_datetime(naive) {
+        MappedLocalTime::Single(dt) => dt,
+        MappedLocalTime::Ambiguous(earlier, _) => earlier,
+        MappedLocalTime::None => return None,
+    };
+    u64::try_from(dt.timestamp_millis()).ok()
 }
 
 #[cfg(test)]
