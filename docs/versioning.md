@@ -86,6 +86,90 @@ bump 内容の決定とタグを打つ判断は自動化しません。「今回
 
 Release ノートは `CHANGELOG.md` の該当バージョンの節がそのまま使われます。節が見つからない場合は自動生成にフォールバックし、warning を出します。
 
+### 作業手順
+
+`X.Y.Z` を出すバージョンに読み替えてください。
+
+**1. bump ブランチを切る**
+
+```bash
+git checkout main && git pull
+git checkout -b release/X.Y.Z
+```
+
+**2. `CHANGELOG.md` を更新する**
+
+- `## [Unreleased]` の内容を `## [X.Y.Z] - YYYY-MM-DD` として切り出す
+- 空の `## [Unreleased]` は残す
+- 末尾のリンク定義を更新する (`[Unreleased]` の compare 範囲と `[X.Y.Z]` の行)
+
+**3. version を bump する**
+
+「バージョンを持つ箇所」節のとおり、以下を `X.Y.Z` にします。
+
+- `packages/core/Cargo.toml`
+- `packages/create-chamberlain/package.json`
+- `package.json` (ルート)
+
+**minor bump のときは** `packages/create-chamberlain/templates/react/src-tauri/Cargo.toml` の `chamberlain-core = "0.X"` も同時に更新します (patch bump では不要 — `"0.1"` は 0.1.x に一致するため)。
+
+**4. `Cargo.lock` を更新する**
+
+```bash
+cargo check -p chamberlain-core
+```
+
+**5. PR を出してマージする**
+
+```bash
+git add -A && git commit -m "chore(release): X.Y.Z"
+git push -u origin release/X.Y.Z
+gh pr create --title "chore(release): X.Y.Z" --body "..."
+```
+
+CI (`ci.yml`) が緑になったらマージします。ここで `--dry-run` が通ることを確認しているので、以降は失敗しにくくなります。
+
+**6. タグを打つ**
+
+```bash
+git checkout main && git pull
+git tag -a vX.Y.Z -m "chamberlain-core X.Y.Z / create-chamberlain X.Y.Z"
+git push origin vX.Y.Z
+```
+
+**7. Release workflow を見守る**
+
+```bash
+gh run watch
+```
+
+**8. 結果を確認する**
+
+- <https://crates.io/crates/chamberlain-core>
+- <https://www.npmjs.com/package/create-chamberlain>
+- `gh release view vX.Y.Z`
+
+### 失敗したときの対処
+
+**publish は取り消せません。** どの段階で落ちたかで対処が変わります。
+
+| 落ちた job | 状態 | 対処 |
+| --- | --- | --- |
+| `verify` | 何も publish されていない | タグを消して直す (下記)。安全 |
+| `publish-crate` | 何も publish されていない | 原因を直し、タグを消して打ち直す |
+| `publish-npm` | **core だけ publish 済み** | Actions の **Re-run failed jobs** を使う。全体を re-run すると `cargo publish` が `already exists` で落ちる |
+| `github-release` | 両方 publish 済み | 同上、または `gh release create` を手で実行 |
+
+タグを打ち直す場合:
+
+```bash
+git push origin --delete vX.Y.Z
+git tag -d vX.Y.Z
+# 修正して PR → マージ後、改めてタグを打つ
+```
+
+**既に publish された version 番号は再利用できません。** `publish-crate` が成功した後にやり直しが必要になったら、次の patch version で出し直してください (crates.io は yank しかできず、npm も 72 時間以内の unpublish のみです)。
+
 ### Trusted Publishing
 
 publish の認証は crates.io / npm 双方の Trusted Publishing (OIDC) を使い、トークンも 2FA も CI に持たせません。レジストリ側には以下を登録しています。
