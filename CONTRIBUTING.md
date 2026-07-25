@@ -94,6 +94,10 @@ node packages/create-chamberlain/bin/create.js /tmp/chamberlain-scaffold-check
 
 いずれも Windows 実機ビルドでは出ません。
 
+## バージョンとリリース
+
+バージョニング (lockstep)、0.x のセマンティクス、1.0 の定義、タグ・ブランチ規約、publish 手順は [`docs/versioning.md`](docs/versioning.md) にまとまっています。ブランチを切る前とリリース作業の前に確認してください。
+
 ## Issue と設計論点
 
 進行中の設計論点・タスクは GitHub Issues で追跡しています。`gh issue list` を見るのが一次情報です。「未確定の論点」の全体像は [`docs/architecture.md`](docs/architecture.md) の同名節にまとまっています。
