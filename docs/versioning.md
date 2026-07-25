@@ -71,12 +71,29 @@ main                    ← 常にリリース可能。直 push は禁止 (PR �
 
 ## リリース手順
 
-1. CHANGELOG.md を更新する (Keep a Changelog 形式)
-2. 上記「バージョンを持つ箇所」を bump し、PR で main にマージする
-3. `cargo publish -p chamberlain-core --dry-run` と `npm publish --dry-run` (create-chamberlain) で成果物を確認する
-4. **`chamberlain-core` を先に publish する**
-5. **その後で `create-chamberlain` を publish する**
-6. `vX.Y.Z` を annotated tag で打ち、push して GitHub Release を作る
+[`.github/workflows/release.yml`](../.github/workflows/release.yml) が `vX.Y.Z` タグの push を起点に publish します。人がやるのは bump とタグを打つ判断だけです。
+
+| | 誰が | 何を |
+| --- | --- | --- |
+| 1 | 人 | `CHANGELOG.md` を更新し、上記「バージョンを持つ箇所」を bump して PR で main へ |
+| 2 | CI | PR 上で `--dry-run` を回す ([`ci.yml`](../.github/workflows/ci.yml)) |
+| 3 | 人 | `git tag -a vX.Y.Z && git push origin vX.Y.Z` |
+| 4 | CI | タグと各マニフェストの version 一致を検証 → `chamberlain-core` publish → `create-chamberlain` publish → GitHub Release 作成 |
+
+dry-run をタグ後ではなく **PR 時点で** 回すのは、publish が事実上取り消せないためです (crates.io は yank しかできず、npm も 72 時間以内の unpublish のみ)。タグを打った後に壊れていると分かっても手遅れなので、検証はマージ前に済ませます。
+
+bump 内容の決定とタグを打つ判断は自動化しません。「今回は破壊的変更だから minor」は 0.x のセマンティクス上、機械には決められない判断です。
+
+Release ノートは `CHANGELOG.md` の該当バージョンの節がそのまま使われます。節が見つからない場合は自動生成にフォールバックし、warning を出します。
+
+### Trusted Publishing
+
+publish の認証は crates.io / npm 双方の Trusted Publishing (OIDC) を使い、トークンも 2FA も CI に持たせません。レジストリ側には以下を登録しています。
+
+- **crates.io** — repository + workflow filename (`release.yml`)
+- **npm** — organization/user + repository + workflow filename (`release.yml`)、allowed actions は `npm publish` のみ
+
+**`release.yml` はリネームしないでください。** workflow 名を変えるとレジストリ側の登録と一致せず、publish が失敗します。
 
 ### publish 順序を守る理由
 

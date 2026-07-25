@@ -1,0 +1,163 @@
+name: Release
+
+# vX.Y.Z タグの push が起点。バージョンを決めてタグを打つのは人の仕事で、
+# それ以降 (publish と GitHub Release 作成) をここで自動化する。
+# 手順の全体像は docs/versioning.md の「リリース手順」を参照。
+on:
+  push:
+    tags: ["v*"]
+
+# デフォルトは最小権限。各 job で必要なものだけ足す
+permissions:
+  contents: read
+
+jobs:
+  # publish は事実上取り消せない (crates.io は yank しかできず、npm も 72h 以内の
+  # unpublish のみ)。タグと各マニフェストの version がズレたまま走らせないよう、
+  # 何よりも先に検証する。
+  verify:
+    name: Verify versions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check tag against manifests
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          fail=0
+
+          core=$(grep -m1 '^version = ' packages/core/Cargo.toml | cut -d'"' -f2)
+          cli=$(node -p "require('./packages/create-chamberlain/package.json').version")
+
+          if [ "$tag" != "$core" ]; then
+            echo "::error::tag $tag != packages/core/Cargo.toml $core"
+            fail=1
+          fi
+          if [ "$tag" != "$cli" ]; then
+            echo "::error::tag $tag != create-chamberlain/package.json $cli"
+            fail=1
+          fi
+
+          # lockstep 運用の要。テンプレが同梱する chamberlain-core の依存指定を
+          # bump し忘れるのが最も起きやすいミスなので機械で止める
+          # (docs/versioning.md「バージョンを持つ箇所」)。
+          dep=$(grep -m1 '^chamberlain-core = ' \
+            packages/create-chamberlain/templates/react/src-tauri/Cargo.toml | cut -d'"' -f2)
+          case "$tag" in
+            0.*) want="${tag%.*}" ;;   # 0.2.1 → "0.2" (0.x では minor が破壊的変更の単位)
+            *)   want="${tag%%.*}" ;;  # 1.2.3 → "1"
+          esac
+          if [ "$dep" != "$want" ]; then
+            echo "::error::template dep chamberlain-core = \"$dep\" should be \"$want\""
+            fail=1
+          fi
+
+          exit $fail
+
+  publish-crate:
+    name: Publish chamberlain-core (crates.io)
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      # crates.io Trusted Publishing。OIDC token の発行に必要
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      # cargo publish はビルド検証を行うので、CI と同じネイティブ依存が必要
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+
+      # 短命トークンを発行する。job 終了時に post-step が自動で revoke する
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+
+      - name: cargo publish
+        run: cargo publish -p chamberlain-core
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+  publish-npm:
+    name: Publish create-chamberlain (npm)
+    # core より後に出す。テンプレが chamberlain-core を version 依存で参照している
+    # ので、逆順だと scaffold した人の cargo check が壊れる
+    # (docs/versioning.md「publish 順序を守る理由」)。
+    needs: publish-crate
+    runs-on: ubuntu-latest
+    permissions:
+      # npm Trusted Publishing。OIDC token の発行に必要
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      # Trusted Publishing (OIDC) は npm CLI 11.5.1 以降。Node 24 の同梱版では
+      # 足りないことがあるので明示的に上げる
+      - name: Ensure npm supports trusted publishing
+        run: |
+          npm install -g npm@latest
+          npm --version
+
+      # トークンも 2FA も渡さない。npm CLI が OIDC 環境を自動検出する
+      - name: npm publish
+        run: npm publish
+        working-directory: packages/create-chamberlain
+
+  github-release:
+    name: Create GitHub Release
+    needs: [publish-crate, publish-npm]
+    runs-on: ubuntu-latest
+    permissions:
+      # Release の作成に必要
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      # CHANGELOG.md の該当バージョンの節をそのまま Release ノートにする
+      # (docs/versioning.md「タグ」)。節が見つからなければ自動生成にフォールバック。
+      - name: Extract CHANGELOG section
+        id: notes
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '
+            $0 ~ "^## \\[" v "\\]" { flag = 1; next }
+            flag && /^## \[/ { exit }
+            flag { print }
+          ' CHANGELOG.md > notes.md
+
+          if [ -s notes.md ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::no CHANGELOG section for $version; falling back to generated notes"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ steps.notes.outputs.found }}" = "true" ]; then
+            gh release create "$GITHUB_REF_NAME" \
+              --title "$GITHUB_REF_NAME" \
+              --notes-file notes.md
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --title "$GITHUB_REF_NAME" \
+              --generate-notes
+          fi
