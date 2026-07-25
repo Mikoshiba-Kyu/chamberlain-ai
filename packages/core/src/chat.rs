@@ -42,9 +42,7 @@ fn load_history(app: &AppHandle) -> Vec<ChatMessage> {
             // 破損を silent に消さず、別キーに退避してから空扱いにする。
             // これを入れないと次の save で完全上書きされて復旧手段が消える。
             let backup_key = format!("messages_corrupted_{}", crate::now_millis());
-            eprintln!(
-                "chat history parse error: {e}; preserving corrupt copy at '{backup_key}'"
-            );
+            eprintln!("chat history parse error: {e}; preserving corrupt copy at '{backup_key}'");
             store.set(&backup_key, value);
             let _ = store.save();
             Vec::new()
