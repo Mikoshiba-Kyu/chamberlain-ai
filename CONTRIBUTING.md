@@ -109,6 +109,8 @@ pnpm --filter chamberlain-example-react build
 
 `cargo publish --dry-run` と `npm pack --dry-run` を PR 時点で回しているのは、crates.io / npm の publish が事実上取り消せないためです。`packages/core/Cargo.toml` の `include` を触ったときに壊れやすい箇所なので、マージ前に検出します。
 
+publish 自体は [`.github/workflows/release.yml`](.github/workflows/release.yml) が `vX.Y.Z` タグの push を起点に実行します。詳細は [`docs/versioning.md`](docs/versioning.md) の「リリース手順」を参照してください。
+
 ## バージョンとリリース
 
 バージョニング (lockstep)、0.x のセマンティクス、1.0 の定義、タグ・ブランチ規約、publish 手順は [`docs/versioning.md`](docs/versioning.md) にまとまっています。ブランチを切る前とリリース作業の前に確認してください。
