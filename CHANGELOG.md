@@ -6,6 +6,8 @@
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-07-25
+
 ### Fixed
 
 - 破損した `__meta__` で worker が silent death する経路を除去 (#21)
@@ -42,5 +44,6 @@
 - **モノレポ構成** — `packages/core` + `packages/create-chamberlain` + `examples/react` (#10, #11)
 - **サンプルトリガー** — `github-issues-count` (Type I の初実装, #15)
 
-[Unreleased]: https://github.com/Mikoshiba-Kyu/chamberlain-ai/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/Mikoshiba-Kyu/chamberlain-ai/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/Mikoshiba-Kyu/chamberlain-ai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Mikoshiba-Kyu/chamberlain-ai/releases/tag/v0.1.0
