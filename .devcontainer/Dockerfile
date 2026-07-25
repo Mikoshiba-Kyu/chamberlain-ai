@@ -90,6 +90,23 @@ RUN npm install -g \
         @google/gemini-cli
 
 # ─────────────────────────────────────────────────────────────────────────────
+# TypeScript Language Server（CLI エージェントの LSP 連携用）
+#   ルート package.json に typescript が無いため、global 版が fallback になる。
+#   ベースイメージ同梱版が build のたびに latest へ動かないよう固定する。
+# ─────────────────────────────────────────────────────────────────────────────
+RUN npm install -g \
+        typescript-language-server \
+        typescript@6
+
+# ─────────────────────────────────────────────────────────────────────────────
+# rust-analyzer（CLI エージェントの LSP 連携用）
+#   ~/.cargo/bin/rust-analyzer は proxy symlink が最初から在るため which では
+#   判別できない。component 未追加だと "Unknown binary" で落ちる。
+#   上の rustup ブロックと分けているのは cargo-xwin のキャッシュを守るため。
+# ─────────────────────────────────────────────────────────────────────────────
+RUN rustup component add rust-analyzer
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Claude Code（公式インストーラでネイティブバイナリを配置）
 # ─────────────────────────────────────────────────────────────────────────────
 RUN curl -fsSL https://claude.ai/install.sh | bash
