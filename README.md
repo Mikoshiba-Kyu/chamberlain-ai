@@ -38,6 +38,7 @@ See [`docs/getting-started.md`](docs/getting-started.md) for the full walkthroug
 - [`docs/overview.md`](docs/overview.md) — what this framework is for (vision, what/why)
 - [`docs/architecture.md`](docs/architecture.md) — current skeleton (responsibilities, contracts, decisions)
 - [`docs/getting-started.md`](docs/getting-started.md) — setup and first run (for agent developers)
+- [`docs/versioning.md`](docs/versioning.md) — versioning, release, tag and branch policy
 
 > [!NOTE]
 > Documentation is currently Japanese-only.
