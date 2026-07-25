@@ -145,9 +145,7 @@ fn parse_wall_clock(s: &str) -> Result<WallClockSpec, String> {
                 .parse()
                 .map_err(|_| format!("@monthly invalid day '{d_s}' in '{s}'"))?;
             if !(1..=31).contains(&d) {
-                return Err(format!(
-                    "@monthly day out of range (1-31): '{d}' in '{s}'"
-                ));
+                return Err(format!("@monthly day out of range (1-31): '{d}' in '{s}'"));
             }
             let (h, m) = parse_hhmm(time_s, s)?;
             Ok(WallClockSpec::Monthly {
@@ -228,8 +226,7 @@ pub(crate) fn resolve_tz(name: Option<&str>) -> Result<Tz, String> {
             // その場合は iana_time_zone にフォールバック (log は出さない: 正常経路)。
         }
     }
-    let sys = iana_time_zone::get_timezone()
-        .map_err(|e| format!("cannot detect user tz: {e}"))?;
+    let sys = iana_time_zone::get_timezone().map_err(|e| format!("cannot detect user tz: {e}"))?;
     sys.parse::<Tz>()
         .map_err(|e| format!("system tz '{sys}' not in chrono-tz DB: {e}"))
 }
@@ -260,7 +257,9 @@ pub(crate) fn next_scheduled_after(after_ms: u64, spec: &WallClockSpec, tz: &Tz)
             // 現在ローカル時刻の :00 (切り捨て) から始めて 1 時間刻みで探索。
             // 「厳密に after より後」を要求するので、まず現在時刻の :00 を起点にして
             // 1 時間ずつ足しながらチェックする。
-            let mut candidate = local_after.date_naive().and_hms_opt(local_after.hour(), 0, 0)?;
+            let mut candidate = local_after
+                .date_naive()
+                .and_hms_opt(local_after.hour(), 0, 0)?;
             for _ in 0..(24 * 400) {
                 candidate = candidate.checked_add_signed(chrono::TimeDelta::hours(1))?;
                 if let Some(ms) = pick_earlier_utc(tz, &candidate) {

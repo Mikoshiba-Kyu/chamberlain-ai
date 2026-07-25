@@ -94,6 +94,21 @@ node packages/create-chamberlain/bin/create.js /tmp/chamberlain-scaffold-check
 
 いずれも Windows 実機ビルドでは出ません。
 
+## CI
+
+PR と main への push で [`.github/workflows/ci.yml`](.github/workflows/ci.yml) が走ります。手元で先に確認したいときは以下と同じことをしています。
+
+```
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo publish -p chamberlain-core --dry-run
+pnpm --filter chamberlain-example-react build
+```
+
+**Tauri の bundle (msi / nsis / deb) は CI では作りません。** Chamberlain はフレームワークであり、実行ファイルを作るのはエージェント開発者の手元だからです。CI が見るのはコンパイル・lint・配布物の中身までです。
+
+`cargo publish --dry-run` と `npm pack --dry-run` を PR 時点で回しているのは、crates.io / npm の publish が事実上取り消せないためです。`packages/core/Cargo.toml` の `include` を触ったときに壊れやすい箇所なので、マージ前に検出します。
+
 ## バージョンとリリース
 
 バージョニング (lockstep)、0.x のセマンティクス、1.0 の定義、タグ・ブランチ規約、publish 手順は [`docs/versioning.md`](docs/versioning.md) にまとまっています。ブランチを切る前とリリース作業の前に確認してください。

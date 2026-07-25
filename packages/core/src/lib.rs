@@ -506,11 +506,7 @@ fn spawn_trigger_worker(
                         "failed to load trigger '{}' at {:?}: {e}",
                         t.manifest.id, entry_path
                     );
-                    emit_activity(
-                        &app_for_worker,
-                        &t.manifest.id,
-                        format!("[load error] {e}"),
-                    );
+                    emit_activity(&app_for_worker, &t.manifest.id, format!("[load error] {e}"));
                     continue;
                 }
             };
@@ -785,7 +781,8 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
             }
 
             let open_item = MenuItem::with_id(app, "open", "Open Chamberlain", true, None::<&str>)?;
-            let notify_item = MenuItem::with_id(app, "notify", "Send test notification", true, None::<&str>)?;
+            let notify_item =
+                MenuItem::with_id(app, "notify", "Send test notification", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&open_item, &notify_item, &quit_item])?;
 
