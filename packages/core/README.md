@@ -11,9 +11,10 @@ Chamberlain フレームワークの Rust コア。常駐する秘書エージ�
 ## 何をやるか
 
 - **心拍 tick** — `tokio::time::sleep` を回す常駐タスク。通常 `1m`、`CHAMBERLAIN_DEV=1` 時 `10s`
-- **トリガーの schedule 判定** — interval (`5m`) と wall-clock (`@daily 09:00` 等) の DSL を解釈
+- **schedule の展開** — `@daily 09:00` / `@hourly :45` / `@every 10m` 等の DSL を解釈し、絶対時刻を持つタスクリストに展開する。心拍は due なタスクを取り出して実行するだけ
+- **タスクリスト** — 「秘書がこれから何をするつもりか」の単一の実体。UI から閲覧・削除でき、手動実行もここに積まれる
 - **JS ランタイムホスト** — rustyscript (deno_core 経由) 上で TypeScript トリガーを実行
-- **State store** — `tauri-plugin-store` の JSON ファイルにトリガー毎の state を永続化
+- **State store** — `tauri-plugin-store` の JSON ファイルにトリガー毎の state とタスクリストを永続化
 - **OS 通知** — `tauri-plugin-notification` 経由 (Windows は AUMID 自己登録込み)
 - **トレイ + チャット UI** — 秘書 persona (Type II AI) を Anthropic Messages API で駆動
 

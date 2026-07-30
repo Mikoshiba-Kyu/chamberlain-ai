@@ -6,5 +6,5 @@
   "author": "chamberlain",
   "entry": "index.ts",
   "requiredSecrets": ["github_token"],
-  "schedule": "1h"
+  "schedule": "@hourly"
 }

@@ -6,6 +6,37 @@
 
 ## [Unreleased]
 
+### Added
+
+- **タスクリストがスケジュールの唯一の実体になった** (#26 Phase 1)。`manifest.schedule` は展開器が絶対時刻のタスクに変換し、心拍は「due なタスクを取り出して実行して消す」だけを行う。秘書が未来に対して書ける場所ができた
+- schedule DSL に時間内の解像度を追加 — `@hourly :45` (毎時 :45) と `@every 10m` (毎時 N 等分)。`@every` の N は 5 / 10 / 15 / 20 / 30 のみ
+- 予定リスト UI (`list_tasks` / `delete_task`)。「秘書がこれから何をするつもりか」が 1 画面で見え、削除できる。削除した予定は展開でよみがえらない
+- 手動実行 (`run_trigger_now`) — トリガーを今すぐ 1 回実行する (#20 を #26 Phase 1 に吸収)
+- 起動時に `manifest.schedule` / `tz` の変更を検知して該当トリガーを再展開 (#26 決定事項 7)
+- 起動時に、消えたトリガーを指す予定を破棄する孤児掃除 (#26 追加決定 9)
+- `tick(ctx)` に `scheduledAt` / `delayMs` を追加。遅延をどう伝えるかは framework ではなくトリガーが決める (#26 追加決定 11)
+
+### Changed
+
+- **BREAKING**: interval schedule (`"5m"` / `"1h"` / `"10s"`) を廃止。`manifest.schedule` は `@` 始まりのみになった (#26 決定事項 4)。旧形式は移行先を名指しするエラーで reject される
+- **BREAKING**: `TriggerListItem.scheduleType` を削除 (interval 系統廃止により `nextFireAt` の意味論が分岐しなくなった)。代わりに生の `schedule` 文字列を返す
+- **BREAKING**: `TriggerListItem.nextFireAt` はタスクリストの投影になった。予定を削除すれば null になる
+- **BREAKING**: `CHAMBERLAIN_DEV=1` は心拍のみ緩和する。schedule 下限の緩和 (秒スケール) は廃止 — 分グリッドに秒は載らない。dev の反復手段は手動実行ボタンに移った
+- `__meta__.fire_times` を廃止。タスクリストが唯一の真実になった。起動時に残骸を掃除する
+- pause 中も展開は続き、予定はリストに残る。due 取り出し時に破棄され `[paused]` として記録される (#26 追加決定 10)
+- missed-fire の猶予を出自別にした — schedule 由来は心拍 2 回分、ad-hoc は 24h (#26 決定事項 8)
+
+### Migration
+
+`triggers/*/manifest.json` の `"schedule"` を書き換える必要があります。
+
+| 旧 | 新 |
+|---|---|
+| `"1h"` | `"@hourly"` |
+| `"5m"` / `"10m"` / `"30m"` | `"@every 5m"` / `"@every 10m"` / `"@every 30m"` |
+| `"6h"` | `"@daily HH:MM"` を複数トリガーに分けるか、`"@hourly"` + トリガー側で間引く |
+| `"10s"` (dev) | 表現不可。UI の「今すぐ実行」ボタンを使う |
+
 ## [0.1.1] - 2026-07-25
 
 ### Fixed
