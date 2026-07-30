@@ -14,3 +14,25 @@ Chamberlainは設計中のフレームワークで、細部の多くはまだ確
 - **スコープを守る** — 意見は積極的に、実装は依頼された範囲に。勝手なリファクタリングや「ついで」の変更は避ける。
 
 不明な点は勝手に決めず、ユーザーに確認してください。
+
+## フロントエンドを触るときの規律
+
+秘書 UI のソースは 2 箇所にあります。**真実は template 側です。**
+
+| | 役割 |
+|---|---|
+| `packages/create-chamberlain/templates/react/` | **編集するのはここ。** エージェント開発者に配られるもの |
+| `examples/react/` | 「それが実際に動くことの証明」。共有部分は template からのコピー |
+
+```bash
+pnpm sync:template          # templates → examples を同期
+pnpm sync:template:check    # 差分があれば非 0 (CI が実行する)
+```
+
+`examples/react` を直接編集しないでください。同期漏れは CI (`sync:template:check`) で落ちます。
+
+ただし `examples/react` の以下は**意図的に template と違う**ので同期対象外です。詳細は `scripts/sync-template.mjs` の冒頭コメント参照。
+
+- `package.json` / `src-tauri/Cargo.toml` — workspace のパッケージ名。`Cargo.toml` は `chamberlain-core` を **path 依存**で引く (これが examples の存在意義)
+- `src-tauri/tauri.conf.json` — `identifier` が app_data のパスを決めるため固定
+- `src-tauri/src/main.rs` — lib 名の参照

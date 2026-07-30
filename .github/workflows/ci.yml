@@ -69,6 +69,12 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
+      # examples/react は templates/react の共有部分のコピー。真実は templates 側
+      # (#39)。片方だけ直したまま merge されると、publish された scaffold の出力だけが
+      # 古いという最悪の壊れ方をするので、ここで必ず落とす
+      - name: Template / example が同期しているか
+        run: pnpm sync:template:check
+
       # tsc + vite build。examples/react が唯一の TS ビルド対象
       - name: Build example frontend
         run: pnpm --filter chamberlain-example-react build
