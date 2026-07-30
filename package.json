@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "pnpm --filter chamberlain-example-react dev",
     "build": "pnpm --filter chamberlain-example-react build",
-    "tauri": "pnpm --filter chamberlain-example-react tauri"
+    "tauri": "pnpm --filter chamberlain-example-react tauri",
+    "sync:template": "node scripts/sync-template.mjs",
+    "sync:template:check": "node scripts/sync-template.mjs --check"
   }
 }
