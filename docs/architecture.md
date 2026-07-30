@@ -107,12 +107,13 @@ Chamberlain は「常駐する Rust コア」と「エージェント開発者�
 │            Rust コア (常駐)                   │
 │                                             │
 │  ・永久 tick timer (1m / dev 10s)             │
-│  ・per-trigger schedule 判定 (5m 以上)         │
+│  ・schedule 展開器 → タスクリスト               │
+│  ・due タスクの取り出しと実行                   │
 │  ・tray icon                                │
 │  ・OS notification                          │
 │  ・JS runtime host (deno_core embedded)     │
 │  ・trigger discovery                        │
-│  ・state store (JSON)                       │
+│  ・state store + task store (JSON)          │
 └─────┬──────────────────────────────┬────────┘
       │                              │
  tick │ activity event   discovery / │ tick / call tick()
@@ -121,10 +122,10 @@ Chamberlain は「常駐する Rust コア」と「エージェント開発者�
 │  Web UI (React)  │         │    triggers/     │
 │                  │         │                  │
 │  ・トリガー一覧    │         │   <id>/          │
-│  ・アクティビティ  │         │    manifest.json │
-│  ・停止/再開      │         │    index.ts      │
-└──────────────────┘         │    <assets>      │
-                             └──────────────────┘
+│  ・予定リスト      │         │    manifest.json │
+│  ・アクティビティ  │         │    index.ts      │
+│  ・停止/再開/手動  │         │    <assets>      │
+└──────────────────┘         └──────────────────┘
 ```
 
 - **Rust コア** = 永久に動いている心臓。時計、トレイ、OS 通知、JS ランタイム、永続化を担う
@@ -133,63 +134,131 @@ Chamberlain は「常駐する Rust コア」と「エージェント開発者�
 
 責務分割の要諦は [`overview.md`](overview.md) と一致する: コアが常駐性・トレイ・OS 通知・チャット UI を提供し、エージェント開発者は「いつ何を確認して何を通知するか」に集中する。
 
+### スケジュールの実体はタスクリスト (#26)
+
+0.2.0 でスケジューラの骨格が入れ替わった。`manifest.schedule` は「発火条件の記述」ではなく **絶対時刻の生成規則** であり、展開器がそれを具体的な時刻を持つタスクに変換する。
+
+```
+manifest.schedule ──(展開器: 閾値条件)──▶ タスクリスト ──(心拍: due 取り出し)──▶ 実行
+                                             ▲                                  │
+手動実行 / (将来) Type II ──(直接積む)────────┘                                  ▼
+                                                                          実行/破棄の記録
+```
+
+タスクリストは「未来への意図」を表す単一の場所であり、manifest 由来のタスクも手動実行で積まれたタスクも同じリストに並ぶ。これにより:
+
+- **心拍から schedule の解釈が消えた**。心拍は「`scheduled_at <= now` を取り出して実行して消す」だけを行う
+- **秘書が未来に対して書ける場所ができた**。Phase 3 でチャット / Type II からの登録がここに乗る
+- **観測面が強化された**。「秘書がこれから何をするつもりか」が 1 画面で見え、しかも削除できる
+
 ## Rust コアの責務
 
 ### Heartbeat tick
 
-`tokio::time::sleep(TICK_INTERVAL)` を回す非同期タスク。心拍は通常 `1m`、`CHAMBERLAIN_DEV=1` 時は `10s` に切り替わる (#17)。心拍は「発火判定を回す粒度」であり、実際の発火頻度はトリガー毎の `manifest.schedule` で決まる。
+`tokio::time::sleep(TICK_INTERVAL)` を回す非同期タスク。心拍は通常 `1m`、`CHAMBERLAIN_DEV=1` 時は `10s` に切り替わる。心拍は「due なタスクを取り出す粒度」であり、発火時刻の精度そのものではない (時刻はタスクの `scheduled_at` が持っている)。
 
 一度動き出したら停止イベントは無く、プロセスが生きている限り tick が刻まれる。TS 側が壊れても心臓は止まらない、という設計の要。
 
-### Per-trigger schedule 判定 (#17 / #18)
+手動実行 (`run_trigger_now`) は心拍を待たずに割り込む。UI 側から `mpsc::Sender` で心拍を 1 回起こす。
 
-心拍で回されるのは「発火判定」であって、実際に tick() を呼ぶかは per-trigger の schedule で決まる。
+心拍 1 回の流れ:
 
-`manifest.schedule` は 1 フィールドで 2 系統を扱う。先頭文字で判別:
+1. **展開** — `expanded_until` が閾値に迫ったトリガーをホライズンまで展開する
+2. **due 取り出し** — `scheduled_at <= now` なタスクを昇順に取る。ここに schedule の解釈は入らない
+3. **分類** — 孤児 / pause / 遅延超過を破棄し、残りを実行する
+4. **後片付け** — 処理済みタスクを消して 1 回だけ永続化する
 
-- 数字始まり (`"5m"` / `"1h"` 等) → **interval schedule** (#17 Phase 1)
-- `@` 始まり (`"@daily 09:00"` 等) → **wall-clock schedule** (#18 Phase 2)
+### schedule DSL (#26 決定事項 4 / 5)
 
-manifest フィールドが増えないのでエージェント開発者の学習コストが低い。パースは [`crate::schedule`] モジュールに一元化。
+`manifest.schedule` は `@` 始まりの生成規則のみを受け付ける。**0.2.0 で interval schedule (`"5m"` / `"1h"`) は廃止された。**
 
-共通ルール:
+| 記法 | 発火時刻 |
+|---|---|
+| `@hourly` | 毎時 :00 |
+| `@hourly :45` | 毎時 :45 |
+| `@every 10m` | 毎時 :00,:10,:20,:30,:40,:50 |
+| `@daily HH:MM` | 毎日 HH:MM |
+| `@weekly [MON\|TUE\|WED\|THU\|FRI\|SAT\|SUN] HH:MM` | 毎週指定曜日の HH:MM (英字 3 文字大文字) |
+| `@monthly D HH:MM` | 毎月 D 日 HH:MM。D が存在しない月 (2 月の 30 日等) は skip |
+| `@at YYYY-MM-DDTHH:MM` | その時刻に 1 回だけ |
 
-- `last_fire_at` は tick() を呼んだら常に `now` に更新される (成功・エラー・null 返しに関わらず)。schedule の意味を「発火試行の頻度」に統一し、エラー時に毎心拍リトライになるノイズを避けるため
-- `last_fire_at` の保存先: `triggers-state.json` の予約 namespace `__meta__.fire_times` (詳細: [状態モデル](#状態モデル) 節)
+`@hourly :MM` と `@every Nm` は生成器として同一である。どちらも「毎時、指定した分集合で発火」であり、前者は分集合が 1 要素、後者は N 等分。実装は分集合を作る関数 1 本。
+
+**`@every <N>m` は N が 5 / 10 / 15 / 20 / 30 のみ。** 60 の約数なら毎時同じ分集合になるため、展開が各時間で独立・冪等になり、展開済み境界 1 つで完結する。下限 5 分は旧 interval の下限を踏襲している。
+
+採らないもの:
+
+- **interval 系統** — 展開型では interval は「wall-clock の生成規則のひとつ」に格下げされ、`@hourly` が 1 時間 interval と同義になる。さらに `"7m"` のようなグリッドに割り切れない値は日の境目で間隔が崩れ、展開器が「前回展開の末尾時刻」を覚える必要が生じる (境界 1 つで済まなくなる)
+- **カンマ区切りリスト** (`@hourly :00,:15,:45`) — 認めると「曜日リストは? 月リストは?」と滑り出して cron に着地する (#18)
+- **full 5-field cron** (`0 9 * * *`) — 秘書用途では表現力過剰、cron parser クレート依存を避けたい、意味論を背負い込みたくない
+- **`CHAMBERLAIN_DEV=1` での秒スケール** — グリッドが分単位である以上、秒は原理的に載らない。dev の反復手段は手動実行ボタンに移った
+
+discovery でのバリデーション:
+
 - schedule 省略 → discovery で完全に捨てる (manifest 不正と同じ扱い)
-- schedule パース失敗 / interval 下限違反 / tz 解決失敗 → **トリガー自体は list_triggers に `error` フィールド付きで残す**。worker は load / tick しない。stderr と activity にも `[schedule error]` で流すが、activity は `.setup()` 内で emit されるため UI 未接続で捨てられる可能性が高く、`list_triggers().error` が実質的な観測面
+- schedule パース失敗 / tz 解決失敗 → **トリガー自体は list_triggers に `error` フィールド付きで残す**。worker は load / 展開しない。stderr と activity にも `[schedule error]` で流すが、activity は `.setup()` 内で emit されるため UI 未接続で捨てられる可能性が高く、`list_triggers().error` が実質的な観測面
+- 発火間隔の下限チェックはもう無い。下限は DSL パーサが構文として担保する (`@every` の許可値が 5 分以上)
 - 予約 id `__meta__` → discovery で完全に捨てる (framework 内部用の namespace 衝突)
 
-#### interval schedule (#17)
+### 展開器 (#26 決定事項 2 / 3 / 6)
 
-- DSL: `"5m"` / `"1h"` / `"10s"`。単位は `s` / `m` / `h`。単位無し・複合単位 (`1h30m`) は非対応
-- 意味: 「前回 fire から N 経過したら次 fire」。TZ 非依存
-- 判定式: `now - last_fire_at >= schedule`。初回 (`last_fire_at` が無い) は即発火する
-- 最小粒度: 通常 `5m`、`CHAMBERLAIN_DEV=1` 時は `10s` (discovery で下限バリデーション)
-- catch-up: `last_fire_at` を `now` に上書きするので、プロセス停止で溜まった発火は捨てられる (「1 回だけ発火」)
+展開器は core が固定で持つ。「1 日 1 回の展開」自体をタスクとしてリストに積む (self-hosting) 形は綺麗だが、そのタスクを消されたら秘書が二度と動かなくなるので、ブートストラップの堅牢性を優先した。
 
-#### wall-clock schedule (#18)
+**展開済み境界**: トリガーごとに `expanded_until` を 1 つだけ持つ。展開器はこの境界より後の時刻しか生成しない。境界より前にあった「秘書 AI やエンドユーザーが消したタスク」は二度と生成されないので、tombstone 無しで冪等性が自明になる。
 
-- DSL: 5 種類の cron-lite エイリアス
-  - `@hourly` — 毎時 :00
-  - `@daily HH:MM` — 毎日 HH:MM
-  - `@weekly [MON|TUE|WED|THU|FRI|SAT|SUN] HH:MM` — 毎週指定曜日の HH:MM (英字 3 文字大文字)
-  - `@monthly D HH:MM` — 毎月 D 日 HH:MM。D が存在しない月 (2 月の 30 日等) は skip
-  - `@at YYYY-MM-DDTHH:MM` — 特定日時に 1 回だけ fire、以降永久 skip
-- full 5-field cron (`0 9 * * *`) は採らない (秘書用途では表現力過剰、cron parser クレート依存を避けたい、意味論を背負い込みたくない)
-- 意味: TZ に紐付いた wall-clock 時刻で fire
-- 判定式: `next_scheduled_after(last_fire_at, spec, tz) <= now`
-- 最小粒度チェックは無し (wall-clock は最短でも `@hourly` = 60m で interval 最小 5m を大きく上回るため)
-- **missed-fire policy: skip**。プロセス停止中に過ぎた予定は「秘書として今更 09:00 の挨拶しても不自然」なので捨てる
-  - 実装: worker 起動時に「fire_times に履歴の無い wall-clock トリガー」を `startup_now` で seed。以降の判定は上記式で行われ、「起動時点で過ぎている当日の予定」は自然に skip される
-  - 例: `@daily 09:00` のアプリを 10:00 に起動 → 今日の 09:00 は捨てて明日 09:00 を待つ
-  - `@at` で期日が既に past の場合も同じ仕組みで永久 skip される (`next_scheduled_after` が `None` を返す)
+**閾値条件で起こす**: Chamberlain はデスクトップアプリで常時起動していない。日次パスを 00:00 に置くと、9:00〜18:00 しか PC を開かないユーザーの環境では一度も走らない。代わりに心拍ごとに条件を見る。
+
+```
+心拍ごとに: expanded_until < now + 24h なら展開する (ホライズン 48h)
+```
+
+比較 1 つなのでコストは無視でき、「結果として 1 日 1 回程度走る」が保証される。閾値 24h とホライズン 48h の差が余裕として働く。
+
+**過去は生成しない**: 展開の起点は `max(expanded_until, now)`。1 週間アプリを閉じていた後の起動で 1 週間分の過去タスクを生成してから全部破棄する、という無駄と観測面のノイズを避ける。wall-clock の missed-fire skip (#18) は「生成しない」ことで達成される。
+
+展開対象は「実行可能なトリガー」だけ。構成エラーのあるトリガーや JS のロードに失敗したトリガーを展開しても、実行できないタスクを積んで due 時に破棄するだけになる。
+
+### 起動時の突き合わせ (#26 決定事項 7 / 追加決定 9)
+
+アプリのアップデートで `manifest` が変わるため、起動時に永続タスクリストを現在の manifest と突き合わせる。
+
+- **schedule 変更検知** — `schedule` / `tz` 文字列を前回値と比較し、変わっていたらそのトリガーの未実行タスク (schedule 由来のみ) を破棄して `expanded_until` を `now` に戻す。これが無いと `@daily 09:00` → `@daily 08:00` の変更が最大 48 時間反映されない
+- **孤児掃除** — `trigger_id` が現存トリガー集合に無いタスクを破棄する。放置すると心拍が解決できず、due になった瞬間から失敗し続ける
+
+突き合わせには **discovery で見えている全トリガー**を渡す (ロードに失敗したものも含む)。ロード失敗は一時的なこともあり、それだけで展開済み境界や積まれたタスクを破棄すると「1 回のビルド事故でスケジュールの記憶が消える」ことになる。
+
+猶予窓は設けない。Mastra の `missesBeforeDelete` は「デプロイ順序でスケジューラがワークフロー登録より先に回る」レース対策だが、Chamberlain の `discover_triggers()` は起動時 1 回で確定するのでこのレースが存在しない。
+
+### due 判定と missed-fire (#26 決定事項 8 / 追加決定 10 / 11)
+
+心拍が due なタスクを取り出したときの分岐。起動時もスリープ復帰も通常運転も経路は 1 本である (「起動時の掃除」という専用経路を持たない)。
+
+| 条件 | 処理 | 記録 |
+|---|---|---|
+| 親トリガーが現存しない | 破棄 | `[orphaned]` |
+| 親トリガーが実行不能 (構成エラー / ロード失敗) | 破棄 | `[unavailable]` |
+| 親トリガーが pause 中 | 破棄 | `[paused]` |
+| 遅れ ≤ 猶予 | **実行** | 通常の notify / activity |
+| schedule 由来で猶予超過 | 破棄 | `[skipped]` |
+| ad-hoc で猶予超過 | 破棄 | `[expired]` |
+
+**猶予は origin で違う。**
+
+- **schedule 由来: 心拍 2 回分** (prod 2m / dev 20s)。「心拍が拾い損ねた」ぶんだけを許す。#18 の missed-fire policy: skip と整合し、「今更 09:00 の挨拶をしても不自然」を守る。定期タスクには次の機会がある
+- **ad-hoc: 24h**。一回きりで消えたら二度と来ないので破棄してはならない。遅延を明示して実行する。ただし無制限だと「1 週間前のリマインドが起動時に一斉に鳴る」ので上限を置く
+
+> Issue #26 決定事項 8 のフロー図は「遅れ < 猶予 → 実行」を両 origin 共通に書いているが、猶予を 24h 一律にすると同じ決定事項が挙げている「今更 09:00 の挨拶をしても不自然」と矛盾する。両方の意図を満たす読みは origin 別の猶予しかないため、そう実装している。
+
+**pause はトリガー側の属性**であり、タスクレコードには持たせない。pause 中も展開は続き、タスクはリストに積まれたまま見える (「止めている間に何が来ていたか」が可視化されるほうが秘書メタファに合う)。due 取り出し時に破棄されるので、resume 時の特別処理も要らない。
+
+**遅延はタスクの `scheduled_at` から導出する**。framework は通知本文に前置きを足さず、`tick(ctx)` に `scheduledAt` / `delayMs` を渡してトリガー / Type II 側に判断させる。通知の文面はエージェント開発者の領分であり、framework が前置きを注入すると文体・言語・敬体が破綻する。
+
+実行順序は state読 → `tick(ctx)` → notify → state保存 → **タスク削除**。タスク削除を最後にすることで、実行中にクラッシュしたタスクはリストに残り次回起動で再試行される (at-least-once)。秘書は「1 回多く言う > 一言忘れる」の立場を取る。`tick()` がエラーを返してもタスクは消す (エラーで毎心拍リトライになるノイズを避ける)。
 
 #### TZ セマンティクス (#18)
 
 - **デフォルト: user local** (OS TZ を [`iana_time_zone`] クレートで解決 → [`chrono_tz`] で TimeZone を取得)
 - **上書き: `manifest.tz`** に IANA name (例: `"Asia/Tokyo"`)。省略時は user local
-- interval schedule は TZ 非依存なので `tz` は wall-clock schedule のみ影響する
 - shipped Tauri アプリはユーザーの OS TZ が正しく設定されている前提。dev container の TZ 問題は `.devcontainer/devcontainer.json` の `containerEnv.TZ` で解決済み (#17)
 
 #### DST 明文化 (#18)
@@ -202,7 +271,7 @@ user local を採用した副作用として:
 
 JST は現状 DST 無しなので日本ユーザーには直接影響しないが、将来的にユーザーが海外環境で使う場合の期待挙動として明文化する。
 
-dev モードは compile-time feature ではなく env-var 単独判定。「本番配布ビルドでは env を渡す口が Tauri bundle 側で塞がっている」ことを暗黙の前提にしている (詳細議論は #17)。
+dev モードは compile-time feature ではなく env-var 単独判定。「本番配布ビルドでは env を渡す口が Tauri bundle 側で塞がっている」ことを暗黙の前提にしている (詳細議論は #17)。0.2.0 では dev モードが緩和するのは心拍だけである。
 
 ### Trigger discovery と runtime
 
@@ -213,6 +282,16 @@ dev モードは compile-time feature ではなく env-var 単独判定。「本
 Runtime は V8 の thread affinity を守るため、専用の `std::thread` に閉じ込める。tokio 側からは `std::sync::mpsc` で tick 信号を送るだけ。JS 実行は常にこの 1 スレッド上で直列に行われる。
 
 失敗は隔離される: 1トリガーの load / instantiate / tick() が失敗しても、そのトリガーだけスキップされ、他は続行する。エラーは activity ストリームに `[error]` / `[load error]` / `[instantiate error]` プレフィックス付きで emit される。
+
+### Task store
+
+`tauri-plugin-store` の JSON ファイル (`<app_data>/tasks.json`)。pending なタスクリストと、トリガーごとの展開状態 (`expanded_until` + 前回の schedule 文字列) を持つ。
+
+**トリガー state と別ファイルにする理由**: `tauri-plugin-store` は `save()` でファイル全体を書く。同居させると「トリガーが state を 1 つ書くたびに数百件のタスク配列も書き直される」write amplification が起きる。`@every 5m` 1 つで 288 件/日を生成するので、この分離は効く。
+
+抽象レイヤ (storage domain の trait) は作らない。バックエンドが 1 つの段階では早い。ただし将来 SQLite に置き換える判断に備えて、境界に置く操作の粒度は Mastra の `SchedulesStorage` (`listDue` / `updateNextFire` / `recordTrigger` / `listTriggers`) に寄せてある。
+
+Phase 2 の実行履歴レイヤ (追記専用 + retention) は本質的にテーブルなので、そこで SQLite を再検討する。
 
 ### State store
 
@@ -234,8 +313,14 @@ Tauri の `TrayIconBuilder`。メニュー: Open Chamberlain / Send test notific
 
 トリガー制御:
 
-- `list_triggers() -> Vec<TriggerListItem>` — 起動時に discover したトリガーを UI 表示用に返す
+- `list_triggers() -> Vec<TriggerListItem>` — 起動時に discover したトリガーを UI 表示用に返す。`nextFireAt` は**タスクリストの投影**であり、framework が別に持っている「次回発火予定」ではない。`scheduleType` は 0.2.0 で削除された (interval 系統廃止により意味論が分岐しなくなったため)
 - `pause_trigger(id: String)` / `resume_trigger(id: String)`
+- `run_trigger_now(id: String)` — 今すぐ 1 回実行する (#20 を #26 Phase 1 に吸収)。実装は「即 due な ad-hoc タスクを 1 件積んで心拍を起こす」。ad-hoc タスクは展開済み境界を触らないので、手動実行が定期スケジュールを乱すことはない
+
+タスクリスト (#26):
+
+- `list_tasks() -> Vec<TaskListItem>` — pending なタスクを `scheduled_at` 昇順で返す
+- `delete_task(id: String)` — 予定を 1 件削除する。展開済み境界があるので次の展開で復活しない
 
 Secret store (#13):
 
@@ -284,10 +369,8 @@ Rust 側で `serde_json` によりパース。unknown フィールドは silentl
 - `name` (必須) — UI に表示する人間可読名
 - `description` (任意) — UI 詳細表示用
 - `entry` (必須) — パッケージ dir 相対のエントリスクリプトパス。通常は `"index.ts"`
-- `schedule` (必須) — 発火頻度の DSL 文字列
-  - interval: `"5m"` / `"1h"` / `"6h"` 形式。単位は `s` / `m` / `h`。意味は「前回 fire から N 経過したら次 fire」。最小粒度は通常 `5m`、dev 時は `10s` (#17)
-  - wall-clock: `"@daily 09:00"` / `"@weekly MON 09:00"` / `"@monthly 15 09:00"` / `"@hourly"` / `"@at 2026-08-01T18:30"` (#18)
-- `tz` (任意) — wall-clock schedule 用の IANA TZ 名 (例: `"Asia/Tokyo"`)。省略時は OS の user local を [`iana_time_zone`] で解決。interval schedule では無視される (#18)
+- `schedule` (必須) — 発火時刻の生成規則。`@` 始まりのみ。`"@hourly"` / `"@hourly :45"` / `"@every 10m"` / `"@daily 09:00"` / `"@weekly MON 09:00"` / `"@monthly 15 09:00"` / `"@at 2026-08-01T18:30"` (詳細は [schedule DSL](#schedule-dsl-26-決定事項-4--5) 節)。**0.2.0 で interval 形式 (`"5m"` / `"1h"`) は廃止された**
+- `tz` (任意) — IANA TZ 名 (例: `"Asia/Tokyo"`)。省略時は OS の user local を [`iana_time_zone`] で解決 (#18)
 - `requiredSecrets` (任意) — このトリガーが `chamberlain.getSecret(name)` で読む予定の secret 名一覧。Settings UI が「未設定です」の表示に使う (#13)
 
 manifest を分離ファイルにする理由は「Rust が JS を動かさずに一覧を作れる」「Chrome/VS Code/npm と同じパターンで開発者に説明不要」「将来 marketplace の話が出た時にそのまま嵌る」など。決定の経緯は #8。
@@ -300,8 +383,10 @@ manifest を分離ファイルにする理由は「Rust が JS を動かさず�
 type State = { /* トリガー固有 */ };
 
 interface Ctx {
-  now: number;      // ms since epoch (Rust から渡される)
-  state: State;     // 前回 tick() が返した state (未保存なら {})
+  now: number;         // ms since epoch (Rust から渡される)
+  state: State;        // 前回 tick() が返した state (未保存なら {})
+  scheduledAt: number; // このタスクが実行を意図された絶対時刻 (#26 追加決定 11)
+  delayMs: number;     // now - scheduledAt。遅延をどう伝えるかはトリガーが決める
 }
 
 interface TickResult {
@@ -362,40 +447,74 @@ chamberlain.http.fetch(url: string, opts?: {
 
 議論の経緯は #7。
 
-### tick 内の順序
+### タスク実行の順序
 
-per-trigger per-tick で以下の順で実行される:
+due なタスク 1 件について以下の順で実行される。schedule の判定はここに一切入らない (時刻はタスクが持っており、心拍は取り出すだけ)。
 
-1. `paused` 判定 → true ならスキップ
-2. schedule 判定 → `now - last_fire_at < schedule` ならスキップ (詳細: [Per-trigger schedule 判定](#per-trigger-schedule-判定-17) 節)
-3. state store から namespace `id` の値を読み出し (未保存なら `{}`)
-4. TS `tick({ now, state })` を呼ぶ
-5. 戻り値の `notify` を fire (OS 通知 + activity emit)
-6. 戻り値の `state` を store に書き込み → save
-7. `__meta__.fire_times[id]` に `now` を書き込み → save
+1. 分類 → 孤児 / 実行不能 / pause 中 / 遅延超過なら破棄 (詳細: [due 判定と missed-fire](#due-判定と-missed-fire-26-決定事項-8--追加決定-10--11) 節)
+2. state store から namespace `id` の値を読み出し (未保存なら `{}`)
+3. TS `tick({ now, state, scheduledAt, delayMs })` を呼ぶ
+4. 戻り値の `notify` を fire (OS 通知 + activity emit)
+5. 戻り値の `state` を store に書き込み → save
+6. タスクをリストから削除 → `tasks.json` に save (心拍あたり 1 回にまとめる)
 
 **notify が state 保存より先** である点は意図的。プロセスクラッシュ時の "at least once" を優先する: 秘書は「1回多く言う > 一言忘れる」。同じイベントを2回通知する方が、忘れて未通知になるより秘書として望ましい。
 
+**タスク削除が最後** である点も同じ理由。実行中にクラッシュしたタスクはリストに残り、次回起動でもう一度試される。
+
 ### on-disk 形式
+
+トリガー state (`<app_data>/triggers-state.json`):
 
 ```json
 {
   "greeter": { "greetCount": 42 },
   "stretch-reminder": { "lastFire": 1721000000000 },
-  "__meta__": {
-    "fire_times": {
-      "greeter": 1721000000000,
-      "stretch-reminder": 1721000060000
-    }
-  }
+  "__meta__": {}
 }
 ```
 
 トップレベルのキーがトリガー ID (自動 namespace)。値は任意 JSON。framework は中身を関知しない。
 
-**予約 namespace `__meta__`**: framework が内部管理する情報を置くための予約領域 (#17)。現在は `fire_times`: 「トリガー ID → 最終 fire 時刻 (ms since epoch)」のマップだけを持つ。この ID を名乗るトリガーは discovery で reject される。
+**予約 namespace `__meta__`**: framework が内部管理する情報を置くための予約領域。0.1.x はここに `fire_times` (トリガー ID → 最終 fire 時刻) を持っていたが、**0.2.0 で廃止された**。タスクリストが唯一の真実になったため。起動時に残骸が掃除される。この ID を名乗るトリガーは discovery で reject される。
 
-保存先は Tauri が管理する `<app_data>/triggers-state.json`:
+タスクリスト (`<app_data>/tasks.json`):
+
+```json
+{
+  "tasks": [
+    {
+      "id": "greeter-morning@1767250800000",
+      "origin": "schedule",
+      "trigger_id": "greeter-morning",
+      "scheduled_at": 1767250800000,
+      "created_at": 1767225600000
+    },
+    {
+      "id": "manual-github-issues-count-1767226000000",
+      "origin": "adhoc",
+      "trigger_id": "github-issues-count",
+      "scheduled_at": 1767226000000,
+      "created_at": 1767226000000
+    }
+  ],
+  "expansion": {
+    "greeter-morning": {
+      "expanded_until": 1767398400000,
+      "schedule": "@daily 06:00",
+      "tz": "Asia/Tokyo"
+    }
+  }
+}
+```
+
+`tasks` は `scheduled_at` 昇順・id 一意が不変条件。エンドユーザーが手で編集できる場所にあるため、読み込み時に並べ替えと重複排除を行う。
+
+`expansion` がトリガーごとに持つのは **境界 1 つと前回の schedule 文字列だけ**。境界より前の時刻は二度と生成されないので、削除されたタスクの tombstone は要らない。schedule 文字列は起動時の変更検知に使う。
+
+schedule 由来タスクの id は `{trigger_id}@{scheduled_at}` で決定的に決まる。冪等性は境界だけで担保されるが、境界の書き込みが失敗した場合の二重生成を id で弾ける。
+
+保存先は Tauri が管理する `<app_data>/`:
 
 - Linux: `~/.local/share/<identifier>/`
 - Windows: `%APPDATA%\<identifier>\`
@@ -424,12 +543,28 @@ Rust 側から Tauri の `Emitter::emit("activity", ...)` で JS 側に届く。
 ```typescript
 interface ActivityEvent {
   ts: number;       // ms since epoch
-  source: string;   // trigger ID
-  message: string;  // 通知本文、または [error] / [load error] / [instantiate error] プレフィックス付きエラー
+  source: string;   // trigger ID (トリガーに紐付かないものは "__task__")
+  message: string;  // 通知本文、または下記プレフィックス付きの framework イベント
 }
 ```
 
 UI 側 (`chamberlainApi.onActivity`) は `@tauri-apps/api/event` の `listen` で購読する。表示は新しい順に直近 200 件 (`MAX_EVENTS`)。
+
+プレフィックス一覧:
+
+| プレフィックス | 意味 |
+|---|---|
+| `[error]` / `[load error]` / `[instantiate error]` | トリガーの tick / ロード / インスタンス化の失敗 |
+| `[schedule error]` | discovery 時点の schedule / tz の構成エラー |
+| `[expanded]` | 展開器がタスクを積んだ |
+| `[rescheduled]` | schedule 変更を検知して再展開した |
+| `[orphaned]` / `[unavailable]` | 実行対象トリガーが消えた / 実行できない状態のため予定を破棄 |
+| `[paused]` | 停止中のため予定を破棄 |
+| `[skipped]` | schedule 由来の予定が猶予を超えて遅れたため破棄 |
+| `[expired]` | ad-hoc の予定が猶予 (24h) を超えたため未実行のまま破棄 |
+| `[manual]` / `[deleted]` | 手動実行の予約 / 予定の削除 |
+
+これらは Phase 2 で永続化される実行履歴レイヤの原型でもある (#26)。捨てるにしても痕跡を残すのが観測面原則に合う。
 
 ### エラーもここに流す
 
@@ -459,7 +594,17 @@ AI 駆動トリガーは prompt / MD / スキーマ等のアセットを持ち�
 
 ### 順序 — notify が state 保存より先 (#7)
 
-プロセスクラッシュ時の "at least once" を優先。1回多く言う > 忘れる。
+プロセスクラッシュ時の "at least once" を優先。1回多く言う > 忘れる。#26 でタスク削除も同じ理由で最後になった。
+
+### スケジュールの実体はタスクリスト (#26)
+
+`manifest.schedule` を「発火条件」から「絶対時刻の生成規則」に読み替え、展開器が具体的な時刻のタスクに変換する。心拍は due なタスクを取り出すだけになり、`should_fire` の分岐が実行パスから消えた。動機は「秘書自身が未来に対して何も書けない」という構造上の穴を埋めること。冪等性はトリガーごとの展開済み境界 1 つで担保し、tombstone を持たない。
+
+分散マルチインスタンス前提の Mastra は逆に `nextFireAt` 1 つを CAS で進める形を採っている。展開しないのは「誰が展開したか」の競合を避けるためであり、単一プロセスで、かつタスクを編集可能にしたい Chamberlain には当てはまらない。
+
+### interval schedule の廃止 (#26)
+
+展開型では interval は「wall-clock の生成規則のひとつ」に格下げされ、`@hourly` が 1 時間 interval と同義になる。グリッドに割り切れない値 (`"7m"`) は展開済み境界 1 つで完結しなくなる。破壊的変更だが 0.x なので minor bump (0.2.0) で許容した。
 
 ### トリガーの配置とパス解決 — Tauri resource dir に統一 (#19)
 
@@ -485,15 +630,21 @@ TS 側 (`index.ts`) から自パッケージ内のアセット (prompt.md、sche
 
 `triggers/**/*.ts` や manifest.json の変更を検出して Runtime を再構築する仕組み。dev DX 向上に効くが、V8 の再初期化コストと state 継続性の扱いが論点。
 
-### cadence / 精度 / DSL (Phase 3 以降)
+### cadence / 精度 / DSL
 
-Phase 1 (#17) で interval schedule、Phase 2 (#18) で wall-clock schedule と TZ セマンティクスに着地した。詳細は上記 [Per-trigger schedule 判定](#per-trigger-schedule-判定-17--18) 節を参照。
+#17 で interval schedule、#18 で wall-clock schedule と TZ セマンティクスに着地し、#26 で展開型スケジューラに転換して interval を廃止した。詳細は上記 [schedule DSL](#schedule-dsl-26-決定事項-4--5) と [展開器](#展開器-26-決定事項-2--3--6) 節を参照。
 
-Phase 3 以降で議論する余地がある論点:
+まだ議論する余地がある論点:
 
-- `chamberlain.time.tz` op (トリガー内で「今 UTC / user local で何時か」を TZ-aware に取れる op)。interval schedule + 動的判定パターン (MTG 30 分前通知等) を書けるようにする
+- `chamberlain.time.tz` op (トリガー内で「今 UTC / user local で何時か」を TZ-aware に取れる op)
 - カレンダー統合トリガー (MTG N 分前通知の実応用例)
 - 動的相対時刻 (`"MTG - 30m"` 等の DSL 表現) — 現状はトリガー内ロジックで書く方針
+- **1 日に複数回の実行** — 時間内は分集合を持てる (`@every 10m`) のに、日内は持てない (`@daily 09:00` と `@daily 18:00` を同じトリガーに書けない) という非対称が残っている。現状は「トリガーを 2 つ書く」で回避できる。ここまで開くと cron に近づくため論点として認識するに留める (#26)
+
+### #26 の残り Phase
+
+- **Phase 2** — 実行履歴レイヤ。現在の activity ログ (in-memory 直近 200 件) を追記専用の永続レイヤに昇格させる。`scheduled_at` と実際の実行時刻を両方持ち、遅延は導出値とする。retention とストレージ (SQLite 検討) が論点
+- **Phase 3** — チャット / Type II からの ad-hoc タスク登録。タスクの中身を「自然言語の指示 (`prompt`)」に開く話であり、`overview.md` の承認モデル (「実際にアクションを実行する場合は、必ず提案としてユーザーに提示し、確認をとってから行う」) と正面から交差する。あわせて「リマインド時刻が来たが秘書はチャット中」の分岐が必要になる (Mastra の `ifActive` / `ifIdle` = deliver / wake / persist / discard が先例)
 
 ### notify API の一般化
 

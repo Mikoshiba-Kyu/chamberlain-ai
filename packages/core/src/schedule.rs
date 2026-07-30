@@ -1,16 +1,37 @@
-//! Schedule DSL パーサと wall-clock 発火時刻計算 (#17 Phase 1 + #18 Phase 2)。
+//! Schedule DSL パーサと wall-clock 発火時刻計算 (#26 Phase 1)。
 //!
-//! `manifest.schedule` は 1 フィールドで 2 系統を扱う。先頭文字で判別する:
-//! - 数字始まり (`"1h"` 等) → [`Schedule::Interval`] (Phase 1)
-//! - `@` 始まり (`"@daily 09:00"` 等) → [`Schedule::WallClock`] (Phase 2)
+//! `manifest.schedule` は `@` 始まりの wall-clock DSL のみを受け付ける。
+//! **0.2.0 で interval schedule (`"5m"` / `"1h"`) は廃止された** (#26 決定事項 4)。
+//! 展開型スケジューラでは interval は「wall-clock の生成規則のひとつ」に格下げされ、
+//! `@hourly` が 1 時間 interval と同義になるため、別系統として維持する意味が無くなった。
+//! さらにグリッドに割り切れない interval (`"7m"` 等) は日の境目で間隔が崩れ、展開器が
+//! 「前回展開の末尾時刻」を覚える必要が生じる (展開済み境界 1 つで済まなくなる)。
 //!
-//! manifest フィールドを増やさない (エージェント開発者の学習コストを最小化する) 都合で
-//! パース時点で分岐する形をとる。詳細な設計議論は #17 / #18 参照。
+//! DSL 一覧:
+//!
+//! | 記法 | 発火時刻 |
+//! |---|---|
+//! | `@hourly` | 毎時 :00 |
+//! | `@hourly :45` | 毎時 :45 |
+//! | `@every 10m` | 毎時 :00,:10,:20,:30,:40,:50 |
+//! | `@daily 09:00` | 毎日 09:00 |
+//! | `@weekly MON 09:00` | 毎週月曜 09:00 |
+//! | `@monthly 15 09:00` | 毎月 15 日 09:00 |
+//! | `@at 2026-08-01T18:30` | その時刻に 1 回だけ |
+//!
+//! `@hourly :MM` と `@every Nm` は生成器として同一である。どちらも「毎時、指定した分集合で
+//! 発火」であり、前者は分集合が 1 要素、後者は N 等分。よって [`Schedule::Hourly`] の
+//! `minutes` に畳んで 1 本の実装で扱う。
+//!
+//! `@every <N>m` は **N が 5 / 10 / 15 / 20 / 30 の場合のみ有効**。60 の約数なら毎時同じ
+//! 分集合になるため、展開が各時間で独立・冪等になり、展開済み境界 1 つで完結する。
+//! 下限 5 分は旧 interval の下限を踏襲している (説明が増えない)。
+//! カンマ区切りリスト (`@hourly :00,:15,:45`) は意図的に露出させない。リスト構文を認めると
+//! 「曜日リストは? 月リストは?」と滑り出して cron に着地するため (#18)。
 //!
 //! TZ セマンティクス:
 //! - デフォルトは user local (OS TZ を [`iana_time_zone`] で取得)
 //! - `manifest.tz` に IANA name を書けば上書き
-//! - Interval schedule は TZ 非依存 (経過時間ベース) なので `tz` は wall-clock のみ効く
 //!
 //! DST 挙動 (spring-forward / fall-back):
 //! - spring-forward で存在しない時刻 (例: LA の 3 月 DST 日の 02:30) は skip
@@ -25,107 +46,77 @@ use chrono::{
     DateTime, Datelike, MappedLocalTime, NaiveDate, NaiveDateTime, TimeZone, Timelike, Weekday,
 };
 use chrono_tz::Tz;
-use std::time::Duration;
 
-#[derive(Debug, Clone)]
+/// `@every <N>m` で許可する N。60 の約数のうち、5 分以上かつ「人間が丸いと感じる」値。
+/// 6 / 12 は 60 の約数だが DSL としては露出させない (#26 決定事項 5)。
+const EVERY_ALLOWED_MINUTES: &[u32] = &[5, 10, 15, 20, 30];
+
+/// `manifest.schedule` の意味論。すべて「絶対時刻の生成規則」であり、展開器がこれを
+/// 具体的な時刻のタスクに変換する。実行時の発火判定には使われない (#26 決定事項 2)。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Schedule {
-    /// `"5m"` / `"1h"` 等。前回 fire から N 経過したら次 fire。
-    Interval(Duration),
-    /// `"@daily 09:00"` 等。TZ に紐付いた wall-clock 時刻で fire。
-    WallClock(WallClockSpec),
-}
-
-#[derive(Debug, Clone)]
-pub(crate) enum WallClockSpec {
-    /// 毎時 :00 に fire。
-    Hourly,
-    /// 毎日 HH:MM に fire。
+    /// 毎時、`minutes` の各分に発火。昇順・重複なしが不変条件。
+    /// `@hourly` → `[0]` / `@hourly :45` → `[45]` / `@every 15m` → `[0, 15, 30, 45]`。
+    Hourly { minutes: Vec<u32> },
+    /// 毎日 HH:MM に発火。
     Daily { hour: u32, minute: u32 },
-    /// 毎週指定曜日の HH:MM に fire。
+    /// 毎週指定曜日の HH:MM に発火。
     Weekly {
         weekday: Weekday,
         hour: u32,
         minute: u32,
     },
-    /// 毎月 D 日 HH:MM に fire。D が存在しない月 (2 月の 30 日等) は skip。
+    /// 毎月 D 日 HH:MM に発火。D が存在しない月 (2 月の 30 日等) は skip。
     Monthly { day: u32, hour: u32, minute: u32 },
-    /// 特定日時に 1 回だけ fire。TZ は manifest.tz (省略時 user local) で解釈される。
-    /// 発火後は永久 skip。起動時に既に過ぎていた場合も skip (missed-fire policy)。
+    /// 特定日時に 1 回だけ発火。TZ は manifest.tz (省略時 user local) で解釈される。
     At { datetime: NaiveDateTime },
 }
 
-/// `manifest.schedule` DSL 全体のエントリ。
+/// `manifest.schedule` DSL のエントリ。
+///
+/// 旧 interval 形式 (`"5m"` / `"1h"`) は 0.2.0 で廃止されたが、単に
+/// "unknown keyword" で落とすとエージェント開発者が移行先を推測できない。
+/// 数字始まりを検出したら移行先を名指しするエラーを返す。
 pub(crate) fn parse_schedule(s: &str) -> Result<Schedule, String> {
     let trimmed = s.trim();
     if trimmed.is_empty() {
         return Err(format!("empty schedule: '{s}'"));
     }
-    if trimmed.starts_with('@') {
-        parse_wall_clock(trimmed).map(Schedule::WallClock)
-    } else {
-        parse_interval(trimmed).map(Schedule::Interval)
+    if !trimmed.starts_with('@') {
+        if looks_like_legacy_interval(trimmed) {
+            return Err(format!(
+                "interval schedule '{trimmed}' was removed in 0.2.0; \
+                 use '@every 5m' (5/10/15/20/30) for sub-hourly, or '@hourly' / '@daily HH:MM'"
+            ));
+        }
+        return Err(format!(
+            "schedule must start with '@' (e.g. '@hourly', '@daily 09:00'), got '{trimmed}'"
+        ));
     }
-}
 
-/// Phase 1 の interval DSL。`5m` / `1h` / `10s` の形式のみ。
-/// 単位無し・複合単位 (`1h30m`) は非対応 (wall-clock DSL に譲る)。
-fn parse_interval(s: &str) -> Result<Duration, String> {
-    // char 単位で末尾を切り分ける (byte offset だと multi-byte char で panic する)
-    let mut chars = s.chars();
-    let unit = chars
-        .next_back()
-        .ok_or_else(|| format!("empty schedule: '{s}'"))?;
-    let num_part = chars.as_str();
-    if num_part.is_empty() {
-        return Err(format!("schedule missing number: '{s}'"));
-    }
-    let n: u64 = num_part
-        .parse()
-        .map_err(|_| format!("invalid schedule number in '{s}'"))?;
-    if n == 0 {
-        return Err(format!("schedule must be positive: '{s}'"));
-    }
-    let secs = match unit {
-        's' => n,
-        'm' => n
-            .checked_mul(60)
-            .ok_or_else(|| format!("schedule overflow: '{s}'"))?,
-        'h' => n
-            .checked_mul(60 * 60)
-            .ok_or_else(|| format!("schedule overflow: '{s}'"))?,
-        other => return Err(format!("unknown schedule unit '{other}' in '{s}'")),
-    };
-    Ok(Duration::from_secs(secs))
-}
-
-fn parse_wall_clock(s: &str) -> Result<WallClockSpec, String> {
-    let mut parts = s.splitn(2, char::is_whitespace);
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
     let head = parts.next().unwrap(); // starts_with('@') 済みなので必ず取れる
     let rest = parts.next().unwrap_or("").trim();
     match head {
-        "@hourly" => {
-            if !rest.is_empty() {
-                return Err(format!("@hourly takes no args, got '{rest}' in '{s}'"));
-            }
-            Ok(WallClockSpec::Hourly)
-        }
+        "@hourly" => parse_hourly(rest, trimmed),
+        "@every" => parse_every(rest, trimmed),
         "@daily" => {
-            let (h, m) = parse_hhmm(rest, s)?;
-            Ok(WallClockSpec::Daily { hour: h, minute: m })
+            let (h, m) = parse_hhmm(rest, trimmed)?;
+            Ok(Schedule::Daily { hour: h, minute: m })
         }
         "@weekly" => {
             let mut sp = rest.splitn(2, char::is_whitespace);
             let wd_s = sp
                 .next()
                 .filter(|s| !s.is_empty())
-                .ok_or_else(|| format!("@weekly missing weekday in '{s}'"))?;
+                .ok_or_else(|| format!("@weekly missing weekday in '{trimmed}'"))?;
             let time_s = sp
                 .next()
-                .ok_or_else(|| format!("@weekly missing time in '{s}'"))?
+                .ok_or_else(|| format!("@weekly missing time in '{trimmed}'"))?
                 .trim();
-            let weekday = parse_weekday(wd_s, s)?;
-            let (h, m) = parse_hhmm(time_s, s)?;
-            Ok(WallClockSpec::Weekly {
+            let weekday = parse_weekday(wd_s, trimmed)?;
+            let (h, m) = parse_hhmm(time_s, trimmed)?;
+            Ok(Schedule::Weekly {
                 weekday,
                 hour: h,
                 minute: m,
@@ -136,19 +127,21 @@ fn parse_wall_clock(s: &str) -> Result<WallClockSpec, String> {
             let d_s = sp
                 .next()
                 .filter(|s| !s.is_empty())
-                .ok_or_else(|| format!("@monthly missing day in '{s}'"))?;
+                .ok_or_else(|| format!("@monthly missing day in '{trimmed}'"))?;
             let time_s = sp
                 .next()
-                .ok_or_else(|| format!("@monthly missing time in '{s}'"))?
+                .ok_or_else(|| format!("@monthly missing time in '{trimmed}'"))?
                 .trim();
             let d: u32 = d_s
                 .parse()
-                .map_err(|_| format!("@monthly invalid day '{d_s}' in '{s}'"))?;
+                .map_err(|_| format!("@monthly invalid day '{d_s}' in '{trimmed}'"))?;
             if !(1..=31).contains(&d) {
-                return Err(format!("@monthly day out of range (1-31): '{d}' in '{s}'"));
+                return Err(format!(
+                    "@monthly day out of range (1-31): '{d}' in '{trimmed}'"
+                ));
             }
-            let (h, m) = parse_hhmm(time_s, s)?;
-            Ok(WallClockSpec::Monthly {
+            let (h, m) = parse_hhmm(time_s, trimmed)?;
+            Ok(Schedule::Monthly {
                 day: d,
                 hour: h,
                 minute: m,
@@ -156,14 +149,77 @@ fn parse_wall_clock(s: &str) -> Result<WallClockSpec, String> {
         }
         "@at" => {
             if rest.is_empty() {
-                return Err(format!("@at missing datetime in '{s}'"));
+                return Err(format!("@at missing datetime in '{trimmed}'"));
             }
             let dt = NaiveDateTime::parse_from_str(rest, "%Y-%m-%dT%H:%M")
-                .map_err(|e| format!("@at invalid datetime '{rest}' in '{s}': {e}"))?;
-            Ok(WallClockSpec::At { datetime: dt })
+                .map_err(|e| format!("@at invalid datetime '{rest}' in '{trimmed}': {e}"))?;
+            Ok(Schedule::At { datetime: dt })
         }
-        other => Err(format!("unknown wall-clock keyword '{other}' in '{s}'")),
+        other => Err(format!(
+            "unknown schedule keyword '{other}' in '{trimmed}' \
+             (expected @hourly / @every / @daily / @weekly / @monthly / @at)"
+        )),
     }
+}
+
+/// 旧 interval 形式 (`5m` / `1h` / `10s`) に見えるか。移行エラーメッセージの出し分け用。
+fn looks_like_legacy_interval(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next_back() {
+        Some('s' | 'm' | 'h') => {
+            let num = chars.as_str();
+            !num.is_empty() && num.chars().all(|c| c.is_ascii_digit())
+        }
+        _ => false,
+    }
+}
+
+/// `@hourly` (引数なし = :00) と `@hourly :MM` を扱う。
+fn parse_hourly(rest: &str, orig: &str) -> Result<Schedule, String> {
+    if rest.is_empty() {
+        return Ok(Schedule::Hourly { minutes: vec![0] });
+    }
+    let mm = rest.strip_prefix(':').ok_or_else(|| {
+        format!("@hourly argument must be ':MM' (e.g. '@hourly :45'), got '{rest}' in '{orig}'")
+    })?;
+    // カンマ区切りリストは意図的に非サポート。誤用に対して意図を明示して落とす。
+    if mm.contains(',') {
+        return Err(format!(
+            "@hourly takes a single ':MM'; comma lists are not supported \
+             (use '@every Nm' for an evenly-spaced set) in '{orig}'"
+        ));
+    }
+    let m: u32 = mm
+        .parse()
+        .map_err(|_| format!("@hourly invalid minute '{mm}' in '{orig}'"))?;
+    if m >= 60 {
+        return Err(format!(
+            "@hourly minute out of range (0-59): '{m}' in '{orig}'"
+        ));
+    }
+    Ok(Schedule::Hourly { minutes: vec![m] })
+}
+
+/// `@every <N>m` を毎時の分集合に展開する。N は [`EVERY_ALLOWED_MINUTES`] のみ。
+fn parse_every(rest: &str, orig: &str) -> Result<Schedule, String> {
+    if rest.is_empty() {
+        return Err(format!("@every missing interval in '{orig}'"));
+    }
+    let num = rest.strip_suffix('m').ok_or_else(|| {
+        format!("@every interval must be in minutes (e.g. '@every 10m'), got '{rest}' in '{orig}'")
+    })?;
+    let n: u32 = num
+        .parse()
+        .map_err(|_| format!("@every invalid interval '{rest}' in '{orig}'"))?;
+    if !EVERY_ALLOWED_MINUTES.contains(&n) {
+        return Err(format!(
+            "@every interval must be one of {EVERY_ALLOWED_MINUTES:?} minutes \
+             (a divisor of 60, so each hour expands identically), got '{n}m' in '{orig}'"
+        ));
+    }
+    // n は 60 の約数なので 0 から n 刻みで必ず 60 未満に収まる。
+    let minutes = (0..60).step_by(n as usize).collect();
+    Ok(Schedule::Hourly { minutes })
 }
 
 fn parse_hhmm(s: &str, orig: &str) -> Result<(u32, u32), String> {
@@ -231,20 +287,20 @@ pub(crate) fn resolve_tz(name: Option<&str>) -> Result<Tz, String> {
         .map_err(|e| format!("system tz '{sys}' not in chrono-tz DB: {e}"))
 }
 
-/// wall-clock schedule の「`after_ms` より厳密に後にある最も早い予定時刻」を返す (ms since epoch, UTC)。
+/// 「`after_ms` より厳密に後にある最も早い予定時刻」を返す (ms since epoch, UTC)。
 ///
-/// 用途:
-/// - worker の should_fire 判定: `next_scheduled_after(last_fire_at) <= now` なら fire
-/// - list_triggers の nextFireAt: UI 表示用に `next_scheduled_after(now)` を返す
+/// 展開器はこれを境界時刻から繰り返し呼んでホライズンまでのタスクを生成する
+/// (#26 決定事項 2)。`list_triggers` の表示用に単発で呼ぶ経路もある。
 ///
-/// 戻り値 `None` は「以降 fire することがない」を意味する (現状 `@at` の期日が past のときのみ)。
+/// 戻り値 `None` は「以降 fire することがない」を意味する (現状 `@at` の期日が past、
+/// または探索窓を越えた場合のみ)。
 ///
 /// DST 実装:
 /// - Ambiguous (fall-back) は earlier (最初の UTC 出現) を採用。2 回目は "厳密に後" 条件で
-///   自然に skip される (2 回目の UTC 時刻 > 1 回目の UTC 時刻 なので、1 回目を last としたクエリで
-///   2 回目が返ることは無い)
+///   自然に skip される (2 回目の UTC 時刻 > 1 回目の UTC 時刻 なので、1 回目を after とした
+///   クエリで 2 回目が返ることは無い)
 /// - None (spring-forward) は該当日 / 該当時刻を飛ばして次候補を探索
-pub(crate) fn next_scheduled_after(after_ms: u64, spec: &WallClockSpec, tz: &Tz) -> Option<u64> {
+pub(crate) fn next_scheduled_after(after_ms: u64, spec: &Schedule, tz: &Tz) -> Option<u64> {
     // now_millis() が u64 なので、`as i64` だと u64::MAX 近辺の値が負値に化ける。
     // 現実的な運用では発生しないが、破損した state store から巨大な値を読んだ場合の
     // silent skip を避けるため try_from で早期に None に落とす (Issue #21 #15)。
@@ -253,24 +309,27 @@ pub(crate) fn next_scheduled_after(after_ms: u64, spec: &WallClockSpec, tz: &Tz)
     let local_after = after_utc.with_timezone(tz);
 
     match spec {
-        WallClockSpec::Hourly => {
-            // 現在ローカル時刻の :00 (切り捨て) から始めて 1 時間刻みで探索。
-            // 「厳密に after より後」を要求するので、まず現在時刻の :00 を起点にして
-            // 1 時間ずつ足しながらチェックする。
-            let mut candidate = local_after
+        Schedule::Hourly { minutes } => {
+            // 現在ローカル時刻の :00 (切り捨て) を起点に、1 時間ずつ進めながら
+            // 各時間の分集合を昇順に見る。分集合は parse 時点で昇順なので、
+            // 最初に "after より後" を満たしたものが最も早い予定時刻になる。
+            let mut hour_start = local_after
                 .date_naive()
                 .and_hms_opt(local_after.hour(), 0, 0)?;
             for _ in 0..(24 * 400) {
-                candidate = candidate.checked_add_signed(chrono::TimeDelta::hours(1))?;
-                if let Some(ms) = pick_earlier_utc(tz, &candidate) {
-                    if ms > after_ms {
-                        return Some(ms);
+                for m in minutes {
+                    let naive = hour_start.with_minute(*m)?;
+                    if let Some(ms) = pick_earlier_utc(tz, &naive) {
+                        if ms > after_ms {
+                            return Some(ms);
+                        }
                     }
                 }
+                hour_start = hour_start.checked_add_signed(chrono::TimeDelta::hours(1))?;
             }
             None
         }
-        WallClockSpec::Daily { hour, minute } => {
+        Schedule::Daily { hour, minute } => {
             let mut date = local_after.date_naive();
             for _ in 0..400 {
                 if let Some(naive) = date.and_hms_opt(*hour, *minute, 0) {
@@ -284,7 +343,7 @@ pub(crate) fn next_scheduled_after(after_ms: u64, spec: &WallClockSpec, tz: &Tz)
             }
             None
         }
-        WallClockSpec::Weekly {
+        Schedule::Weekly {
             weekday,
             hour,
             minute,
@@ -304,7 +363,7 @@ pub(crate) fn next_scheduled_after(after_ms: u64, spec: &WallClockSpec, tz: &Tz)
             }
             None
         }
-        WallClockSpec::Monthly { day, hour, minute } => {
+        Schedule::Monthly { day, hour, minute } => {
             let mut year = local_after.year();
             let mut month = local_after.month();
             // 20 年 (240 ヶ月) 分回せば @monthly 31 の運用でも十分先まで到達できる。
@@ -327,7 +386,7 @@ pub(crate) fn next_scheduled_after(after_ms: u64, spec: &WallClockSpec, tz: &Tz)
             }
             None
         }
-        WallClockSpec::At { datetime } => {
+        Schedule::At { datetime } => {
             let ms = pick_earlier_utc(tz, datetime)?;
             if ms > after_ms {
                 Some(ms)
@@ -374,58 +433,122 @@ mod tests {
             .timestamp_millis() as u64
     }
 
-    // ---- parse_schedule (interval branch) ----
+    // ---- interval 廃止 (#26 決定事項 4) ----
 
     #[test]
-    fn parse_interval_basic() {
-        assert!(matches!(
-            parse_schedule("10s").unwrap(),
-            Schedule::Interval(d) if d == Duration::from_secs(10)
-        ));
-        assert!(matches!(
-            parse_schedule("5m").unwrap(),
-            Schedule::Interval(d) if d == Duration::from_secs(300)
-        ));
-        assert!(matches!(
-            parse_schedule("1h").unwrap(),
-            Schedule::Interval(d) if d == Duration::from_secs(3600)
-        ));
-        assert!(matches!(
-            parse_schedule(" 1h ").unwrap(),
-            Schedule::Interval(d) if d == Duration::from_secs(3600)
-        ));
+    fn legacy_interval_is_rejected_with_migration_hint() {
+        for s in ["10s", "5m", "1h", "6h"] {
+            let err = parse_schedule(s).unwrap_err();
+            assert!(
+                err.contains("removed in 0.2.0"),
+                "'{s}' should name the migration: {err}"
+            );
+            assert!(
+                err.contains("@every 5m"),
+                "'{s}' should point at @every: {err}"
+            );
+        }
     }
 
     #[test]
-    fn parse_interval_rejects() {
+    fn non_at_sign_is_rejected() {
+        let err = parse_schedule("daily 09:00").unwrap_err();
+        assert!(err.contains("must start with '@'"), "{err}");
         assert!(parse_schedule("").is_err());
-        assert!(parse_schedule("m").is_err());
-        assert!(parse_schedule("0m").is_err());
-        assert!(parse_schedule("1d").is_err());
-        assert!(parse_schedule("1h30m").is_err());
         assert!(parse_schedule("💾").is_err()); // multi-byte, no panic
     }
 
-    // ---- parse_schedule (wall-clock branch) ----
+    // ---- @hourly / @every (#26 決定事項 5) ----
 
     #[test]
-    fn parse_wall_clock_hourly() {
-        assert!(matches!(
+    fn parse_hourly_bare_is_minute_zero() {
+        assert_eq!(
             parse_schedule("@hourly").unwrap(),
-            Schedule::WallClock(WallClockSpec::Hourly)
-        ));
-        assert!(parse_schedule("@hourly 09:00").is_err()); // 余分な引数
+            Schedule::Hourly { minutes: vec![0] }
+        );
+        assert_eq!(
+            parse_schedule(" @hourly ").unwrap(),
+            Schedule::Hourly { minutes: vec![0] }
+        );
     }
 
     #[test]
-    fn parse_wall_clock_daily() {
-        match parse_schedule("@daily 09:00").unwrap() {
-            Schedule::WallClock(WallClockSpec::Daily { hour, minute }) => {
-                assert_eq!(hour, 9);
-                assert_eq!(minute, 0);
+    fn parse_hourly_with_minute() {
+        assert_eq!(
+            parse_schedule("@hourly :45").unwrap(),
+            Schedule::Hourly { minutes: vec![45] }
+        );
+        assert_eq!(
+            parse_schedule("@hourly :00").unwrap(),
+            Schedule::Hourly { minutes: vec![0] }
+        );
+    }
+
+    #[test]
+    fn parse_hourly_rejects_bad_args() {
+        assert!(parse_schedule("@hourly 45").is_err()); // ':' 無し
+        assert!(parse_schedule("@hourly :60").is_err());
+        assert!(parse_schedule("@hourly :xx").is_err());
+    }
+
+    // カンマ区切りリストは DSL に露出させない (cron への滑りを防ぐ)。
+    // 誤用時に「非サポート」と名指しで落ちることを保証する。
+    #[test]
+    fn parse_hourly_rejects_comma_list() {
+        let err = parse_schedule("@hourly :00,:15,:45").unwrap_err();
+        assert!(err.contains("comma lists are not supported"), "{err}");
+    }
+
+    #[test]
+    fn parse_every_expands_to_minute_set() {
+        assert_eq!(
+            parse_schedule("@every 10m").unwrap(),
+            Schedule::Hourly {
+                minutes: vec![0, 10, 20, 30, 40, 50]
             }
-            other => panic!("unexpected: {other:?}"),
+        );
+        assert_eq!(
+            parse_schedule("@every 15m").unwrap(),
+            Schedule::Hourly {
+                minutes: vec![0, 15, 30, 45]
+            }
+        );
+        assert_eq!(
+            parse_schedule("@every 30m").unwrap(),
+            Schedule::Hourly {
+                minutes: vec![0, 30]
+            }
+        );
+        // 下限。288 件/日を生成する。
+        assert_eq!(
+            parse_schedule("@every 5m").unwrap(),
+            Schedule::Hourly {
+                minutes: (0..60).step_by(5).collect()
+            }
+        );
+    }
+
+    // 60 の約数でない値、および約数でも allowlist 外 (6 / 12) を拒否する。
+    // allowlist に絞る理由は「毎時同じ分集合になる」ことと DSL の丸さの両立 (#26)。
+    #[test]
+    fn parse_every_rejects_non_allowlisted() {
+        for s in ["@every 7m", "@every 6m", "@every 12m", "@every 60m"] {
+            let err = parse_schedule(s).unwrap_err();
+            assert!(err.contains("must be one of"), "'{s}': {err}");
         }
+        assert!(parse_schedule("@every 4m").is_err());
+        assert!(parse_schedule("@every 1h").is_err()); // 分単位のみ
+        assert!(parse_schedule("@every").is_err());
+    }
+
+    // ---- 既存 DSL の回帰 ----
+
+    #[test]
+    fn parse_daily() {
+        assert_eq!(
+            parse_schedule("@daily 09:00").unwrap(),
+            Schedule::Daily { hour: 9, minute: 0 }
+        );
         assert!(parse_schedule("@daily").is_err());
         assert!(parse_schedule("@daily 25:00").is_err());
         assert!(parse_schedule("@daily 09:99").is_err());
@@ -433,43 +556,39 @@ mod tests {
     }
 
     #[test]
-    fn parse_wall_clock_weekly() {
-        match parse_schedule("@weekly MON 09:00").unwrap() {
-            Schedule::WallClock(WallClockSpec::Weekly {
-                weekday,
-                hour,
-                minute,
-            }) => {
-                assert_eq!(weekday, Weekday::Mon);
-                assert_eq!(hour, 9);
-                assert_eq!(minute, 0);
+    fn parse_weekly() {
+        assert_eq!(
+            parse_schedule("@weekly MON 09:00").unwrap(),
+            Schedule::Weekly {
+                weekday: Weekday::Mon,
+                hour: 9,
+                minute: 0
             }
-            other => panic!("unexpected: {other:?}"),
-        }
+        );
         assert!(parse_schedule("@weekly Mon 09:00").is_err()); // 小文字は拒否
         assert!(parse_schedule("@weekly XYZ 09:00").is_err());
         assert!(parse_schedule("@weekly MON").is_err());
     }
 
     #[test]
-    fn parse_wall_clock_monthly() {
-        match parse_schedule("@monthly 15 09:00").unwrap() {
-            Schedule::WallClock(WallClockSpec::Monthly { day, hour, minute }) => {
-                assert_eq!(day, 15);
-                assert_eq!(hour, 9);
-                assert_eq!(minute, 0);
+    fn parse_monthly() {
+        assert_eq!(
+            parse_schedule("@monthly 15 09:00").unwrap(),
+            Schedule::Monthly {
+                day: 15,
+                hour: 9,
+                minute: 0
             }
-            other => panic!("unexpected: {other:?}"),
-        }
+        );
         assert!(parse_schedule("@monthly 0 09:00").is_err());
         assert!(parse_schedule("@monthly 32 09:00").is_err());
         assert!(parse_schedule("@monthly 15").is_err());
     }
 
     #[test]
-    fn parse_wall_clock_at() {
+    fn parse_at() {
         match parse_schedule("@at 2026-08-01T18:30").unwrap() {
-            Schedule::WallClock(WallClockSpec::At { datetime }) => {
+            Schedule::At { datetime } => {
                 assert_eq!(datetime.year(), 2026);
                 assert_eq!(datetime.month(), 8);
                 assert_eq!(datetime.day(), 1);
@@ -484,7 +603,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_wall_clock_unknown_keyword() {
+    fn parse_unknown_keyword() {
         assert!(parse_schedule("@yearly").is_err());
         assert!(parse_schedule("@").is_err());
     }
@@ -493,73 +612,150 @@ mod tests {
 
     #[test]
     fn hourly_utc() {
-        let spec = WallClockSpec::Hourly;
+        let spec = Schedule::Hourly { minutes: vec![0] };
         let tz = tz_utc();
         // 12:30 → 次は 13:00
         let after = utc_ms(2026, 3, 1, 12, 30);
-        let next = next_scheduled_after(after, &spec, &tz).unwrap();
-        assert_eq!(next, utc_ms(2026, 3, 1, 13, 0));
+        assert_eq!(
+            next_scheduled_after(after, &spec, &tz).unwrap(),
+            utc_ms(2026, 3, 1, 13, 0)
+        );
         // ちょうど 13:00 → 次は 14:00 (厳密に後)
         let after2 = utc_ms(2026, 3, 1, 13, 0);
-        let next2 = next_scheduled_after(after2, &spec, &tz).unwrap();
-        assert_eq!(next2, utc_ms(2026, 3, 1, 14, 0));
+        assert_eq!(
+            next_scheduled_after(after2, &spec, &tz).unwrap(),
+            utc_ms(2026, 3, 1, 14, 0)
+        );
+    }
+
+    // @hourly :45 は毎時 :45 のみ。:00 を返してはいけない。
+    #[test]
+    fn hourly_with_minute_offset() {
+        let spec = Schedule::Hourly { minutes: vec![45] };
+        let tz = tz_utc();
+        // 12:30 → 同じ時間の 12:45
+        assert_eq!(
+            next_scheduled_after(utc_ms(2026, 3, 1, 12, 30), &spec, &tz).unwrap(),
+            utc_ms(2026, 3, 1, 12, 45)
+        );
+        // 12:45 ちょうど → 翌時 13:45
+        assert_eq!(
+            next_scheduled_after(utc_ms(2026, 3, 1, 12, 45), &spec, &tz).unwrap(),
+            utc_ms(2026, 3, 1, 13, 45)
+        );
+        // 12:50 → 翌時 13:45 (:00 に戻らない)
+        assert_eq!(
+            next_scheduled_after(utc_ms(2026, 3, 1, 12, 50), &spec, &tz).unwrap(),
+            utc_ms(2026, 3, 1, 13, 45)
+        );
+    }
+
+    // @every は分集合を昇順に走査し、時間をまたぐときに :00 へ正しく戻る。
+    #[test]
+    fn hourly_minute_set_walks_and_wraps() {
+        let spec = parse_schedule("@every 20m").unwrap(); // :00, :20, :40
+        let tz = tz_utc();
+        assert_eq!(
+            next_scheduled_after(utc_ms(2026, 3, 1, 12, 0), &spec, &tz).unwrap(),
+            utc_ms(2026, 3, 1, 12, 20)
+        );
+        assert_eq!(
+            next_scheduled_after(utc_ms(2026, 3, 1, 12, 20), &spec, &tz).unwrap(),
+            utc_ms(2026, 3, 1, 12, 40)
+        );
+        // :40 の次は翌時 :00 に wrap する
+        assert_eq!(
+            next_scheduled_after(utc_ms(2026, 3, 1, 12, 40), &spec, &tz).unwrap(),
+            utc_ms(2026, 3, 1, 13, 0)
+        );
+        // 分集合の隙間 (12:41) からでも次は 13:00
+        assert_eq!(
+            next_scheduled_after(utc_ms(2026, 3, 1, 12, 41), &spec, &tz).unwrap(),
+            utc_ms(2026, 3, 1, 13, 0)
+        );
+    }
+
+    // 展開器の使い方 (境界から繰り返し呼ぶ) が正しい列を生むことを保証する。
+    // これは #26 決定事項 2 の生成器としての契約そのもの。
+    #[test]
+    fn hourly_minute_set_generates_dense_sequence() {
+        let spec = parse_schedule("@every 30m").unwrap();
+        let tz = tz_utc();
+        let mut cursor = utc_ms(2026, 3, 1, 12, 0);
+        let mut generated = Vec::new();
+        for _ in 0..4 {
+            cursor = next_scheduled_after(cursor, &spec, &tz).unwrap();
+            generated.push(cursor);
+        }
+        assert_eq!(
+            generated,
+            vec![
+                utc_ms(2026, 3, 1, 12, 30),
+                utc_ms(2026, 3, 1, 13, 0),
+                utc_ms(2026, 3, 1, 13, 30),
+                utc_ms(2026, 3, 1, 14, 0),
+            ]
+        );
     }
 
     #[test]
     fn daily_tokyo_next_is_today() {
         // JST 08:00 (UTC 前日 23:00) から @daily 09:00 → JST 当日 09:00 (UTC 00:00)
-        let spec = WallClockSpec::Daily { hour: 9, minute: 0 };
+        let spec = Schedule::Daily { hour: 9, minute: 0 };
         let tz = tz_tokyo();
         let after = utc_ms(2026, 7, 18, 23, 0); // JST 2026-07-19 08:00
-        let next = next_scheduled_after(after, &spec, &tz).unwrap();
-        // JST 2026-07-19 09:00 = UTC 2026-07-19 00:00
-        assert_eq!(next, utc_ms(2026, 7, 19, 0, 0));
+        assert_eq!(
+            next_scheduled_after(after, &spec, &tz).unwrap(),
+            utc_ms(2026, 7, 19, 0, 0)
+        );
     }
 
     #[test]
     fn daily_tokyo_missed_becomes_tomorrow() {
         // JST 10:00 から @daily 09:00 → 翌日 09:00
-        let spec = WallClockSpec::Daily { hour: 9, minute: 0 };
+        let spec = Schedule::Daily { hour: 9, minute: 0 };
         let tz = tz_tokyo();
         let after = utc_ms(2026, 7, 19, 1, 0); // JST 2026-07-19 10:00
-        let next = next_scheduled_after(after, &spec, &tz).unwrap();
-        // JST 2026-07-20 09:00 = UTC 2026-07-20 00:00
-        assert_eq!(next, utc_ms(2026, 7, 20, 0, 0));
+        assert_eq!(
+            next_scheduled_after(after, &spec, &tz).unwrap(),
+            utc_ms(2026, 7, 20, 0, 0)
+        );
     }
 
     #[test]
     fn weekly_next_monday() {
-        let spec = WallClockSpec::Weekly {
+        let spec = Schedule::Weekly {
             weekday: Weekday::Mon,
             hour: 9,
             minute: 0,
         };
         let tz = tz_tokyo();
         let after = utc_ms(2026, 7, 19, 1, 0); // JST 2026-07-19 (日) 10:00
-        let next = next_scheduled_after(after, &spec, &tz).unwrap();
-        // JST 2026-07-20 (月) 09:00 = UTC 2026-07-20 00:00
-        assert_eq!(next, utc_ms(2026, 7, 20, 0, 0));
+        assert_eq!(
+            next_scheduled_after(after, &spec, &tz).unwrap(),
+            utc_ms(2026, 7, 20, 0, 0)
+        );
     }
 
     #[test]
     fn monthly_skips_missing_day() {
         // @monthly 31 09:00 in Tokyo: 2026-02 には 31 日が無いので 2026-03-31 に飛ぶ
-        let spec = WallClockSpec::Monthly {
+        let spec = Schedule::Monthly {
             day: 31,
             hour: 9,
             minute: 0,
         };
         let tz = tz_tokyo();
-        // JST 2026-02-01 00:00 (= UTC 2026-01-31 15:00) から
-        let after = utc_ms(2026, 1, 31, 15, 0);
-        let next = next_scheduled_after(after, &spec, &tz).unwrap();
-        // 2026-02-31 は無い → 2026-03-31 09:00 JST = UTC 2026-03-31 00:00
-        assert_eq!(next, utc_ms(2026, 3, 31, 0, 0));
+        let after = utc_ms(2026, 1, 31, 15, 0); // JST 2026-02-01 00:00
+        assert_eq!(
+            next_scheduled_after(after, &spec, &tz).unwrap(),
+            utc_ms(2026, 3, 31, 0, 0)
+        );
     }
 
     #[test]
     fn at_returns_target_when_future() {
-        let spec = WallClockSpec::At {
+        let spec = Schedule::At {
             datetime: NaiveDate::from_ymd_opt(2026, 8, 1)
                 .unwrap()
                 .and_hms_opt(18, 30, 0)
@@ -567,22 +763,23 @@ mod tests {
         };
         let tz = tz_tokyo();
         let after = utc_ms(2026, 7, 19, 0, 0);
-        let next = next_scheduled_after(after, &spec, &tz).unwrap();
         // JST 2026-08-01 18:30 = UTC 2026-08-01 09:30
-        assert_eq!(next, utc_ms(2026, 8, 1, 9, 30));
+        assert_eq!(
+            next_scheduled_after(after, &spec, &tz).unwrap(),
+            utc_ms(2026, 8, 1, 9, 30)
+        );
     }
 
     #[test]
     fn at_returns_none_when_past() {
-        let spec = WallClockSpec::At {
+        let spec = Schedule::At {
             datetime: NaiveDate::from_ymd_opt(2026, 7, 1)
                 .unwrap()
                 .and_hms_opt(18, 30, 0)
                 .unwrap(),
         };
         let tz = tz_tokyo();
-        let after = utc_ms(2026, 7, 19, 0, 0);
-        assert!(next_scheduled_after(after, &spec, &tz).is_none());
+        assert!(next_scheduled_after(utc_ms(2026, 7, 19, 0, 0), &spec, &tz).is_none());
     }
 
     // ---- DST semantics (America/Los_Angeles) ----
@@ -590,70 +787,86 @@ mod tests {
     #[test]
     fn dst_spring_forward_skips_nonexistent_time() {
         // 2026-03-08 の LA は 02:00 → 03:00 (02:30 は存在しない)
-        // @daily 02:30 で 2026-03-07 の LA 深夜から探索 → 2026-03-08 は skip、2026-03-09 02:30 になる
-        let spec = WallClockSpec::Daily {
+        let spec = Schedule::Daily {
             hour: 2,
             minute: 30,
         };
         let tz = tz_la();
-        // LA 2026-03-07 23:00 PST (UTC-8) = UTC 2026-03-08 07:00
-        let after = utc_ms(2026, 3, 8, 7, 0);
-        let next = next_scheduled_after(after, &spec, &tz).unwrap();
-        // 2026-03-08 02:30 は存在しない → 2026-03-09 02:30 PDT (UTC-7) = UTC 2026-03-09 09:30
-        assert_eq!(next, utc_ms(2026, 3, 9, 9, 30));
+        let after = utc_ms(2026, 3, 8, 7, 0); // LA 2026-03-07 23:00 PST
+                                              // 2026-03-08 02:30 は存在しない → 2026-03-09 02:30 PDT (UTC-7)
+        assert_eq!(
+            next_scheduled_after(after, &spec, &tz).unwrap(),
+            utc_ms(2026, 3, 9, 9, 30)
+        );
+    }
+
+    // spring-forward の欠落時間は @hourly でも飛ばされる。LA の 2026-03-08 は
+    // 02:00-02:59 が存在しないので、01:00 の次は 03:00 になる。
+    #[test]
+    fn dst_spring_forward_skips_missing_hour_for_hourly() {
+        let spec = Schedule::Hourly { minutes: vec![0] };
+        let tz = tz_la();
+        // LA 2026-03-08 01:00 PST (UTC-8) = UTC 09:00
+        let after = utc_ms(2026, 3, 8, 9, 0);
+        // 次は LA 03:00 PDT (UTC-7) = UTC 10:00 (02:00 は存在しない)
+        assert_eq!(
+            next_scheduled_after(after, &spec, &tz).unwrap(),
+            utc_ms(2026, 3, 8, 10, 0)
+        );
     }
 
     #[test]
     fn dst_fall_back_fires_earlier_occurrence() {
         // 2026-11-01 LA: 02:00 → 01:00 (01:00-01:59 が 2 回来る)
-        // @daily 01:30 → 1 回目 (PDT UTC-7) を発火時刻とする
-        let spec = WallClockSpec::Daily {
+        let spec = Schedule::Daily {
             hour: 1,
             minute: 30,
         };
         let tz = tz_la();
-        // LA 2026-10-31 23:00 PDT (UTC-7) = UTC 2026-11-01 06:00
-        let after = utc_ms(2026, 11, 1, 6, 0);
-        let next = next_scheduled_after(after, &spec, &tz).unwrap();
-        // 1 回目 (PDT UTC-7) = UTC 2026-11-01 08:30
-        assert_eq!(next, utc_ms(2026, 11, 1, 8, 30));
+        let after = utc_ms(2026, 11, 1, 6, 0); // LA 2026-10-31 23:00 PDT
+                                               // 1 回目 (PDT UTC-7) = UTC 2026-11-01 08:30
+        assert_eq!(
+            next_scheduled_after(after, &spec, &tz).unwrap(),
+            utc_ms(2026, 11, 1, 8, 30)
+        );
     }
 
     #[test]
     fn dst_fall_back_second_occurrence_is_skipped() {
-        // 1 回目 (08:30 UTC) を last とした次クエリでは、2 回目 (09:30 UTC) ではなく
-        // 翌日 01:30 (PST UTC-8) = UTC 2026-11-02 09:30 が返らないといけない
-        let spec = WallClockSpec::Daily {
+        let spec = Schedule::Daily {
             hour: 1,
             minute: 30,
         };
         let tz = tz_la();
         let after = utc_ms(2026, 11, 1, 8, 30); // 1 回目 fire 直後
-        let next = next_scheduled_after(after, &spec, &tz).unwrap();
-        // 翌日 01:30 PST = UTC 2026-11-02 09:30 (day+25h から、DST 終わったので 8h→9h)
-        assert_eq!(next, utc_ms(2026, 11, 2, 9, 30));
+                                                // 2 回目 (09:30 UTC) ではなく翌日 01:30 PST = UTC 2026-11-02 09:30
+        assert_eq!(
+            next_scheduled_after(after, &spec, &tz).unwrap(),
+            utc_ms(2026, 11, 2, 9, 30)
+        );
     }
 
     #[test]
     fn at_spring_forward_never_fires() {
         // 2026-03-08 の LA で @at 2026-03-08T02:30 → 存在しない時刻 → 永久 skip
-        let spec = WallClockSpec::At {
+        let spec = Schedule::At {
             datetime: NaiveDate::from_ymd_opt(2026, 3, 8)
                 .unwrap()
                 .and_hms_opt(2, 30, 0)
                 .unwrap(),
         };
         let tz = tz_la();
-        let after = utc_ms(2026, 3, 1, 0, 0);
-        assert!(next_scheduled_after(after, &spec, &tz).is_none());
+        assert!(next_scheduled_after(utc_ms(2026, 3, 1, 0, 0), &spec, &tz).is_none());
     }
 
     // ---- resolve_tz ----
 
     #[test]
     fn resolve_tz_explicit() {
-        let tz = resolve_tz(Some("Asia/Tokyo")).unwrap();
-        assert_eq!(tz, chrono_tz::Asia::Tokyo);
+        assert_eq!(
+            resolve_tz(Some("Asia/Tokyo")).unwrap(),
+            chrono_tz::Asia::Tokyo
+        );
     }
 
     #[test]
@@ -663,9 +876,6 @@ mod tests {
 
     // TZ env の優先を確認する。dev container の `/etc/localtime = UTC` + `TZ=Asia/Tokyo`
     // で app が UTC を採ってしまうバグに対する regression。
-    // TZ env は test 実行環境自体に副作用があるので、他のテストと並行しないよう
-    // `#[cfg(test)]` 側でシリアライズさせる方法もあるが、
-    // ここでは単発 test で set → assert → restore を素直に行う。
     #[test]
     fn resolve_tz_respects_tz_env() {
         let saved = std::env::var("TZ").ok();

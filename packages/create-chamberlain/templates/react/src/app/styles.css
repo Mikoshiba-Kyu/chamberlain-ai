@@ -124,6 +124,38 @@ body {
   }
 }
 
+/* パネル見出し直下のサマリ行 (件数 + 内訳) */
+.panel-summary {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin: 0 0 12px;
+}
+
+.panel-summary-count {
+  font-size: 22px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.panel-summary-unit {
+  font-size: 13px;
+  color: #6b6b6f;
+}
+
+.panel-summary-detail {
+  margin-left: 6px;
+  font-size: 12px;
+  color: #6b6b6f;
+}
+
+@media (prefers-color-scheme: dark) {
+  .panel-summary-unit,
+  .panel-summary-detail {
+    color: #a1a1a6;
+  }
+}
+
 /* Trigger list */
 .trigger-list {
   list-style: none;
@@ -168,6 +200,28 @@ body {
   }
 }
 
+.trigger-schedule {
+  margin-top: 4px;
+  font-size: 12px;
+  color: #6b6b6f;
+}
+
+/* 予定リストで「あと N 分」を時刻の隣に添える */
+.task-relative {
+  margin-left: 10px;
+  font-family: inherit;
+  font-weight: 400;
+  font-size: 12px;
+  color: #6b6b6f;
+}
+
+@media (prefers-color-scheme: dark) {
+  .trigger-schedule,
+  .task-relative {
+    color: #a1a1a6;
+  }
+}
+
 .trigger-status {
   display: flex;
   align-items: center;
@@ -195,6 +249,17 @@ body {
   color: #b3261e;
 }
 
+/* 予定の origin バッジ。定期 (manifest 由来) と 手動・依頼 (ad-hoc) を見分ける */
+.status-schedule {
+  background: rgba(0, 122, 255, 0.16);
+  color: #0a5dc2;
+}
+
+.status-adhoc {
+  background: rgba(255, 149, 0, 0.2);
+  color: #96590a;
+}
+
 .trigger-error {
   margin-top: 4px;
   font-size: 12px;
@@ -211,6 +276,12 @@ body {
   }
   .status-error {
     color: #ff8a80;
+  }
+  .status-schedule {
+    color: #8ec5ff;
+  }
+  .status-adhoc {
+    color: #ffc978;
   }
   .trigger-error {
     color: #ff8a80;
