@@ -24,4 +24,4 @@ tauri = { version = "2", features = [] }
 # 直接依存として宣言する必要がある。
 tauri-plugin-notification = "2"
 tauri-plugin-store = "2"
-chamberlain-core = "0.1"
+chamberlain-core = "0.2"

@@ -1,6 +1,6 @@
 [package]
 name = "chamberlain-core"
-version = "0.1.1"
+version = "0.2.0"
 description = "Chamberlain framework core: heartbeat tick, trigger discovery, JS runtime host, state store, OS notification, tray"
 authors = ["Mikoshiba-Kyu"]
 edition = "2021"
