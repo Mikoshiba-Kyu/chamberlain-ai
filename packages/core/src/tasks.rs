@@ -366,21 +366,16 @@ pub(crate) struct ReconcileReport {
     pub orphaned: Vec<(String, String)>,
     /// schedule / tz が変わったので未実行タスクを捨てて再展開したトリガー id。
     pub rescheduled: Vec<String>,
-    /// 猶予を超えて古くなっていたので一括破棄した予定 (トリガーごとに 1 件)。
-    pub stale: Vec<StaleSweep>,
 }
 
-/// 長期停止からの復帰で一括破棄した予定の要約 (#50)。
+/// [`sweep_stale`] が破棄した予定を、トリガーごとにまとめたもの。
 ///
-/// 1 件ずつではなくトリガー単位に畳む。48h 先まで展開されたタスクが 2 日の停止で
-/// 全部過去になると、`@every 5m` なら 576 件になる。同じことを言う行が観測面を埋め、
-/// **起動時にしか出ない `[expanded]` / `[rescheduled]` を押し流してしまう**。
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct StaleSweep {
+/// `tasks` は `scheduled_at` 昇順 ([`TaskStore`] の不変条件がそのまま残る) なので、
+/// 先頭が最も古い。
+#[derive(Debug)]
+pub(crate) struct StaleGroup {
     pub trigger_id: String,
-    pub count: usize,
-    /// 破棄したうち最も古い `scheduled_at`。「いつから止まっていたか」が読める。
-    pub oldest: u64,
+    pub tasks: Vec<Task>,
 }
 
 /// 起動時に永続タスクリストを現在の manifest と突き合わせる。
@@ -398,7 +393,6 @@ pub(crate) fn reconcile(
     store: &mut TaskStore,
     triggers: &[TriggerSpecView<'_>],
     now: u64,
-    schedule_grace: Duration,
 ) -> ReconcileReport {
     let known: HashSet<&str> = triggers.iter().map(|t| t.id).collect();
     let mut report = ReconcileReport::default();
@@ -458,40 +452,60 @@ pub(crate) fn reconcile(
         });
     }
 
-    // 3. 長期停止からの復帰の掃除 (#50)。
-    //
-    // 猶予を超えた schedule 由来タスクは **絶対に実行されない** ([`classify_due`] が
-    // `SkippedLate` を返す)。それを心拍で 1 件ずつ発見すると、2 日の停止で数十〜数百件の
-    // 同じ行が観測面を埋める。判定は心拍と同一で、報告だけをトリガー単位に畳む。
-    //
-    // pause 状態を見ないのは、**pause が永続化されていない**ため。起動直後は必ず
-    // 全トリガーが実行中で、`Disposition::Paused` に化ける行は存在しない。
+    store.sort();
+    report
+}
+
+/// 猶予を超えて古くなった schedule 由来タスクを破棄し、トリガーごとにまとめて返す
+/// (#50 / #53)。
+///
+/// # なぜ心拍の分類とは別に置くのか
+///
+/// 判定自体は [`classify_due`] の `SkippedLate` と同一である。分けているのは**報告の
+/// 粒度**のためで、心拍が 1 件ずつ発見すると長期の不在から復帰したときに同じことを言う
+/// 行が観測面を埋める。48h 先まで展開された状態で 2 日空くと `@every 5m` で 576 件になり、
+/// **その回にしか出ない `[expanded]` / `[rescheduled]` を押し流してしまう** (#50)。
+///
+/// 心拍と起動時突き合わせの**両方**から呼ぶ。#50 では起動時だけの特別扱いにしていたが、
+/// それだとプロセスを保ったままのスリープ復帰が塞がらなかった (#53)。掃除が 1 箇所に
+/// あれば、その区別自体が要らない。
+///
+/// # 対象
+///
+/// **schedule 由来だけ。** ad-hoc は猶予 24h 内なら遅れても実行しなければならず
+/// (決定事項 8)、超過分は手動由来で件数が知れているので心拍が `[expired]` として
+/// 1 件ずつ扱う。
+///
+/// pause 状態は見ない。pause 中のタスクは due 判定側が `Paused` として破棄するが、
+/// **pause は永続化されない**ので起動直後は必ず全トリガーが実行中である。心拍中に
+/// pause されたトリガーのタスクがここで拾われることはありうるが、どちらも「破棄」で
+/// 結論は変わらない。
+pub(crate) fn sweep_stale(
+    store: &mut TaskStore,
+    now: u64,
+    schedule_grace: Duration,
+) -> Vec<StaleGroup> {
     let cutoff = now.saturating_sub(schedule_grace.as_millis() as u64);
-    let mut swept: BTreeMap<String, (usize, u64)> = BTreeMap::new();
-    store.tasks.retain(|t| {
-        if t.origin != TaskOrigin::Schedule || t.scheduled_at >= cutoff {
-            return true;
+    let mut groups: BTreeMap<String, Vec<Task>> = BTreeMap::new();
+    let mut kept = Vec::with_capacity(store.tasks.len());
+
+    for task in std::mem::take(&mut store.tasks) {
+        if task.origin != TaskOrigin::Schedule || task.scheduled_at >= cutoff {
+            kept.push(task);
+            continue;
         }
-        let key = t
+        let key = task
             .trigger_id
             .clone()
             .unwrap_or_else(|| "__task__".to_string());
-        let entry = swept.entry(key).or_insert((0, t.scheduled_at));
-        entry.0 += 1;
-        entry.1 = entry.1.min(t.scheduled_at);
-        false
-    });
-    report.stale = swept
-        .into_iter()
-        .map(|(trigger_id, (count, oldest))| StaleSweep {
-            trigger_id,
-            count,
-            oldest,
-        })
-        .collect();
+        groups.entry(key).or_default().push(task);
+    }
+    store.tasks = kept;
 
-    store.sort();
-    report
+    groups
+        .into_iter()
+        .map(|(trigger_id, tasks)| StaleGroup { trigger_id, tasks })
+        .collect()
 }
 
 #[cfg(test)]
@@ -795,7 +809,6 @@ mod tests {
                 tz: None,
             }],
             now,
-            grace(),
         );
 
         assert_eq!(store.tasks.len(), 1);
@@ -812,7 +825,7 @@ mod tests {
         let now = base();
         let mut store = TaskStore::default();
         store.insert(adhoc_task(Some("gone"), now));
-        let report = reconcile(&mut store, &[], now, grace());
+        let report = reconcile(&mut store, &[], now);
         assert!(store.tasks.is_empty());
         assert_eq!(report.orphaned.len(), 1);
     }
@@ -842,7 +855,6 @@ mod tests {
                 tz: None,
             }],
             now,
-            grace(),
         );
 
         assert_eq!(report.rescheduled, vec!["greeter".to_string()]);
@@ -876,7 +888,6 @@ mod tests {
                 tz: Some("Europe/Berlin"),
             }],
             now,
-            grace(),
         );
         assert_eq!(report.rescheduled, vec!["greeter".to_string()]);
         assert_eq!(store.expansion["greeter"].expanded_until, now);
@@ -904,7 +915,6 @@ mod tests {
                 tz: Some("Asia/Tokyo"),
             }],
             now,
-            grace(),
         );
         assert_eq!(report, ReconcileReport::default());
         assert_eq!(store.tasks.len(), 1);
@@ -934,7 +944,6 @@ mod tests {
                 tz: None,
             }],
             now,
-            grace(),
         );
         assert_eq!(store.tasks.len(), 1);
         assert_eq!(store.tasks[0].origin, TaskOrigin::Adhoc);
@@ -953,7 +962,6 @@ mod tests {
                 tz: None,
             }],
             now,
-            grace(),
         );
         assert_eq!(report, ReconcileReport::default());
         assert_eq!(store.expansion["fresh"].expanded_until, now);
@@ -1018,12 +1026,12 @@ mod tests {
         assert!(parsed.tasks[0].trigger_id.is_none());
     }
 
-    // ---- 長期停止からの復帰 (#50) --------------------------------------------
+    // ---- 猶予超過の掃除 (#50 / #53) ------------------------------------------
 
     /// 2 日閉じていた後の起動を模す。積まれていた schedule 由来タスクが全部過去に
-    /// なっているので、心拍で 1 件ずつ破棄せず起動時に畳んで捨てる。
+    /// なっているので、1 件ずつではなくトリガー単位にまとめて返す。
     #[test]
-    fn reconcile_sweeps_stale_schedule_tasks() {
+    fn sweep_stale_groups_by_trigger() {
         let now = base();
         let mut store = TaskStore::default();
         // 2 日前から 1 時間前まで、48 件すべてが過去。
@@ -1032,30 +1040,14 @@ mod tests {
         }
         // 猶予内 (1 分遅れ) のものは残す。心拍が拾って実行する。
         store.insert(schedule_task("hourly", now - 60_000));
-        store.expansion.insert(
-            "hourly".into(),
-            ExpansionState {
-                expanded_until: now,
-                schedule: "@hourly".into(),
-                tz: None,
-            },
-        );
 
-        let report = reconcile(
-            &mut store,
-            &[TriggerSpecView {
-                id: "hourly",
-                schedule: "@hourly",
-                tz: None,
-            }],
-            now,
-            grace(),
-        );
+        let groups = sweep_stale(&mut store, now, grace());
 
-        assert_eq!(report.stale.len(), 1, "報告はトリガー単位に畳む");
-        assert_eq!(report.stale[0].trigger_id, "hourly");
-        assert_eq!(report.stale[0].count, 48);
-        assert_eq!(report.stale[0].oldest, now - 2 * DAY);
+        assert_eq!(groups.len(), 1, "報告はトリガー単位に畳む");
+        assert_eq!(groups[0].trigger_id, "hourly");
+        assert_eq!(groups[0].tasks.len(), 48);
+        // 先頭が最も古い (呼び出し側が「最古」として出す)。
+        assert_eq!(groups[0].tasks[0].scheduled_at, now - 2 * DAY);
         // 猶予内の 1 件だけ残る。
         assert_eq!(store.tasks.len(), 1);
         assert_eq!(store.tasks[0].scheduled_at, now - 60_000);
@@ -1085,106 +1077,81 @@ mod tests {
 
             let mut store = TaskStore::default();
             store.insert(task);
-            reconcile(
-                &mut store,
-                &[TriggerSpecView {
-                    id: "t",
-                    schedule: "@hourly",
-                    tz: None,
-                }],
-                now,
-                grace(),
+            sweep_stale(&mut store, now, grace());
+            assert_eq!(
+                !store.tasks.is_empty(),
+                should_survive,
+                "sweep_stale の判定"
             );
-            assert_eq!(!store.tasks.is_empty(), should_survive, "reconcile の判定");
         }
     }
 
     /// ad-hoc は触らない。猶予 24h 内なら遅れても実行しなければならず (決定事項 8)、
     /// 超過分は心拍が `[expired]` として 1 件ずつ扱う (手動由来なので件数が知れている)。
     #[test]
-    fn reconcile_leaves_adhoc_tasks_alone() {
+    fn sweep_stale_leaves_adhoc_tasks_alone() {
         let now = base();
         let mut store = TaskStore::default();
         store.insert(adhoc_task(Some("t"), now - 2 * DAY));
         store.insert(adhoc_task(Some("t"), now - HOUR));
 
-        let report = reconcile(
-            &mut store,
-            &[TriggerSpecView {
-                id: "t",
-                schedule: "@hourly",
-                tz: None,
-            }],
-            now,
-            grace(),
-        );
+        let groups = sweep_stale(&mut store, now, grace());
 
-        assert!(report.stale.is_empty());
+        assert!(groups.is_empty());
         assert_eq!(store.tasks.len(), 2);
     }
 
-    /// トリガーが複数あれば報告も複数。1 行にまとめてしまうと「どのトリガーが
+    /// トリガーが複数あれば group も複数。1 つにまとめてしまうと「どのトリガーが
     /// 止まっていたか」が消える。
     #[test]
-    fn stale_sweep_is_reported_per_trigger() {
+    fn sweep_stale_keeps_triggers_apart() {
         let now = base();
         let mut store = TaskStore::default();
         store.insert(schedule_task("a", now - DAY));
         store.insert(schedule_task("a", now - 2 * DAY));
         store.insert(schedule_task("b", now - 3 * HOUR));
 
-        let views = [
-            TriggerSpecView {
-                id: "a",
-                schedule: "@hourly",
-                tz: None,
-            },
-            TriggerSpecView {
-                id: "b",
-                schedule: "@hourly",
-                tz: None,
-            },
-        ];
-        let report = reconcile(&mut store, &views, now, grace());
+        let groups = sweep_stale(&mut store, now, grace());
 
         assert_eq!(
-            report
-                .stale
+            groups
                 .iter()
-                .map(|s| (s.trigger_id.as_str(), s.count, s.oldest))
+                .map(|g| (
+                    g.trigger_id.as_str(),
+                    g.tasks.len(),
+                    g.tasks[0].scheduled_at
+                ))
                 .collect::<Vec<_>>(),
             vec![("a", 2, now - 2 * DAY), ("b", 1, now - 3 * HOUR)]
         );
+        assert!(store.tasks.is_empty());
     }
 
-    /// 未来のタスクは当然残る。長期停止からの復帰でなければ何も起きない。
+    /// 未来のタスクは当然残る。掃除は何も起こさない。
     #[test]
-    fn reconcile_is_a_noop_without_stale_tasks() {
+    fn sweep_stale_is_a_noop_without_stale_tasks() {
         let now = base();
         let mut store = TaskStore::default();
         store.insert(schedule_task("t", now + HOUR));
-        store.expansion.insert(
-            "t".into(),
-            ExpansionState {
-                expanded_until: now + 2 * DAY,
-                schedule: "@hourly".into(),
-                tz: None,
-            },
-        );
 
-        let report = reconcile(
-            &mut store,
-            &[TriggerSpecView {
-                id: "t",
-                schedule: "@hourly",
-                tz: None,
-            }],
-            now,
-            grace(),
-        );
-
-        assert_eq!(report, ReconcileReport::default());
+        assert!(sweep_stale(&mut store, now, grace()).is_empty());
         assert_eq!(store.tasks.len(), 1);
+    }
+
+    /// 掃除後もタスクリストの不変条件 (scheduled_at 昇順) が保たれる。
+    /// due 取り出しが先頭からの走査を前提にしているため。
+    #[test]
+    fn sweep_stale_preserves_ordering() {
+        let now = base();
+        let mut store = TaskStore::default();
+        store.insert(schedule_task("t", now - DAY));
+        store.insert(schedule_task("t", now + 2 * HOUR));
+        store.insert(schedule_task("t", now + HOUR));
+
+        sweep_stale(&mut store, now, grace());
+
+        let times: Vec<u64> = store.tasks.iter().map(|t| t.scheduled_at).collect();
+        assert_eq!(times, vec![now + HOUR, now + 2 * HOUR]);
     }
 
     // ---- 永続層との境界 (#46) ------------------------------------------------
