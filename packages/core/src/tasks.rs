@@ -193,6 +193,62 @@ impl TaskStore {
             .map(|t| t.scheduled_at)
             .min()
     }
+
+    /// 永続層から読んだ生の JSON 値を [`TaskStore`] に組み立てる。
+    ///
+    /// **壊れた値は「空」として扱い、起動を止めない。** タスクリストは再展開で復元できる
+    /// (境界が失われても 1 回だけ余分に展開されるだけで、冪等性の観点でも安全側に倒れる)。
+    /// `tasks.json` はエンドユーザーが手で編集できる場所にあるので、これは想定内の入力である。
+    ///
+    /// 戻り値の 2 つめは呼び出し側が観測面/stderr に流すための警告。ここで直接 eprintln
+    /// しないのは、この関数を副作用なしにしてテストできるようにするため (#46)。
+    pub(crate) fn from_stored(
+        tasks: Option<serde_json::Value>,
+        expansion: Option<serde_json::Value>,
+    ) -> (Self, Vec<String>) {
+        let mut warnings = Vec::new();
+
+        let tasks = tasks
+            .and_then(|v| match serde_json::from_value::<Vec<Task>>(v) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    warnings.push(format!(
+                        "tasks.json: unreadable task list, starting empty: {e}"
+                    ));
+                    None
+                }
+            })
+            .unwrap_or_default();
+
+        let expansion = expansion
+            .and_then(
+                |v| match serde_json::from_value::<BTreeMap<String, ExpansionState>>(v) {
+                    Ok(e) => Some(e),
+                    Err(e) => {
+                        warnings.push(format!(
+                            "tasks.json: unreadable expansion state, starting empty: {e}"
+                        ));
+                        None
+                    }
+                },
+            )
+            .unwrap_or_default();
+
+        let mut loaded = TaskStore { tasks, expansion };
+        // due 取り出しは「先頭から scheduled_at 昇順」を前提にしている。手で編集された
+        // tasks.json を読んだ場合にもこの不変条件を成立させる。
+        loaded.normalize();
+        (loaded, warnings)
+    }
+
+    /// 永続層に書く 2 つの JSON 値 (tasks / expansion) を作る。
+    pub(crate) fn to_stored(&self) -> Result<(serde_json::Value, serde_json::Value), String> {
+        let tasks = serde_json::to_value(&self.tasks)
+            .map_err(|e| format!("failed to serialize task list: {e}"))?;
+        let expansion = serde_json::to_value(&self.expansion)
+            .map_err(|e| format!("failed to serialize expansion state: {e}"))?;
+        Ok((tasks, expansion))
+    }
 }
 
 /// due になったタスクの処理方針。
@@ -901,5 +957,95 @@ mod tests {
         assert_eq!(parsed.tasks.len(), 1);
         assert_eq!(parsed.tasks[0].origin, TaskOrigin::Adhoc);
         assert!(parsed.tasks[0].trigger_id.is_none());
+    }
+
+    // ---- 永続層との境界 (#46) ------------------------------------------------
+
+    /// 未設定の `tasks.json` (初回起動) は空の store になり、警告も出ない。
+    #[test]
+    fn from_stored_handles_a_missing_file() {
+        let (store, warnings) = TaskStore::from_stored(None, None);
+        assert!(store.tasks.is_empty());
+        assert!(store.expansion.is_empty());
+        assert!(warnings.is_empty());
+    }
+
+    /// 壊れた値は「空」として扱い、起動を止めない。`tasks.json` はエンドユーザーが
+    /// 手で編集できる場所にあるので、これは異常系ではなく想定内の入力である。
+    #[test]
+    fn from_stored_survives_corrupt_values() {
+        let (store, warnings) = TaskStore::from_stored(
+            Some(serde_json::json!("これは配列ではない")),
+            Some(serde_json::json!([1, 2, 3])),
+        );
+        assert!(store.tasks.is_empty());
+        assert!(store.expansion.is_empty());
+        assert_eq!(warnings.len(), 2);
+    }
+
+    /// タスクリストだけが壊れていても展開状態は残る (逆も同様)。境界が生き残れば
+    /// 「消したタスクが復活する」ことは起きない。
+    #[test]
+    fn from_stored_isolates_the_two_keys() {
+        let expansion = serde_json::json!({
+            "t": { "expanded_until": 42, "schedule": "@hourly", "tz": null },
+        });
+        let (store, warnings) =
+            TaskStore::from_stored(Some(serde_json::json!({"not": "a list"})), Some(expansion));
+        assert!(store.tasks.is_empty());
+        assert_eq!(store.expansion["t"].expanded_until, 42);
+        assert_eq!(warnings.len(), 1);
+    }
+
+    /// 手で編集された `tasks.json` (順序が壊れている / id が重複している) を読んでも、
+    /// due 取り出しの不変条件 (昇順・id 一意) が回復する。
+    #[test]
+    fn from_stored_restores_the_invariants() {
+        let now = base();
+        let tasks = serde_json::json!([
+            { "id": "t@2", "origin": "schedule", "trigger_id": "t", "scheduled_at": now + DAY, "created_at": now },
+            { "id": "t@1", "origin": "schedule", "trigger_id": "t", "scheduled_at": now, "created_at": now },
+            { "id": "t@1", "origin": "schedule", "trigger_id": "t", "scheduled_at": now, "created_at": now },
+        ]);
+        let (store, warnings) = TaskStore::from_stored(Some(tasks), None);
+
+        assert!(warnings.is_empty());
+        assert_eq!(
+            store
+                .tasks
+                .iter()
+                .map(|t| t.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["t@1", "t@2"]
+        );
+        // 昇順が回復しているので、due は先頭からの走査で正しく取れる。
+        assert_eq!(store.due(now).len(), 1);
+    }
+
+    /// `to_stored` → `from_stored` で内容が保存される。永続層に渡す 2 つの値が
+    /// tasks / expansion に分かれていること自体が write amplification 対策の前提
+    /// (#26 ストレージ判断)。
+    #[test]
+    fn stored_roundtrip_preserves_content() {
+        let now = base();
+        let mut store = TaskStore::default();
+        store.insert(schedule_task("t", now + HOUR));
+        store.expansion.insert(
+            "t".into(),
+            ExpansionState {
+                expanded_until: now + DAY,
+                schedule: "@hourly".into(),
+                tz: Some("Asia/Tokyo".into()),
+            },
+        );
+
+        let (tasks, expansion) = store.to_stored().unwrap();
+        let (back, warnings) = TaskStore::from_stored(Some(tasks), Some(expansion));
+
+        assert!(warnings.is_empty());
+        assert_eq!(back.tasks.len(), 1);
+        assert_eq!(back.tasks[0].scheduled_at, now + HOUR);
+        assert_eq!(back.expansion["t"].expanded_until, now + DAY);
+        assert_eq!(back.expansion["t"].tz.as_deref(), Some("Asia/Tokyo"));
     }
 }
