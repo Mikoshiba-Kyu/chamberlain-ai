@@ -22,11 +22,6 @@ name: Build example
 
 on:
   workflow_dispatch:
-  # TODO(#38): merge 前にこのブランチで実際に 4 ジョブを回すための一時トリガー。
-  # workflow_dispatch はファイルが default branch に無いとボタンが出ないため、
-  # push でしか merge 前の実証ができない。**緑を確認したら削除する。**
-  push:
-    branches: [feat/37-38-platform-builds]
   # 週次で回す。dispatch だけだと「誰かが押すまで壊れていることに気づけない」ので、
   # このワークフローの目的を半分しか果たさない。ついでに cache も温まる
   # (GitHub の cache は 7 日で evict されるため、週次はほぼ下限)。
