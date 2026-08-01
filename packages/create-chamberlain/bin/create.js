@@ -115,10 +115,25 @@ async function listTemplates() {
 
 // npm publish は tarball から .gitignore を落とす (仕様)。テンプレ内では
 // `_gitignore` として保存しておき、scaffold 時に本来の名前に戻す。
+/**
+ * npm は tarball 生成時にドットファイルを特殊扱いする (`.gitignore` は落とされる)。
+ * テンプレ側では `_` 始まりで保存し、scaffold 時に復元する。
+ *
+ * `.github` が同じ扱いを受けるかは仕様上グレーなので、`npm pack --dry-run` で事後に
+ * 気づくより既存のパターンに乗せて不確実性ごと消している (#37)。
+ */
 async function renameDotfiles() {
-  const from = path.join(targetDir, "_gitignore");
-  if (existsSync(from)) {
-    await rename(from, path.join(targetDir, ".gitignore"));
+  // 配列を関数内に置くのは、この helper が top-level await から呼ばれるため
+  // (helpers は呼び出しより下に定義されており、const は巻き上がらない)。
+  const dotfiles = [
+    ["_gitignore", ".gitignore"],
+    ["_github", ".github"],
+  ];
+  for (const [from, to] of dotfiles) {
+    const src = path.join(targetDir, from);
+    if (existsSync(src)) {
+      await rename(src, path.join(targetDir, to));
+    }
   }
 }
 

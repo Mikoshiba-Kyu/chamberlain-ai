@@ -106,3 +106,7 @@ jobs:
           test -f "${RUNNER_TEMP}/scaffold-check/src-tauri/tauri.conf.json"
           test -f "${RUNNER_TEMP}/scaffold-check/.gitignore"
           test -d "${RUNNER_TEMP}/scaffold-check/triggers"
+          # 3 プラットフォームビルドのワークフロー (#37)。テンプレへの同梱漏れと
+          # _github → .github のリネーム漏れをここで止める
+          test -f "${RUNNER_TEMP}/scaffold-check/.github/workflows/build.yml"
+          test ! -e "${RUNNER_TEMP}/scaffold-check/_github"
