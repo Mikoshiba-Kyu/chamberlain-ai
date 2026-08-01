@@ -41,7 +41,7 @@ pnpm sync:template:check    # 差分があれば非 0 (CI が実行する)
 
 ### フロントエンドのテスト
 
-テストファイルも template 側が真実です (`src/**/*.test.ts`)。scaffold されたプロジェクトに同梱されることを意図しています。
+テストファイルも template 側が真実です (`src/**/*.test.{ts,tsx}`)。scaffold されたプロジェクトに同梱されることを意図しています。
 
 `templates/react` は pnpm workspace のメンバーではないので、**実行は同期先の `examples/react`** で行います。
 

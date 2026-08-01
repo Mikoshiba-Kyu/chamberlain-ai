@@ -37,6 +37,9 @@ export default defineConfig(async () => ({
     // CI (UTC) で結果が変わるため、テストだけ固定の TZ で回す。UTC 以外を選ぶのは
     // 「ローカル時刻で表示している」ことを assertion で言えるようにするため。
     env: { TZ: "Asia/Tokyo" },
-    include: ["src/**/*.test.ts"],
+    // `src` に限定するのは `src-tauri/target` (Rust のビルド出力) を走査させないため。
+    // 拡張子は tsx も含める — コンポーネントのテストを足したときに黙って拾われなく
+    // なるのを防ぐ。
+    include: ["src/**/*.test.{ts,tsx}"],
   },
 }));
