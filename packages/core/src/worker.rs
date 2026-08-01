@@ -28,7 +28,8 @@
 //! - tick() がエラーを返してもタスクは消す。schedule の意味を「実行を試みる時刻」に統一し、
 //!   エラーで毎心拍リトライになるノイズを避ける (0.1.x の fire_time 更新方針を踏襲)
 //!
-//! この順序はテストで固定されている (`crash_before_cleanup_keeps_the_task`)。
+//! この順序はテストで列として固定されている (`side_effects_happen_in_the_documented_order` /
+//! `crash_before_cleanup_keeps_the_task`)。
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -889,6 +890,27 @@ mod tests {
         assert!(ids(&store).is_empty());
     }
 
+    /// トリガーを持たないタスク (Phase 3 の自然言語タスク、あるいは手で編集された
+    /// `tasks.json`) は Phase 1 では実行経路が無い。孤児にはせず `[unsupported]` として
+    /// 破棄する — 「トリガーが消えた」と「まだ実行できない」は原因の切り分けが違う。
+    #[test]
+    fn task_without_a_trigger_is_unsupported() {
+        let mut host = FakeHost::default();
+        let store = store_of(vec![Task {
+            id: "note-1".into(),
+            origin: TaskOrigin::Adhoc,
+            trigger_id: None,
+            scheduled_at: base(),
+            created_at: base(),
+        }]);
+
+        heartbeat(&mut host, &[], &store, base(), grace());
+
+        assert_eq!(host.count_activity("[unsupported]"), 1);
+        assert_eq!(host.activities()[0].0, "__task__");
+        assert!(ids(&store).is_empty());
+    }
+
     /// manifest から消えたトリガーを指すタスクが心拍まで生き残った場合は `[orphaned]`。
     #[test]
     fn task_for_unknown_trigger_is_orphaned() {
@@ -1003,10 +1025,31 @@ mod tests {
             "hourly trigger".into(),
             "通知は出た".into()
         )));
-        // タスクは消えていない。Mutex は poison しているが lock_tasks が回収する。
+        // タスクは消えていない (削除は後片付けの段階でしか起きない)。
         assert_eq!(ids(&store), vec!["manual-hourly-1".to_string()]);
-        // 永続化も走っていない。
+        // 永続化も走っていない = tasks.json に残る = 次回起動でもう一度実行される。
         assert_eq!(host.saves, 0);
+    }
+
+    /// panic を跨いでもタスクリストは触れ続けられる。
+    ///
+    /// due 取り出しでロックを手放してから JS を回すので、[`heartbeat`] の中で panic しても
+    /// 実際には poison しない。poison するのは UI コマンド側 (ロックを保持したまま
+    /// `save_task_store` を呼ぶ経路) で panic した場合であり、そこで秘書が二度と動かなく
+    /// なることを防ぐのが [`lock_tasks`] の役目。
+    #[test]
+    fn poisoned_lock_is_recovered() {
+        let store = store_of(vec![adhoc("manual-hourly-1", "hourly", base())]);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = lock_tasks(&store);
+            panic!("simulated crash while holding the task list");
+        }));
+        assert!(result.is_err());
+        assert!(store.is_poisoned());
+
+        // 掴み直せて、中身も失われていない。
+        assert_eq!(ids(&store), vec!["manual-hourly-1".to_string()]);
     }
 
     /// tick() がエラーを返してもタスクは消す (毎心拍リトライのノイズを避ける)。
