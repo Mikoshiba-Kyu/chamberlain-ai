@@ -1,5 +1,6 @@
 mod ai;
 mod chat;
+mod history;
 mod http;
 mod schedule;
 mod secrets;
@@ -22,11 +23,12 @@ use tauri::{
 use tauri_plugin_notification::{NotificationExt, PermissionState};
 use tauri_plugin_store::StoreExt;
 
+use crate::history::{origin_str, Activity, ActivityKind, HistoryStore, MAX_ROWS, RETENTION};
 use crate::schedule::{parse_schedule, resolve_tz, Schedule};
 use crate::secrets::SecretsService;
 use crate::tasks::{Task, TaskOrigin, TaskStore};
 use crate::worker::{
-    heartbeat, lock_tasks, reconcile_at_startup, TickResult, TriggerSpec, WorkerHost,
+    heartbeat, lock_tasks, reconcile_at_startup, TickResult, TriggerSpec, WorkerHost, WorkerState,
 };
 
 /// 心臓周期。展開型スケジューラ (#26) では心拍は「due なタスクを取り出す粒度」であり、
@@ -59,6 +61,9 @@ const STATE_STORE_FILE: &str = "triggers-state.json";
 /// 「トリガーが state を 1 つ書くたびに数百件のタスク配列も書き直される」write amplification が
 /// 起きる (#26 ストレージ判断)。
 const TASKS_STORE_FILE: &str = "tasks.json";
+
+/// 実行履歴 (#42)。タスクリストと違って SQLite。理由は [`crate::history`] のモジュール doc。
+const HISTORY_DB_FILE: &str = "history.db";
 const TASKS_KEY: &str = "tasks";
 const EXPANSION_KEY: &str = "expansion";
 
@@ -81,11 +86,31 @@ fn dev_mode_enabled() -> bool {
 /// ("UI as observability plane"): every trigger firing, notification, or
 /// proactive action must also arrive here so the developer can watch the
 /// secretary's behavior without depending on OS-level notification rendering.
+///
+/// live emit (Tauri event) と `list_activity` (永続履歴の読み出し) は**同じ形**を返す。
+/// UI が「起動前に起きたこと」と「今起きたこと」を同じ配列に混ぜられるようにするため (#42)。
 #[derive(Clone, Serialize)]
 struct ActivityEvent {
+    /// 履歴上の行 id。UI が live emit と保存済み履歴を突き合わせる同一性に使う。
+    /// 履歴 DB が開けなかった環境では null になるので、UI 側にフォールバックが要る。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<i64>,
     ts: u64,
     source: String,
+    /// 種別の安定した識別子 (`"skipped"` 等)。0.3.0 で追加 (#42)。UI がフィルタや
+    /// 表示の出し分けに使う。`message` の prefix はこれから組み立てられている。
+    kind: String,
+    /// 表示用の 1 行。0.2.0 と同じ形 (`[skipped] ...`)。
     message: String,
+    /// 元になったタスクのスナップショット。展開・再展開など、タスクに紐付かない
+    /// イベントでは null。
+    #[serde(rename = "taskId", skip_serializing_if = "Option::is_none")]
+    task_id: Option<String>,
+    /// `"schedule"` | `"adhoc"`。履歴上で「定期の予定」と「手動・依頼」を区別する。
+    #[serde(rename = "taskOrigin", skip_serializing_if = "Option::is_none")]
+    task_origin: Option<String>,
+    #[serde(rename = "scheduledAt", skip_serializing_if = "Option::is_none")]
+    scheduled_at: Option<u64>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -137,6 +162,13 @@ type TriggersRef = Arc<Vec<TriggerInfo>>;
 /// Mutex で包む。UI から削除・手動投入ができる (決定事項 1) 以上、worker 側の
 /// in-memory コピーと UI 側の書き込みが競合しない単一の真実が必要になる。
 type TaskStoreRef = Arc<Mutex<TaskStore>>;
+
+/// 履歴の共有ハンドル。worker スレッド (書き手) と UI コマンド (読み手 / 書き手) の
+/// 両方が触る。`rusqlite::Connection` は `Send` だが `!Sync` なので Mutex で包む。
+///
+/// `Option` なのは **DB が開けなくても秘書は動くべき**だから。開けなかった環境では
+/// 履歴が残らないだけで、live emit も心拍もそのまま動く。
+type HistoryRef = Arc<Mutex<Option<HistoryStore>>>;
 
 /// 心拍への割り込みハンドル。手動実行 (#20) が次の心拍を待たずにタスクを処理させる。
 /// `mpsc::Sender` は `Send` だが `!Sync` なので、Tauri state に載せるには Mutex が要る。
@@ -237,6 +269,15 @@ fn send_notification(app: &AppHandle, title: &str, body: &str) {
     }
 }
 
+/// 履歴を掴む。poison の扱いは [`crate::worker::lock_tasks`] と同じ理由で無視する。
+fn lock_history(
+    history: &Mutex<Option<HistoryStore>>,
+) -> std::sync::MutexGuard<'_, Option<HistoryStore>> {
+    history
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 pub(crate) fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -244,13 +285,36 @@ pub(crate) fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
-fn emit_activity(app: &AppHandle, source: &str, message: String) {
+/// 観測面に 1 件流す。**live emit と永続化の両方**を行う (#42)。
+///
+/// 永続化に失敗しても emit は続ける。履歴が欠けるより、秘書が今何をしているかが
+/// 見えなくなる方が実害が大きい。
+fn record_activity(app: &AppHandle, history: &HistoryRef, activity: &Activity) {
+    let ts = now_millis();
+    let id = match lock_history(history).as_ref() {
+        Some(store) => match store.append(ts, activity) {
+            Ok(id) => Some(id),
+            Err(e) => {
+                eprintln!("failed to persist activity: {e}");
+                None
+            }
+        },
+        None => None,
+    };
     let _ = app.emit(
         "activity",
         ActivityEvent {
-            ts: now_millis(),
-            source: source.into(),
-            message,
+            id,
+            ts,
+            source: activity.source.clone(),
+            kind: activity.kind.as_str().to_string(),
+            message: activity.display(),
+            task_id: activity.task.as_ref().map(|t| t.id.clone()),
+            task_origin: activity
+                .task
+                .as_ref()
+                .map(|t| origin_str(t.origin).to_string()),
+            scheduled_at: activity.task.as_ref().map(|t| t.scheduled_at),
         },
     );
 }
@@ -348,6 +412,32 @@ fn save_task_store(app: &AppHandle, state: &TaskStore) {
     }
 }
 
+/// 履歴 DB を `<app_data>/history.db` に開く。
+///
+/// 失敗しても `None` を返すだけで起動は止めない。履歴が残らないのは観測面の劣化だが、
+/// それで秘書が動かなくなる方が実害が大きい (live emit は引き続き動く)。
+fn open_history(app: &AppHandle) -> Option<HistoryStore> {
+    let dir = match app.path().app_data_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("failed to resolve app data dir for history: {e}");
+            return None;
+        }
+    };
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("failed to create app data dir for history: {e}");
+        return None;
+    }
+    let path = dir.join(HISTORY_DB_FILE);
+    match HistoryStore::open(&path) {
+        Ok(store) => Some(store),
+        Err(e) => {
+            eprintln!("failed to open activity history at {path:?}: {e}");
+            None
+        }
+    }
+}
+
 /// `triggers/*/manifest.json` を走査して有効なトリガーだけを拾う。
 /// - manifest 読み取り失敗 / JSON 不正 → その 1 個をスキップ、他は続行
 /// - id 重複 → 先勝ち、後発をスキップして log
@@ -359,7 +449,11 @@ fn save_task_store(app: &AppHandle, state: &TaskStore) {
 /// DSL パーサ側 (`@every` の許可値が 5 分以上) が構文として担保するようになった
 /// (#26 決定事項 4 / 5)。これに伴い dev モードでの下限緩和も消えている
 /// (秒スケールは分グリッドに原理的に載らないため、dev の反復手段は手動実行に移った)。
-fn discover_triggers(app: &AppHandle, triggers_dir: &Path) -> Vec<TriggerInfo> {
+fn discover_triggers(
+    app: &AppHandle,
+    history: &HistoryRef,
+    triggers_dir: &Path,
+) -> Vec<TriggerInfo> {
     let entries = match std::fs::read_dir(triggers_dir) {
         Ok(e) => e,
         Err(e) => {
@@ -401,9 +495,11 @@ fn discover_triggers(app: &AppHandle, triggers_dir: &Path) -> Vec<TriggerInfo> {
         }
 
         // schedule error はトリガーを捨てずに TriggerInfo に持たせ、UI から
-        // 「壊れてる」と見えるようにする。stderr + activity にも流すが、activity は
-        // discovery が .setup() 内で走る都合上 UI リスナー未接続で捨てられる可能性が
-        // 高いため、list_triggers の error フィールドが実質的な観測面。
+        // 「壊れてる」と見えるようにする。stderr + activity にも流す。
+        //
+        // 0.2.0 まで、この activity は discovery が .setup() 内で走る都合上 UI リスナー
+        // 未接続で捨てられていた。#42 で履歴に永続化されるようになり、UI は起動後に
+        // list_activity で読めるようになっている。
         let (schedule, schedule_error) = match parse_schedule(&manifest.schedule) {
             Ok(spec) => (spec, None),
             Err(e) => {
@@ -411,7 +507,11 @@ fn discover_triggers(app: &AppHandle, triggers_dir: &Path) -> Vec<TriggerInfo> {
                     "invalid schedule for trigger '{}': {e} ({manifest_path:?})",
                     manifest.id
                 );
-                emit_activity(app, &manifest.id, format!("[schedule error] {e}"));
+                record_activity(
+                    app,
+                    history,
+                    &Activity::new(&manifest.id, ActivityKind::ScheduleError, e.clone()),
+                );
                 // ダミー値。schedule_error が Some の間 worker は展開しないので参照されない。
                 (Schedule::Hourly { minutes: vec![0] }, Some(e))
             }
@@ -422,7 +522,11 @@ fn discover_triggers(app: &AppHandle, triggers_dir: &Path) -> Vec<TriggerInfo> {
             Ok(t) => (t, schedule_error),
             Err(e) => {
                 eprintln!("trigger '{}' tz error: {e}", manifest.id);
-                emit_activity(app, &manifest.id, format!("[schedule error] {e}"));
+                record_activity(
+                    app,
+                    history,
+                    &Activity::new(&manifest.id, ActivityKind::ScheduleError, e.clone()),
+                );
                 let combined = match schedule_error {
                     Some(prev) => Some(format!("{prev}; {e}")),
                     None => Some(e),
@@ -495,6 +599,7 @@ struct TauriHost {
     runtime: rustyscript::Runtime,
     /// ロードに成功したトリガーのモジュール。起動時に 1 回作られ、以後変わらない。
     loaded: BTreeMap<String, rustyscript::ModuleHandle>,
+    history: HistoryRef,
 }
 
 impl TauriHost {
@@ -533,8 +638,21 @@ impl WorkerHost for TauriHost {
         send_notification(&self.app, title, body);
     }
 
-    fn activity(&mut self, source: &str, message: String) {
-        emit_activity(&self.app, source, message);
+    fn activity(&mut self, activity: Activity) {
+        record_activity(&self.app, &self.history, &activity);
+    }
+
+    fn sweep_history(&mut self, now: u64) -> usize {
+        match lock_history(&self.history).as_ref() {
+            Some(store) => match store.sweep(now, RETENTION, MAX_ROWS) {
+                Ok(removed) => removed,
+                Err(e) => {
+                    eprintln!("failed to sweep activity history: {e}");
+                    0
+                }
+            },
+            None => 0,
+        }
     }
 
     fn save_tasks(&mut self, store: &TaskStore) {
@@ -556,6 +674,7 @@ fn spawn_trigger_worker(
     app: AppHandle,
     triggers: TriggersRef,
     task_store: TaskStoreRef,
+    history: HistoryRef,
     secrets_service: SecretsService,
     tick_interval: Duration,
 ) -> mpsc::Sender<()> {
@@ -586,10 +705,16 @@ fn spawn_trigger_worker(
             .borrow_mut()
             .put(secrets_service);
 
+        let mut host = TauriHost {
+            app: app_for_worker,
+            runtime,
+            loaded: BTreeMap::new(),
+            history,
+        };
+
         // 起動時に全モジュールをロード。ロード失敗したものはスキップ (他トリガーは動く)。
         // schedule_error があるトリガーはこの段階でスキップ (load しない = 展開もされない)。
         // UI には list_triggers 経由で error 付きで見える。
-        let mut loaded: BTreeMap<String, rustyscript::ModuleHandle> = BTreeMap::new();
         for t in triggers.iter() {
             if t.schedule_error.is_some() {
                 continue;
@@ -602,40 +727,46 @@ fn spawn_trigger_worker(
                         "failed to load trigger '{}' at {:?}: {e}",
                         t.manifest.id, entry_path
                     );
-                    emit_activity(&app_for_worker, &t.manifest.id, format!("[load error] {e}"));
+                    host.activity(Activity::new(
+                        &t.manifest.id,
+                        ActivityKind::LoadError,
+                        e.to_string(),
+                    ));
                     continue;
                 }
             };
-            let handle = match runtime.load_module(&module) {
+            let handle = match host.runtime.load_module(&module) {
                 Ok(h) => h,
                 Err(e) => {
                     eprintln!("failed to instantiate trigger '{}': {e}", t.manifest.id);
-                    emit_activity(
-                        &app_for_worker,
+                    host.activity(Activity::new(
                         &t.manifest.id,
-                        format!("[instantiate error] {e}"),
-                    );
+                        ActivityKind::InstantiateError,
+                        e.to_string(),
+                    ));
                     continue;
                 }
             };
-            loaded.insert(t.manifest.id.clone(), handle);
+            host.loaded.insert(t.manifest.id.clone(), handle);
         }
-
-        let mut host = TauriHost {
-            app: app_for_worker,
-            runtime,
-            loaded,
-        };
 
         // 0.1.x の残骸を掃除してから、永続タスクリストを現在の manifest と突き合わせる。
         drop_legacy_fire_times(&host.app);
         let specs = build_specs(&triggers, &host);
         reconcile_at_startup(&mut host, &specs, &task_store, now_millis());
 
+        let mut state = WorkerState::default();
         while tick_rx.recv().is_ok() {
             // paused はここで読み直す (UI から心拍の合間に切り替わる)。
             let specs = build_specs(&triggers, &host);
-            heartbeat(&mut host, &specs, &task_store, now_millis(), schedule_grace);
+            heartbeat(
+                &mut host,
+                &specs,
+                &task_store,
+                &mut state,
+                now_millis(),
+                schedule_grace,
+            );
         }
     });
 
@@ -655,6 +786,39 @@ fn spawn_trigger_worker(
     });
 
     tick_tx
+}
+
+/// 保存済みの履歴を新しい順に返す (#42)。
+///
+/// **このコマンドが起動時イベントの gap を閉じる。** worker は `.setup()` 内で動き出すため、
+/// `[schedule error]` / `[expanded]` / `[rescheduled]` / `[orphaned]` は webview の
+/// リスナーが繋がる前に emit されて捨てられていた。UI は起動後にこれを読めばよい。
+#[tauri::command]
+fn list_activity(limit: Option<usize>, history: State<'_, HistoryRef>) -> Vec<ActivityEvent> {
+    // 上限を設けるのは、UI が誤って全期間を要求しても DB とメモリを踏み抜かないため。
+    let limit = limit.unwrap_or(200).min(1000);
+    let Some(store) = lock_history(&history).as_ref().map(|s| s.recent(limit)) else {
+        return Vec::new();
+    };
+    match store {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|r| ActivityEvent {
+                id: Some(r.id),
+                ts: r.ts,
+                message: r.display(),
+                source: r.source,
+                kind: r.kind,
+                task_id: r.task_id,
+                task_origin: r.task_origin,
+                scheduled_at: r.scheduled_at,
+            })
+            .collect(),
+        Err(e) => {
+            eprintln!("failed to read activity history: {e}");
+            Vec::new()
+        }
+    }
 }
 
 /// トリガー一覧。`nextFireAt` は **タスクリストの投影** であり、framework が別に持っている
@@ -717,6 +881,7 @@ fn delete_task(
     app: AppHandle,
     id: String,
     task_store: State<'_, TaskStoreRef>,
+    history: State<'_, HistoryRef>,
 ) -> Result<(), String> {
     let mut store = lock_tasks(&task_store);
     if !store.remove(&id) {
@@ -724,10 +889,14 @@ fn delete_task(
     }
     save_task_store(&app, &store);
     drop(store);
-    emit_activity(
+    record_activity(
         &app,
-        "__task__",
-        format!("[deleted] 予定を削除しました ({id})"),
+        &history,
+        &Activity::new(
+            "__task__",
+            ActivityKind::Deleted,
+            format!("予定を削除しました ({id})"),
+        ),
     );
     Ok(())
 }
@@ -749,6 +918,7 @@ fn run_trigger_now(
     triggers: State<'_, TriggersRef>,
     task_store: State<'_, TaskStoreRef>,
     tick: State<'_, TickSignal>,
+    history: State<'_, HistoryRef>,
 ) -> Result<(), String> {
     let trigger = find_trigger(&triggers, &id).ok_or_else(|| format!("unknown trigger: {id}"))?;
     if let Some(err) = &trigger.schedule_error {
@@ -756,18 +926,28 @@ fn run_trigger_now(
     }
 
     let now = now_millis();
+    let task = Task {
+        id: format!("manual-{id}-{now}"),
+        origin: TaskOrigin::Adhoc,
+        trigger_id: Some(id.clone()),
+        scheduled_at: now,
+        created_at: now,
+    };
     {
         let mut store = lock_tasks(&task_store);
-        store.insert(Task {
-            id: format!("manual-{id}-{now}"),
-            origin: TaskOrigin::Adhoc,
-            trigger_id: Some(id.clone()),
-            scheduled_at: now,
-            created_at: now,
-        });
+        store.insert(task.clone());
         save_task_store(&app, &store);
     }
-    emit_activity(&app, &id, "[manual] 手動実行を予約しました".to_string());
+    record_activity(
+        &app,
+        &history,
+        &Activity::new(
+            &id,
+            ActivityKind::Manual,
+            "手動実行を予約しました".to_string(),
+        )
+        .with_task(&task),
+    );
     // 心拍を待たせない。prod の 1 分間隔ではボタンとして成立しないため。
     tick.poke();
     Ok(())
@@ -846,6 +1026,7 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
             run_trigger_now,
             list_tasks,
             delete_task,
+            list_activity,
             list_declared_secrets,
             secrets::set_secret,
             secrets::has_secret,
@@ -932,7 +1113,13 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
                     PathBuf::new()
                 }
             };
-            let triggers: TriggersRef = Arc::new(discover_triggers(app.handle(), &triggers_dir));
+            // 履歴 DB は discovery より先に開く。discovery が出す `[schedule error]` は
+            // 「起動時に emit されて誰にも見えない」代表例で、#42 が閉じたい gap そのもの。
+            let history: HistoryRef = Arc::new(Mutex::new(open_history(app.handle())));
+            app.manage(history.clone());
+
+            let triggers: TriggersRef =
+                Arc::new(discover_triggers(app.handle(), &history, &triggers_dir));
             for t in triggers.iter() {
                 eprintln!(
                     "discovered trigger: {} ({}) — entry {}, schedule '{}' tz={:?}",
@@ -955,6 +1142,7 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
                 app.handle().clone(),
                 triggers,
                 task_store,
+                history,
                 secrets_service,
                 tick_interval,
             );

@@ -70,6 +70,13 @@ bitflags = "=2.9.4"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 chrono-tz = { version = "0.10", default-features = false }
 iana-time-zone = "0.1"
+# #42: 実行履歴レイヤ。追記専用 + 時系列クエリ + retention という形なので、
+# tauri-plugin-store の JSON (save() でファイル全体を書き直す) では苦しい。
+#
+# `bundled` で SQLite 本体を同梱する。システムの libsqlite3 に依存すると
+# 「配布先の環境次第で動かない」が発生し、デスクトップアプリとして成立しない。
+# 代償としてビルドに C コンパイラが要る (3 プラットフォームビルドは #37 / #38)。
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-registry = "0.5"
