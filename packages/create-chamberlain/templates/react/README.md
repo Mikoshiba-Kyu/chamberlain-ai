@@ -19,6 +19,14 @@ pnpm install
 pnpm tauri dev
 ```
 
+## テスト
+
+```
+pnpm test
+```
+
+秘書 UI の表示用純関数に vitest のテストが付いています。時刻表示はローカル TZ に依存するため、テストだけ `vite.config.ts` の `test.env` で TZ を固定しています。
+
 ## ビルド (配布用)
 
 ```

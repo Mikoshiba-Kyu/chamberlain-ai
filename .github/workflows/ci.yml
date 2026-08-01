@@ -84,6 +84,11 @@ jobs:
       - name: Build example frontend
         run: pnpm --filter chamberlain-example-react build
 
+      # 表示用純関数の vitest。テストの真実は templates/react 側にあり、上の
+      # sync:template:check を通ったコピーをここで実行している (#46)
+      - name: Test example frontend
+        run: pnpm --filter chamberlain-example-react test
+
       # npm に上げる tarball の中身を検証する。templates/ の同梱漏れや
       # _gitignore の扱いはここでしか見えない
       - name: npm pack --dry-run
