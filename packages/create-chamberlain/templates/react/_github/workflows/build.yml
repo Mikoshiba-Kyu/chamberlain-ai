@@ -1,0 +1,231 @@
+## Chamberlain アプリの配布ビルド (Windows / macOS / Linux)。
+##
+## Chamberlain の最終成果物は Tauri のデスクトップアプリなので、Windows 向けビルドは
+## いずれ必要になる。ローカルのクロスコンパイル (cargo-xwin) は可視 webview を持つアプリで
+## 動かないことが分かっているため、CI でビルドするのが現実的な唯一の経路になる。
+##
+## ## 使い方
+##
+## GitHub の Actions タブから "Build" を選び、Run workflow を押す。ビルドされた
+## インストーラは各ジョブの Artifacts からダウンロードできる。
+##
+## **久しぶりの実行は長い (30 分前後を見込む)。** JS ランタイム (deno_core) のビルドが
+## 重く、GitHub の cache は 7 日で evict されるため。連続して回せば数分で終わる。
+##
+## ## 何が起点か
+##
+## `workflow_dispatch` のみ。タグ起点にしていないのは、**リリース運用はあなたのものだから**
+## である。Chamberlain がタグの切り方を規定すべきではない。成果物も artifact 止めで、
+## GitHub Release を作るかどうかもあなたが決める。
+##
+## ## 署名について
+##
+## **証明書が無くてもこのワークフローは通る。** 署名は secrets が設定されている場合だけ
+## 有効になる。設定方法は下の各ステップのコメントを参照。
+
+name: Build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # 1 プラットフォームが落ちても他のバンドルは手に入れたい。
+      fail-fast: false
+      matrix:
+        include:
+          - label: Windows (x86_64)
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+          # macOS は universal binary にせず arch ごとに分ける。universal はビルド時間が
+          # 倍になり、両方のツールチェインが要る。
+          - label: macOS (Apple Silicon)
+            runner: macos-latest
+            target: aarch64-apple-darwin
+          - label: macOS (Intel)
+            runner: macos-13
+            target: x86_64-apple-darwin
+          - label: Linux (x86_64)
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            # rpm は使う人が限られる割にビルド時間を食うので CI では作らない。
+            # ローカルの `pnpm tauri build` では tauri.conf.json の targets に従う。
+            bundles: deb,appimage
+
+    env:
+      # 署名の有無はこの 3 つが空かどうかで決まる (Windows)。
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # Tauri の Linux ネイティブ依存。
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: pnpm install
+
+      ## --- 署名 (任意) -----------------------------------------------------
+      ##
+      ## Windows: Azure Artifact Signing を使う。
+      ##
+      ## **世の中の記事に多い base64 の .pfx を渡す方式は使えない。** Tauri v2 公式は
+      ## その手順を「2023 年 6 月 1 日より前に取得した OV 証明書に限る」と明記しており、
+      ## それ以降に発行される証明書は秘密鍵を HW トークン / HSM に置くことが必須になった。
+      ##
+      ## Azure Artifact Signing は個人開発者でも取得できる (Azure ポータルで Organization を
+      ## Individual に切り替え、政府発行 ID + Microsoft Authenticator で本人確認)。
+      ## サービス名は Azure Code Signing → Azure Trusted Signing → Azure Artifact Signing と
+      ## 変わっているので、検索時は現行名で当たること。
+      ##
+      ## 設定するもの:
+      ##   secrets: AZURE_CLIENT_ID / AZURE_CLIENT_SECRET / AZURE_TENANT_ID
+      ##   vars:    AZURE_ENDPOINT (例 https://wus2.codesigning.azure.net)
+      ##            AZURE_ACCOUNT / AZURE_CERT_PROFILE
+      ##
+      ## 署名設定を tauri.conf.json に直接書かないのは、証明書を持たない状態でビルドが
+      ## 壊れないようにするため。Tauri は `--config` で部分設定をマージできる。
+      - name: Prepare Windows signing
+        id: signing
+        if: runner.os == 'Windows' && env.AZURE_CLIENT_ID != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install artifact-signing-cli --locked
+          cat > "$RUNNER_TEMP/signing.json" <<JSON
+          {
+            "bundle": {
+              "windows": {
+                "signCommand": "artifact-signing-cli -e ${{ vars.AZURE_ENDPOINT }} -a ${{ vars.AZURE_ACCOUNT }} -c ${{ vars.AZURE_CERT_PROFILE }} -d \"Chamberlain App\" %1"
+              }
+            }
+          }
+          JSON
+          echo "config=$RUNNER_TEMP/signing.json" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        shell: bash
+        env:
+          # macOS はこちらは env だけで完結する。未設定なら署名なしでビルドされる。
+          # 証明書を入れる場合は APPLE_CERTIFICATE (base64 の .p12) と
+          # APPLE_CERTIFICATE_PASSWORD / APPLE_SIGNING_IDENTITY を、公証まで行うなら
+          # APPLE_ID / APPLE_PASSWORD (app-specific password) / APPLE_TEAM_ID を足す。
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          SIGN_CONFIG: ${{ steps.signing.outputs.config }}
+          BUNDLES: ${{ matrix.bundles }}
+        run: |
+          set -euo pipefail
+          args=(--target "${{ matrix.target }}")
+          if [ -n "${BUNDLES:-}" ]; then
+            args+=(--bundles "$BUNDLES")
+          fi
+          if [ -n "${SIGN_CONFIG:-}" ]; then
+            args+=(--config "$SIGN_CONFIG")
+          fi
+          pnpm tauri build "${args[@]}"
+
+      # バンドルの出力先は cargo に聞く。単独プロジェクトなら src-tauri/target、
+      # workspace の一部なら root の target と場所が変わるため、決め打ちにしない。
+      - name: Resolve bundle path
+        shell: bash
+        run: |
+          set -euo pipefail
+          target_dir=$(cargo metadata --format-version 1 --no-deps \
+            --manifest-path src-tauri/Cargo.toml | jq -r .target_directory)
+          echo "RELEASE_DIR=$target_dir/${{ matrix.target }}/release" >> "$GITHUB_ENV"
+
+      ## バンドルに triggers/ が入っていることを確認する。
+      ##
+      ## **これが無いと、アプリは起動するのに何も動かない。** Chamberlain は
+      ## `bundle.resources` で `triggers/**` を同梱し、実行時に Tauri の resource dir から
+      ## 解決する。resource dir の位置はプラットフォームごとに違うので、ビルドが通ったこと
+      ## だけでは同梱を保証できない。
+      - name: Verify bundled triggers
+        shell: bash
+        run: |
+          set -euo pipefail
+          release="$RELEASE_DIR"
+          case "$RUNNER_OS" in
+            Linux)
+              # deb の中身を直接見る。パスの前置き (/usr/lib/<name>/) は productName に
+              # 依存するので、triggers/*/manifest.json の存在だけを見る。
+              deb=$(find "$release/bundle/deb" -name '*.deb' | head -n 1)
+              if [ -z "$deb" ]; then
+                echo "::error::deb バンドルが見つかりません ($release/bundle/deb)"
+                exit 1
+              fi
+              echo "checking $deb"
+              if ! dpkg-deb -c "$deb" | grep -E 'triggers/[^/]+/manifest\.json'; then
+                echo "::error::deb バンドルに triggers/ が入っていません"
+                exit 1
+              fi
+              ;;
+            macOS)
+              app=$(find "$release/bundle/macos" -maxdepth 1 -name '*.app' | head -n 1)
+              if [ -z "$app" ]; then
+                echo "::error::.app が見つかりません ($release/bundle/macos)"
+                exit 1
+              fi
+              echo "checking $app"
+              # ディレクトリの不在で find が落ちると理由の分からない失敗になるので先に見る。
+              if [ ! -d "$app/Contents/Resources/triggers" ] \
+                || [ -z "$(find "$app/Contents/Resources/triggers" -name manifest.json)" ]; then
+                echo "::error::.app の Contents/Resources に triggers/ が入っていません"
+                exit 1
+              fi
+              ;;
+            Windows)
+              # Windows の resource dir は exe と同居する。インストーラ (NSIS/MSI) は
+              # このレイアウトをそのまま梱包するので、ここを見れば resources の解決が
+              # 効いていることを確認できる。
+              if [ ! -d "$release/triggers" ] \
+                || [ -z "$(find "$release/triggers" -name manifest.json)" ]; then
+                echo "::error::exe と同じ場所に triggers/ が入っていません"
+                exit 1
+              fi
+              ;;
+          esac
+          echo "triggers/ の同梱を確認しました"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            ${{ env.RELEASE_DIR }}/bundle/*/*
+          if-no-files-found: error

@@ -50,3 +50,14 @@ pnpm --filter chamberlain-example-react test    # vitest (CI が実行する)
 ```
 
 同じ理由で `templates/react` 内のファイルはエディタが依存を解決できません (`Cannot find module 'vitest'`)。型は `examples/react` 側の `tsc` が見ています。
+
+### 配布ビルドのワークフローは 2 本ある
+
+3 プラットフォームのバンドルを作るワークフローが**意図的に 2 箇所**にあります。片方を直したらもう片方も見てください (自動同期はしていません)。
+
+| | 役割 |
+|---|---|
+| `templates/react/_github/workflows/build.yml` | エージェント開発者に配られるもの (#37)。**自己完結でなければならない** — reusable workflow にすると相手のリポジトリが本リポに依存する |
+| `.github/workflows/build-example.yml` | `examples/react` を同じ手順でビルドする (#38)。core の変更が platform 別バンドルを壊していないかの検証と、上のワークフローが実際に動くことの検証を兼ねる |
+
+テンプレ側が `_github/` なのは、npm が tarball 生成時にドットファイルを特殊扱いするためです (`_gitignore` と同じ理由)。`bin/create.js` の `renameDotfiles()` が scaffold 時に `.github/` へ戻します。この経路は `ci.yml` の scaffold smoke test が検査しています。

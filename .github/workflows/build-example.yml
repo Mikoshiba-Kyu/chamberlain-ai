@@ -1,0 +1,167 @@
+# examples/react を 3 プラットフォームでバンドルする (#38)。
+#
+# 目的は 2 つ。
+#
+# 1. **core の変更が platform 別のバンドルを壊していないか**。#19 で採用した Tauri
+#    resource dir 経由のトリガー解決は platform 依存で、`ci.yml` は ubuntu での
+#    コンパイル検査までしかしていない。DevContainer 中心の開発サイクルでは実機確認が
+#    日常的に行われないので、CI が唯一の検証手段になる
+# 2. **テンプレのワークフロー (#37) が実際に動くか**。テンプレに同梱したものは誰も
+#    回さなければ壊れていても気づけない。ここで実質的に同じ内容を走らせることが
+#    継続的な検証になる
+#
+# テンプレ側 (`packages/create-chamberlain/templates/react/_github/workflows/build.yml`)
+# とは**あえてファイルを分けている**。テンプレは生成物の一部として配布されるので、
+# reusable workflow への参照を持たせるとエージェント開発者のリポジトリが本リポに依存する。
+# 内容の同期はレビュー時に人が担保する。
+#
+# examples/react は chamberlain-core を path 依存で引くので、テンプレ (crates.io の
+# version 依存) とは依存解決が違う。検証したいのは bundle の構造なのでこの差は許容する。
+
+name: Build example
+
+on:
+  workflow_dispatch:
+  # 週次で回す。dispatch だけだと「誰かが押すまで壊れていることに気づけない」ので、
+  # このワークフローの目的を半分しか果たさない。ついでに cache も温まる
+  # (GitHub の cache は 7 日で evict されるため、週次はほぼ下限)。
+  schedule:
+    - cron: "0 18 * * 0" # 毎週日曜 18:00 UTC (月曜 03:00 JST)
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Windows (x86_64)
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+          - label: macOS (Apple Silicon)
+            runner: macos-latest
+            target: aarch64-apple-darwin
+          - label: macOS (Intel)
+            runner: macos-13
+            target: x86_64-apple-darwin
+          - label: Linux (x86_64)
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bundles: deb,appimage
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: swatinem/rust-cache@v2
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Build
+        shell: bash
+        working-directory: examples/react
+        env:
+          BUNDLES: ${{ matrix.bundles }}
+        run: |
+          set -euo pipefail
+          args=(--target "${{ matrix.target }}")
+          if [ -n "${BUNDLES:-}" ]; then
+            args+=(--bundles "$BUNDLES")
+          fi
+          pnpm tauri build "${args[@]}"
+
+      # バンドルに triggers/ が入っていることの確認。これが実質的な回帰テストで、
+      # #19 の resource dir 解決が platform ごとに効いていることを見ている。
+      # 内容はテンプレ側のワークフローと揃えること。
+      # バンドルの出力先は cargo に聞く。単独プロジェクトなら src-tauri/target、
+      # workspace の一部なら root の target と場所が変わるため、決め打ちにしない。
+      - name: Resolve bundle path
+        shell: bash
+        run: |
+          set -euo pipefail
+          target_dir=$(cargo metadata --format-version 1 --no-deps \
+            --manifest-path examples/react/src-tauri/Cargo.toml | jq -r .target_directory)
+          echo "RELEASE_DIR=$target_dir/${{ matrix.target }}/release" >> "$GITHUB_ENV"
+
+      - name: Verify bundled triggers
+        shell: bash
+        run: |
+          set -euo pipefail
+          release="$RELEASE_DIR"
+          case "$RUNNER_OS" in
+            Linux)
+              # deb の中身を直接見る。パスの前置き (/usr/lib/<name>/) は productName に
+              # 依存するので、triggers/*/manifest.json の存在だけを見る。
+              deb=$(find "$release/bundle/deb" -name '*.deb' | head -n 1)
+              if [ -z "$deb" ]; then
+                echo "::error::deb バンドルが見つかりません ($release/bundle/deb)"
+                exit 1
+              fi
+              echo "checking $deb"
+              if ! dpkg-deb -c "$deb" | grep -E 'triggers/[^/]+/manifest\.json'; then
+                echo "::error::deb バンドルに triggers/ が入っていません"
+                exit 1
+              fi
+              ;;
+            macOS)
+              app=$(find "$release/bundle/macos" -maxdepth 1 -name '*.app' | head -n 1)
+              if [ -z "$app" ]; then
+                echo "::error::.app が見つかりません ($release/bundle/macos)"
+                exit 1
+              fi
+              echo "checking $app"
+              # ディレクトリの不在で find が落ちると理由の分からない失敗になるので先に見る。
+              if [ ! -d "$app/Contents/Resources/triggers" ] \
+                || [ -z "$(find "$app/Contents/Resources/triggers" -name manifest.json)" ]; then
+                echo "::error::.app の Contents/Resources に triggers/ が入っていません"
+                exit 1
+              fi
+              ;;
+            Windows)
+              # Windows の resource dir は exe と同居する。インストーラ (NSIS/MSI) は
+              # このレイアウトをそのまま梱包するので、ここを見れば resources の解決が
+              # 効いていることを確認できる。
+              if [ ! -d "$release/triggers" ] \
+                || [ -z "$(find "$release/triggers" -name manifest.json)" ]; then
+                echo "::error::exe と同じ場所に triggers/ が入っていません"
+                exit 1
+              fi
+              ;;
+          esac
+          echo "triggers/ の同梱を確認しました"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: example-${{ matrix.target }}
+          path: |
+            ${{ env.RELEASE_DIR }}/bundle/*/*
+          if-no-files-found: error

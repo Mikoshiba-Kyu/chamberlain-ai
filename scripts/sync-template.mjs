@@ -57,8 +57,16 @@ const DIVERGENT = new Set([
  *                 ルート `.gitignore` に従う
  * - `README.md`   scaffold されたプロジェクトの README。examples には不要
  * - `.env.example` examples では実物の `.env` を使う (gitignore 済み)
+ * - `_github/**` scaffold されたプロジェクト用の GitHub Actions ワークフロー (#37)。
+ *                リポ本体は同じ役割を `.github/workflows/build-example.yml` が持つ
+ *                (#38)。テンプレのものは自己完結でなければならないので別ファイル
  */
-const TEMPLATE_ONLY = new Set(["_gitignore", "README.md", ".env.example"]);
+const TEMPLATE_ONLY = new Set([
+  "_gitignore",
+  "README.md",
+  ".env.example",
+  path.join("_github", "workflows", "build.yml"),
+]);
 
 const checkOnly = process.argv.includes("--check");
 
