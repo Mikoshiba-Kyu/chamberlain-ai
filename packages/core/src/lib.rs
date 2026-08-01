@@ -753,7 +753,7 @@ fn spawn_trigger_worker(
         // 0.1.x の残骸を掃除してから、永続タスクリストを現在の manifest と突き合わせる。
         drop_legacy_fire_times(&host.app);
         let specs = build_specs(&triggers, &host);
-        reconcile_at_startup(&mut host, &specs, &task_store, now_millis(), schedule_grace);
+        reconcile_at_startup(&mut host, &specs, &task_store, now_millis());
 
         let mut state = WorkerState::default();
         while tick_rx.recv().is_ok() {

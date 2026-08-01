@@ -40,8 +40,8 @@ use serde::Deserialize;
 use crate::history::{needs_sweep, Activity, ActivityKind};
 use crate::schedule::Schedule;
 use crate::tasks::{
-    classify_due, expand_trigger, needs_expansion, reconcile, Disposition, ExpansionState,
-    TaskStore, TriggerRuntimeState, TriggerSpecView,
+    classify_due, expand_trigger, needs_expansion, reconcile, sweep_stale, Disposition,
+    ExpansionState, TaskStore, TriggerRuntimeState, TriggerSpecView,
 };
 
 #[derive(Deserialize, Clone)]
@@ -179,7 +179,6 @@ pub(crate) fn reconcile_at_startup<H: WorkerHost>(
     specs: &[TriggerSpec],
     task_store: &Mutex<TaskStore>,
     now: u64,
-    schedule_grace: Duration,
 ) {
     let views: Vec<TriggerSpecView<'_>> = specs
         .iter()
@@ -192,7 +191,7 @@ pub(crate) fn reconcile_at_startup<H: WorkerHost>(
 
     let report = {
         let mut store = lock_tasks(task_store);
-        reconcile(&mut store, &views, now, schedule_grace)
+        reconcile(&mut store, &views, now)
     };
 
     for (task_id, trigger_id) in &report.orphaned {
@@ -209,24 +208,6 @@ pub(crate) fn reconcile_at_startup<H: WorkerHost>(
             trigger_id,
             ActivityKind::Rescheduled,
             "schedule が変更されたため未実行の予定を破棄して再展開します".to_string(),
-        ));
-    }
-
-    for sweep in &report.stale {
-        eprintln!(
-            "trigger '{}': dropped {} stale task(s), oldest {}",
-            sweep.trigger_id,
-            sweep.count,
-            fmt_utc(sweep.oldest)
-        );
-        host.activity(Activity::new(
-            &sweep.trigger_id,
-            ActivityKind::Stale,
-            format!(
-                "{} 件の予定を遅延で破棄しました (最古 {})",
-                sweep.count,
-                fmt_utc(sweep.oldest)
-            ),
         ));
     }
 
@@ -299,6 +280,63 @@ fn expand_pending<H: WorkerHost>(
     dirty
 }
 
+/// 猶予を超えた schedule 由来タスクを掃除し、結果を観測面に流す (#50 / #53)。
+///
+/// **1 件のときは畳まない。** 1 行にまとめても情報が増えず、代わりに「いつの予定が
+/// 流れたか」が消えるため。心拍が 1 回遅れただけ、という日常的なケースはこちらに落ちる。
+///
+/// 戻り値はタスクリストが変化したか (呼び出し側が save の要否を判断する)。
+fn sweep_stale_tasks<H: WorkerHost>(
+    host: &mut H,
+    task_store: &Mutex<TaskStore>,
+    now: u64,
+    schedule_grace: Duration,
+) -> bool {
+    let groups = {
+        let mut store = lock_tasks(task_store);
+        sweep_stale(&mut store, now, schedule_grace)
+    };
+    if groups.is_empty() {
+        return false;
+    }
+
+    for group in groups {
+        if let [task] = group.tasks.as_slice() {
+            host.activity(
+                Activity::new(
+                    &group.trigger_id,
+                    ActivityKind::Skipped,
+                    format!(
+                        "{} の予定に {} 遅れているため実行しませんでした",
+                        fmt_utc(task.scheduled_at),
+                        fmt_delay(now.saturating_sub(task.scheduled_at))
+                    ),
+                )
+                .with_task(task),
+            );
+            continue;
+        }
+        // 先頭が最も古い (タスクリストは scheduled_at 昇順)。
+        let oldest = group.tasks[0].scheduled_at;
+        eprintln!(
+            "trigger '{}': dropped {} stale task(s), oldest {}",
+            group.trigger_id,
+            group.tasks.len(),
+            fmt_utc(oldest)
+        );
+        host.activity(Activity::new(
+            &group.trigger_id,
+            ActivityKind::Stale,
+            format!(
+                "{} 件の予定を遅延で破棄しました (最古 {})",
+                group.tasks.len(),
+                fmt_utc(oldest)
+            ),
+        ));
+    }
+    true
+}
+
 /// 心拍 1 回。展開 → due 取り出し → 分類 → 実行 → 後片付け。
 ///
 /// `now` を引数に取るのは意図的で、テストが時計を進めるだけでシナリオを書けるようにする
@@ -322,14 +360,19 @@ pub(crate) fn heartbeat<H: WorkerHost>(
         }
     }
 
-    // 1. 展開 (閾値条件)。
-    let dirty = expand_pending(host, specs, task_store, now);
+    // 1. 実行できないものの掃除。展開より先に置くのは、この心拍で積むタスクを
+    //    掃除の対象にしないため (展開器は未来しか生成しないので実害は無いが、
+    //    「積む前に片付ける」の方が読みやすい)。
+    let swept = sweep_stale_tasks(host, task_store, now, schedule_grace);
 
-    // 2. due 取り出し。ロックは掴んだまま JS を回さない (list_tasks / delete_task が
+    // 2. 展開 (閾値条件)。
+    let dirty = swept | expand_pending(host, specs, task_store, now);
+
+    // 3. due 取り出し。ロックは掴んだまま JS を回さない (list_tasks / delete_task が
     //    tick() の実行時間ぶん待たされるのを避ける)。
     let due = lock_tasks(task_store).due(now);
 
-    // 3. 分類と実行。
+    // 4. 分類と実行。
     let mut handled: Vec<String> = Vec::new();
     for task in due {
         let spec = task
@@ -425,6 +468,9 @@ pub(crate) fn heartbeat<H: WorkerHost>(
                     .with_task(&task),
                 );
             }
+            // ここには来ない。猶予超過は step 1 の掃除が先に拾う (#53)。
+            // 掃除と `classify_due` の判定がずれた場合の安全網として残してある —
+            // 黙って実行してしまうより、痕跡を残して破棄する方がよい。
             Disposition::SkippedLate { delay_ms } => {
                 host.activity(
                     Activity::new(
@@ -457,7 +503,7 @@ pub(crate) fn heartbeat<H: WorkerHost>(
         handled.push(task.id.clone());
     }
 
-    // 4. 後片付け。実行後に消すことで at-least-once を保つ。
+    // 5. 後片付け。実行後に消すことで at-least-once を保つ。
     //    展開だけがあった心拍でも境界が動いているので save は必要。
     if !handled.is_empty() || dirty {
         let mut store = lock_tasks(task_store);
@@ -820,8 +866,9 @@ mod tests {
         heartbeat(&mut host, &specs, &store, &mut state, resumed, grace());
 
         // 01:00 (2h 遅れ) と 02:00 (1h 遅れ) が猶予 (2 分) を超えて破棄される。
-        // 03:00 は遅れ 0 なので実行される。
-        assert_eq!(host.count_kind(ActivityKind::Skipped), 2);
+        // 2 件あるので 1 行に畳まれる (#53)。03:00 は遅れ 0 なので実行される。
+        assert_eq!(host.count_kind(ActivityKind::Stale), 1);
+        assert_eq!(host.count_kind(ActivityKind::Skipped), 0);
         assert!(!ids(&store).contains(&format!("hourly@{}", base() + HOUR)));
         assert!(!ids(&store).contains(&format!("hourly@{}", base() + 2 * HOUR)));
 
@@ -918,7 +965,7 @@ mod tests {
         let restarted = vec![spec("hourly", "@hourly :30"), spec("daily", "@daily 06:00")];
         let restart_at = base() + 10 * MINUTE;
         let mut host2 = FakeHost::default();
-        reconcile_at_startup(&mut host2, &restarted, &store, restart_at, grace());
+        reconcile_at_startup(&mut host2, &restarted, &store, restart_at);
 
         let rescheduled = host2.only(ActivityKind::Rescheduled);
         assert_eq!(rescheduled.source, "hourly");
@@ -969,7 +1016,7 @@ mod tests {
         // daily が manifest から消えた状態で再起動。
         let restarted = vec![spec("hourly", "@hourly")];
         let mut host2 = FakeHost::default();
-        reconcile_at_startup(&mut host2, &restarted, &store, base() + MINUTE, grace());
+        reconcile_at_startup(&mut host2, &restarted, &store, base() + MINUTE);
 
         assert!(!ids(&store).iter().any(|id| id.starts_with("daily@")));
         assert_eq!(boundary(&store, "daily"), None);
@@ -985,7 +1032,7 @@ mod tests {
         let specs = vec![spec("hourly", "@hourly")];
         let store = store_of(vec![]);
 
-        reconcile_at_startup(&mut host, &specs, &store, base(), grace());
+        reconcile_at_startup(&mut host, &specs, &store, base());
 
         assert!(host.activities().is_empty());
     }
@@ -1252,9 +1299,11 @@ mod tests {
         let stacked = ids(&store).len();
         assert!(stacked > 40, "前提: 相応の件数が積まれている ({stacked})");
 
-        // 2 日後に起動。
+        // 2 日後に起動。掃除は心拍が行う (#53)。
         let mut host = FakeHost::default();
-        reconcile_at_startup(&mut host, &specs, &store, base(), grace());
+        let mut state = WorkerState::default();
+        reconcile_at_startup(&mut host, &specs, &store, base());
+        heartbeat(&mut host, &specs, &store, &mut state, base(), grace());
 
         // トリガーごとに 1 行だけ。
         assert_eq!(host.count_kind(ActivityKind::Stale), 2);
@@ -1274,37 +1323,55 @@ mod tests {
                 fmt_utc(before + HOUR)
             )
         );
-        assert!(ids(&store).contains(&format!("hourly@{}", base())));
+        // 48 件のうち base() ちょうどに来る 1 件は猶予内なので破棄されず、
+        // 同じ心拍で実行される。境界のこちら側とあちら側で扱いが分かれることの確認。
+        assert!(host.effects.contains(&Effect::Tick("hourly".into())));
 
-        // 続く心拍は静か。破棄済みなので [skipped] は 1 件も出ない。
-        let mut state = WorkerState::default();
-        heartbeat(&mut host, &specs, &store, &mut state, base(), grace());
+        // 続く心拍は静か。破棄済みなので同じ行が再び出ることはない。
+        heartbeat(
+            &mut host,
+            &specs,
+            &store,
+            &mut state,
+            base() + MINUTE,
+            grace(),
+        );
+        assert_eq!(host.count_kind(ActivityKind::Stale), 2);
         assert_eq!(host.count_kind(ActivityKind::Skipped), 0);
-        // 起動時にしか出ないイベントが埋もれない。
+        // その回にしか出ないイベントが埋もれない。
         assert_eq!(host.count_kind(ActivityKind::Expanded), 2);
     }
 
-    /// スリープ復帰程度の飛びは従来どおり心拍が 1 件ずつ扱う。畳むのは起動時だけで、
-    /// 数件しか出ない場面では 1 件ずつの方が読みやすい。
+    /// 掃除は心拍にもある (#53)。**プロセスを保ったままのスリープ復帰**は
+    /// `reconcile` を通らないので、起動時だけの特別扱いでは塞がらなかった。
     #[test]
-    fn short_gaps_still_report_per_task() {
+    fn sleep_resume_without_restart_is_also_collapsed() {
         let mut state = WorkerState::default();
         let specs = vec![spec("hourly", "@hourly")];
         let mut host = FakeHost::default();
         let store = store_of(vec![]);
 
         heartbeat(&mut host, &specs, &store, &mut state, base(), grace());
+        // 再起動しない = reconcile_at_startup を通らないまま 2 日進む。
         heartbeat(
             &mut host,
             &specs,
             &store,
             &mut state,
-            base() + 3 * HOUR,
+            base() + 2 * DAY,
             grace(),
         );
 
-        assert_eq!(host.count_kind(ActivityKind::Skipped), 2);
-        assert_eq!(host.count_kind(ActivityKind::Stale), 0);
+        // 0.2.0 / #50 時点ではここが 47 件の [skipped] だった。
+        assert_eq!(host.count_kind(ActivityKind::Skipped), 0);
+        assert_eq!(host.count_kind(ActivityKind::Stale), 1);
+        assert_eq!(
+            host.only(ActivityKind::Stale).display(),
+            format!(
+                "[stale] 47 件の予定を遅延で破棄しました (最古 {})",
+                fmt_utc(base() + HOUR)
+            )
+        );
     }
 
     // ---- 履歴 (#42) ----------------------------------------------------------
@@ -1361,36 +1428,38 @@ mod tests {
         assert_eq!(task.scheduled_at, base());
     }
 
-    /// 破棄系も同じくタスクを持つ。「どの予定がなぜ流れたか」が後から辿れる。
+    /// 破棄が 1 件だけなら畳まず、元のタスクを持った `[skipped]` を出す。
+    /// 「どの予定が流れたか」は 1 件のときこそ情報として意味を持つ (#53)。
     #[test]
-    fn discarded_tasks_are_recorded_with_their_task() {
+    fn a_single_stale_task_keeps_its_identity() {
         let mut state = WorkerState::default();
-        let specs = vec![spec("hourly", "@hourly")];
+        let specs = vec![spec("daily", "@daily 06:00")];
         let mut host = FakeHost::default();
         let store = store_of(vec![]);
 
         heartbeat(&mut host, &specs, &store, &mut state, base(), grace());
+        // 06:00 の予定を 3 時間遅れで拾う。積まれているのは 1 件だけ。
         heartbeat(
             &mut host,
             &specs,
             &store,
             &mut state,
-            base() + 3 * HOUR,
+            base() + 9 * HOUR,
             grace(),
         );
 
-        let skipped: Vec<_> = host
-            .activities
-            .iter()
-            .filter(|a| a.kind == ActivityKind::Skipped)
-            .collect();
-        assert_eq!(skipped.len(), 2);
+        assert_eq!(host.count_kind(ActivityKind::Stale), 0);
+        let skipped = host.only(ActivityKind::Skipped);
         assert_eq!(
-            skipped
-                .iter()
-                .map(|a| a.task.as_ref().unwrap().scheduled_at)
-                .collect::<Vec<_>>(),
-            vec![base() + HOUR, base() + 2 * HOUR]
+            skipped.display(),
+            format!(
+                "[skipped] {} の予定に 3h0m 遅れているため実行しませんでした",
+                fmt_utc(base() + 6 * HOUR)
+            )
+        );
+        assert_eq!(
+            skipped.task.as_ref().unwrap().scheduled_at,
+            base() + 6 * HOUR
         );
     }
 
