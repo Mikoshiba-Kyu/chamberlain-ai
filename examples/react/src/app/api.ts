@@ -3,8 +3,22 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 export interface ActivityEvent {
   ts: number;
+  /** トリガー ID。トリガーに紐付かないものは `"__task__"`。 */
   source: string;
+  /**
+   * 種別の安定した識別子 (`"notify"` / `"skipped"` / `"expanded"` 等)。
+   *
+   * 0.3.0 で追加 (#42)。`message` の `[...]` プレフィックスはこれから組み立てられて
+   * いるので、フィルタや表示の出し分けは文字列パースではなくこちらを見る。
+   */
+  kind: string;
+  /** 表示用の 1 行。 */
   message: string;
+  /** 元になったタスクのスナップショット。展開など、タスクに紐付かないイベントでは undefined。 */
+  taskId?: string;
+  taskOrigin?: "schedule" | "adhoc";
+  /** 実行を意図された時刻。遅延は `ts - scheduledAt` で導出する。 */
+  scheduledAt?: number;
 }
 
 export interface TriggerListItem {
@@ -83,6 +97,15 @@ export const chamberlainApi = {
   runTriggerNow: (id: string) => invoke<void>("run_trigger_now", { id }),
   onActivity: (cb: (ev: ActivityEvent) => void): Promise<UnlistenFn> =>
     listen<ActivityEvent>("activity", (e) => cb(e.payload)),
+  /**
+   * 保存済みの履歴を新しい順に取る (#42)。
+   *
+   * worker は `.setup()` 内で動き出すため、`[schedule error]` や `[expanded]` は
+   * この webview のリスナーが繋がる前に emit されて捨てられる。**起動時のイベントを
+   * 見るにはこれを読む必要がある。**
+   */
+  listActivity: (limit?: number) =>
+    invoke<ActivityEvent[]>("list_activity", { limit }),
 
   listTasks: () => invoke<TaskListItem[]>("list_tasks"),
   /**

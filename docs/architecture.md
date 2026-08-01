@@ -69,6 +69,7 @@ chamberlain-ai/
 │       └── src/
 │           ├── lib.rs              # builder() + discovery + invoke commands + TauriHost
 │           ├── worker.rs           # 心拍の配線層 (WorkerHost 境界)
+│           ├── history.rs          # 実行履歴レイヤ (SQLite / retention)
 │           ├── tasks.rs            # タスクリストと分類 (純関数)
 │           ├── schedule.rs         # schedule DSL と発火時刻の計算 (純関数)
 │           ├── secrets.rs          # keyring + JS op
@@ -312,7 +313,7 @@ Runtime は V8 の thread affinity を守るため、専用の `std::thread` に
 
 抽象レイヤ (storage domain の trait) は作らない。バックエンドが 1 つの段階では早い。ただし将来 SQLite に置き換える判断に備えて、境界に置く操作の粒度は Mastra の `SchedulesStorage` (`listDue` / `updateNextFire` / `recordTrigger` / `listTriggers`) に寄せてある。
 
-Phase 2 の実行履歴レイヤ (追記専用 + retention) は本質的にテーブルなので、そこで SQLite を再検討する。
+タスクリストは SQLite に移していない (#42)。**エンドユーザーが手で編集できること**を設計に織り込んでいるためで、履歴レイヤとは性質が違う。
 
 ### State store
 
@@ -472,10 +473,11 @@ chamberlain.http.fetch(url: string, opts?: {
 
 due なタスク 1 件について以下の順で実行される。schedule の判定はここに一切入らない (時刻はタスクが持っており、心拍は取り出すだけ)。
 
+0. 履歴の retention (閾値条件、1 時間間隔)。実行より先に置くのは、この心拍が積む行を消させないため
 1. 分類 → 孤児 / 実行不能 / pause 中 / 遅延超過なら破棄 (詳細: [due 判定と missed-fire](#due-判定と-missed-fire-26-決定事項-8--追加決定-10--11) 節)
 2. state store から namespace `id` の値を読み出し (未保存なら `{}`)
 3. TS `tick({ now, state, scheduledAt, delayMs })` を呼ぶ
-4. 戻り値の `notify` を fire (OS 通知 + activity emit)
+4. 戻り値の `notify` を fire (OS 通知 + activity emit + 履歴への追記)
 5. 戻り値の `state` を store に書き込み → save
 6. タスクをリストから削除 → `tasks.json` に save (心拍あたり 1 回にまとめる)
 
@@ -541,7 +543,7 @@ schedule 由来タスクの id は `{trigger_id}@{scheduled_at}` で決定的に
 - Windows: `%APPDATA%\<identifier>\`
 - macOS: `~/Library/Application Support/<identifier>/`
 
-`<identifier>` は `tauri.conf.json` の `identifier` (現状 `dev.chamberlain.interval-notifier`)。
+`<identifier>` は `tauri.conf.json` の `identifier` (現状 `dev.chamberlain.interval-notifier`)。同じ場所に実行履歴の `history.db` (SQLite) も置かれる。
 
 ## 観測面 (Observability Plane)
 
@@ -563,13 +565,19 @@ Rust 側から Tauri の `Emitter::emit("activity", ...)` で JS 側に届く。
 
 ```typescript
 interface ActivityEvent {
-  ts: number;       // ms since epoch
+  ts: number;       // ms since epoch (実際に起きた時刻)
   source: string;   // trigger ID (トリガーに紐付かないものは "__task__")
-  message: string;  // 通知本文、または下記プレフィックス付きの framework イベント
+  kind: string;     // 種別の安定した識別子 ("notify" / "skipped" / ...)
+  message: string;  // 表示用の 1 行。prefix は kind から組み立てられている
+  taskId?: string;         // 元になったタスクのスナップショット
+  taskOrigin?: "schedule" | "adhoc";
+  scheduledAt?: number;    // 実行を意図された時刻。遅延は ts - scheduledAt
 }
 ```
 
 UI 側 (`chamberlainApi.onActivity`) は `@tauri-apps/api/event` の `listen` で購読する。表示は新しい順に直近 200 件 (`MAX_EVENTS`)。
+
+**`kind` は 0.3.0 で追加された (#42)。** それまで種別は `message` のプレフィックスだけで表現されていたが、フィルタや集計のたびに文字列パースが要るので独立した値にした。`message` のプレフィックスは `kind` から組み立てられており、見た目は 0.2.0 と同じ。
 
 プレフィックス一覧:
 
@@ -585,7 +593,29 @@ UI 側 (`chamberlainApi.onActivity`) は `@tauri-apps/api/event` の `listen` �
 | `[expired]` | ad-hoc の予定が猶予 (24h) を超えたため未実行のまま破棄 |
 | `[manual]` / `[deleted]` | 手動実行の予約 / 予定の削除 |
 
-これらは Phase 2 で永続化される実行履歴レイヤの原型でもある (#26)。捨てるにしても痕跡を残すのが観測面原則に合う。
+捨てるにしても痕跡を残すのが観測面原則に合う。
+
+### 実行履歴レイヤ (#42 / #26 Phase 2)
+
+タスクリストが「未来への意図」なら、こちらは**過去の記録**である。タスクは完了すると即座に消える (決定事項 1) ので、何が起きたかは別レイヤが持つ。
+
+すべての activity は emit と同時に `<app_data>/history.db` (SQLite) に追記される。
+
+**これが「起動時イベントが誰にも見えない」gap を閉じる。** worker は `.setup()` 内で動き出すため、`[schedule error]` / `[expanded]` / `[rescheduled]` / `[orphaned]` は webview のリスナーが繋がる前に emit されて捨てられていた。UI は起動後に `chamberlainApi.listActivity()` で保存済みの履歴を読み、live 側と混ぜる (重複は ts + source + message で落とす)。
+
+| 列 | 内容 |
+|---|---|
+| `ts` | 実際に起きた時刻 |
+| `source` | trigger ID / `"__task__"` |
+| `kind` | 種別。**enum ではなく TEXT** — 使われなくなった kind の行も読めなければならない |
+| `message` | プレフィックスを含まない本文 |
+| `task_id` / `task_origin` / `scheduled_at` | 元になったタスクのスナップショット |
+
+タスクは実行後に消えるので参照整合性は取れない。外部キーではなく**スナップショット**として持つ。遅延をフィールドに持たず `ts - scheduled_at` で導出するのは決定事項 11 と同じ考え方。
+
+retention は **30 日 + 20,000 行**の併用。日数だけだと `@every 5m` (288 件/日) を入れた環境で膨らみ、件数だけだと「先週何があったか」がトリガー数次第で見えなくなる。掃除は心拍ごとの閾値条件 (1 時間間隔) で走る — 時刻イベントにすると起動保証の問題が出るのは決定事項 6 と同じ理由。
+
+履歴ビューアの UI (フィルタ / 期間指定) は #40 の方針が決まってから。
 
 ### エラーもここに流す
 
@@ -601,9 +631,13 @@ UI 側 (`chamberlainApi.onActivity`) は `@tauri-apps/api/event` の `listen` �
 
 TS を開発者に書かせたい / webview JS は隠しウィンドウで不確実 / fetch/timers/ESM が要る。QuickJS 系は fetch を自作する必要があり framework の実装コストが高い。deno_core は Deno 本体の心臓部で battle-tested。
 
-### 永続化バックエンド — tauri-plugin-store (#7)
+### 永続化バックエンド — tauri-plugin-store (#7) と SQLite (#42) の併存
 
-標準プラグイン、cross-platform のパス解決込み、SQLite より始めるコストが低い。将来 SQLite 相当が必要になれば置き換え可能 (state レイヤの API を Rust コア内に隠せている限り、影響は閉じる)。
+トリガー state とタスクリストは `tauri-plugin-store` の JSON。標準プラグイン、cross-platform のパス解決込み、SQLite より始めるコストが低い。
+
+**実行履歴だけ SQLite (`rusqlite`, bundled)。** 追記専用 + 時系列クエリ + retention という形はアクセスパターンが違い、JSON では追記のたびに `save()` がファイル全体を書き直す。
+
+2 バックエンドの併存は妥協ではなく分離である: タスクリストは小さい可変の作業セットで**エンドユーザーが手で編集できること**を設計に織り込んでいる (`TaskStore::normalize` の存在理由)。履歴は追記ログで人が触るものではない。代償は bundled SQLite がビルドに C コンパイラを要求すること (3 プラットフォームビルドは #37 / #38)。
 
 ### API 形状 — pure functional (#7)
 
@@ -664,7 +698,7 @@ TS 側 (`index.ts`) から自パッケージ内のアセット (prompt.md、sche
 
 ### #26 の残り Phase
 
-- **Phase 2** — 実行履歴レイヤ。現在の activity ログ (in-memory 直近 200 件) を追記専用の永続レイヤに昇格させる。`scheduled_at` と実際の実行時刻を両方持ち、遅延は導出値とする。retention とストレージ (SQLite 検討) が論点
+- **Phase 2** — 実行履歴レイヤ。**0.3.0 で実装済み (#42)。** 詳細は[実行履歴レイヤ](#実行履歴レイヤ-42--26-phase-2)。UI (履歴ビューア) だけ #40 待ち
 - **Phase 3** — チャット / Type II からの ad-hoc タスク登録。タスクの中身を「自然言語の指示 (`prompt`)」に開く話であり、`overview.md` の承認モデル (「実際にアクションを実行する場合は、必ず提案としてユーザーに提示し、確認をとってから行う」) と正面から交差する。あわせて「リマインド時刻が来たが秘書はチャット中」の分岐が必要になる (Mastra の `ifActive` / `ifIdle` = deliver / wake / persist / discard が先例)
 
 ### notify API の一般化

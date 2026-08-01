@@ -29,6 +29,9 @@ const MAX_EVENTS = 200;
  */
 const TASKS_POLL_MS = 15_000;
 
+/** live emit と保存済み履歴が重なったときの同一判定。 */
+const eventKey = (e: ActivityEvent) => `${e.ts}|${e.source}|${e.message}`;
+
 export function App() {
   const [active, setActive] = useState<TabId>("triggers");
   const [events, setEvents] = useState<ActivityEvent[]>([]);
@@ -52,6 +55,20 @@ export function App() {
         if (cancelled) fn();
         else unlisten = fn;
       });
+    // 保存済みの履歴で初期表示を埋める (#42)。worker は setup() 内で動き出すので、
+    // 起動時のイベント ([schedule error] / [expanded] / [rescheduled] / [orphaned]) は
+    // 上のリスナーが繋がる前に流れている。
+    //
+    // live 側と重なる可能性があるので ts + source + message で重複を落とす。
+    chamberlainApi.listActivity(MAX_EVENTS).then((stored) => {
+      if (cancelled) return;
+      setEvents((prev) => {
+        const seen = new Set(prev.map(eventKey));
+        const merged = [...prev, ...stored.filter((e) => !seen.has(eventKey(e)))];
+        merged.sort((a, b) => b.ts - a.ts);
+        return merged.slice(0, MAX_EVENTS);
+      });
+    });
     refresh();
     const timer = setInterval(refresh, TASKS_POLL_MS);
     return () => {

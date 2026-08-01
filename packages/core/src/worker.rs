@@ -37,6 +37,7 @@ use std::time::Duration;
 use chrono_tz::Tz;
 use serde::Deserialize;
 
+use crate::history::{needs_sweep, Activity, ActivityKind};
 use crate::schedule::Schedule;
 use crate::tasks::{
     classify_due, expand_trigger, needs_expansion, reconcile, Disposition, ExpansionState,
@@ -80,8 +81,11 @@ pub(crate) trait WorkerHost {
     /// (観測面は activity 側が担保するため)。
     fn notify(&mut self, title: &str, body: &str);
 
-    /// 観測面 (#6) にイベントを流す。
-    fn activity(&mut self, source: &str, message: String);
+    /// 観測面 (#6) にイベントを流す。live emit と履歴への永続化の両方がここに入る (#42)。
+    fn activity(&mut self, activity: Activity);
+
+    /// 履歴の retention を適用する。戻り値は消した行数 (観測用)。
+    fn sweep_history(&mut self, now: u64) -> usize;
 
     /// タスクリストを永続化する。1 心拍あたり最大 1 回に抑えるのは worker の責任。
     fn save_tasks(&mut self, store: &TaskStore);
@@ -113,6 +117,16 @@ pub(crate) struct TriggerSpec {
 
 fn find_spec<'a>(specs: &'a [TriggerSpec], id: &str) -> Option<&'a TriggerSpec> {
     specs.iter().find(|s| s.id == id)
+}
+
+/// 心拍をまたいで持ち越す worker の状態。
+///
+/// タスクリストと違って永続化しない。落としても「次の心拍で 1 回余分に掃除が走る」だけで、
+/// 安全側に倒れる値しか置かない。
+#[derive(Default)]
+pub(crate) struct WorkerState {
+    /// 最後に履歴の retention を適用した時刻。0 は「まだ一度も」= 起動直後に 1 回走る。
+    last_sweep_at: u64,
 }
 
 /// タスクリストを掴む。poison は「前回の panic の残骸」として無視して中身を取り出す。
@@ -182,17 +196,19 @@ pub(crate) fn reconcile_at_startup<H: WorkerHost>(
 
     for (task_id, trigger_id) in &report.orphaned {
         eprintln!("dropped task '{task_id}': trigger '{trigger_id}' no longer exists");
-        host.activity(
+        host.activity(Activity::new(
             trigger_id,
-            format!("[orphaned] トリガーが存在しないため予定を破棄しました ({task_id})"),
-        );
+            ActivityKind::Orphaned,
+            format!("トリガーが存在しないため予定を破棄しました ({task_id})"),
+        ));
     }
     for trigger_id in &report.rescheduled {
         eprintln!("trigger '{trigger_id}': schedule changed, re-expanding");
-        host.activity(
+        host.activity(Activity::new(
             trigger_id,
-            "[rescheduled] schedule が変更されたため未実行の予定を破棄して再展開します".to_string(),
-        );
+            ActivityKind::Rescheduled,
+            "schedule が変更されたため未実行の予定を破棄して再展開します".to_string(),
+        ));
     }
 
     let store = lock_tasks(task_store);
@@ -255,13 +271,11 @@ fn expand_pending<H: WorkerHost>(
     }
 
     for (id, added, boundary) in expanded {
-        host.activity(
+        host.activity(Activity::new(
             &id,
-            format!(
-                "[expanded] {added} 件のタスクを積みました (〜{})",
-                fmt_utc(boundary)
-            ),
-        );
+            ActivityKind::Expanded,
+            format!("{added} 件のタスクを積みました (〜{})", fmt_utc(boundary)),
+        ));
     }
     dirty
 }
@@ -275,9 +289,20 @@ pub(crate) fn heartbeat<H: WorkerHost>(
     host: &mut H,
     specs: &[TriggerSpec],
     task_store: &Mutex<TaskStore>,
+    state: &mut WorkerState,
     now: u64,
     schedule_grace: Duration,
 ) {
+    // 0. 履歴の retention (閾値条件。#26 決定事項 6 と同じ理由で時刻イベントにしない)。
+    //    実行より先に置くのは、この心拍が積む行を消させないため。
+    if needs_sweep(state.last_sweep_at, now) {
+        let removed = host.sweep_history(now);
+        state.last_sweep_at = now;
+        if removed > 0 {
+            eprintln!("history: swept {removed} row(s)");
+        }
+    }
+
     // 1. 展開 (閾値条件)。
     let dirty = expand_pending(host, specs, task_store, now);
 
@@ -306,9 +331,13 @@ pub(crate) fn heartbeat<H: WorkerHost>(
                     // trigger_id を持たないタスク (Phase 3 の自然言語タスク) は
                     // Phase 1 では実行経路が無い。積まれたら破棄して痕跡を残す。
                     host.activity(
-                        &source,
-                        "[unsupported] 実行対象のトリガーが無いタスクは Phase 1 では実行できません"
-                            .to_string(),
+                        Activity::new(
+                            &source,
+                            ActivityKind::Unsupported,
+                            "実行対象のトリガーが無いタスクは Phase 1 では実行できません"
+                                .to_string(),
+                        )
+                        .with_task(&task),
                     );
                     handled.push(task.id.clone());
                     continue;
@@ -330,7 +359,10 @@ pub(crate) fn heartbeat<H: WorkerHost>(
                             host.notify(&title, &notify.body);
                             // 通知は必ず観測面にも出す (#6)。OS 通知の描画に依存せず
                             // 「秘書が何を言ったか」を UI から追えることが要件。
-                            host.activity(id, notify.body);
+                            host.activity(
+                                Activity::new(id, ActivityKind::Notify, notify.body)
+                                    .with_task(&task),
+                            );
                         }
                         if let Some(new_state) = res.state {
                             host.write_state(id, new_state);
@@ -339,49 +371,67 @@ pub(crate) fn heartbeat<H: WorkerHost>(
                     Ok(None) => {}
                     Err(e) => {
                         eprintln!("trigger '{id}' tick() error: {e}");
-                        host.activity(id, format!("[error] {e}"));
+                        host.activity(Activity::new(id, ActivityKind::Error, e).with_task(&task));
                     }
                 }
             }
             Disposition::Orphaned => {
                 // discovery では見えているのに実行できない場合と、manifest から
                 // 消えている場合を言い分ける (原因の切り分けが変わるため)。
-                let message = if spec.is_some() {
-                    "[unavailable] トリガーが実行できない状態 (構成エラー / ロード失敗) \
-                     のため予定を破棄しました"
-                        .to_string()
+                let (kind, message) = if spec.is_some() {
+                    (
+                        ActivityKind::Unavailable,
+                        "トリガーが実行できない状態 (構成エラー / ロード失敗) \
+                         のため予定を破棄しました"
+                            .to_string(),
+                    )
                 } else {
-                    "[orphaned] トリガーが存在しないため予定を破棄しました".to_string()
+                    (
+                        ActivityKind::Orphaned,
+                        "トリガーが存在しないため予定を破棄しました".to_string(),
+                    )
                 };
-                host.activity(&source, message);
+                host.activity(Activity::new(&source, kind, message).with_task(&task));
             }
             Disposition::Paused => {
                 host.activity(
-                    &source,
-                    format!(
-                        "[paused] 停止中のため {} の予定を破棄しました",
-                        fmt_utc(task.scheduled_at)
-                    ),
+                    Activity::new(
+                        &source,
+                        ActivityKind::Paused,
+                        format!(
+                            "停止中のため {} の予定を破棄しました",
+                            fmt_utc(task.scheduled_at)
+                        ),
+                    )
+                    .with_task(&task),
                 );
             }
             Disposition::SkippedLate { delay_ms } => {
                 host.activity(
-                    &source,
-                    format!(
-                        "[skipped] {} の予定に {} 遅れているため実行しませんでした",
-                        fmt_utc(task.scheduled_at),
-                        fmt_delay(delay_ms)
-                    ),
+                    Activity::new(
+                        &source,
+                        ActivityKind::Skipped,
+                        format!(
+                            "{} の予定に {} 遅れているため実行しませんでした",
+                            fmt_utc(task.scheduled_at),
+                            fmt_delay(delay_ms)
+                        ),
+                    )
+                    .with_task(&task),
                 );
             }
             Disposition::Expired { delay_ms } => {
                 host.activity(
-                    &source,
-                    format!(
-                        "[expired] {} の予定が猶予を超えた ({} 遅れ) ため未実行のまま破棄しました",
-                        fmt_utc(task.scheduled_at),
-                        fmt_delay(delay_ms)
-                    ),
+                    Activity::new(
+                        &source,
+                        ActivityKind::Expired,
+                        format!(
+                            "{} の予定が猶予を超えた ({} 遅れ) ため未実行のまま破棄しました",
+                            fmt_utc(task.scheduled_at),
+                            fmt_delay(delay_ms)
+                        ),
+                    )
+                    .with_task(&task),
                 );
             }
         }
@@ -428,7 +478,9 @@ mod tests {
         WriteState(String, String),
         Tick(String),
         Notify(String, String),
-        Activity(String, String),
+        /// (source, kind, 表示用の 1 行)。kind を持つのは #42 で列に出したため。
+        Activity(String, &'static str, String),
+        Sweep,
         Save(usize),
     }
 
@@ -445,6 +497,9 @@ mod tests {
         /// 最後に永続化されたタスク id の一覧。
         saved: Vec<String>,
         saves: usize,
+        /// 流れた activity をそのまま保持する (kind / task ref の検証用)。
+        activities: Vec<Activity>,
+        sweeps: usize,
     }
 
     impl FakeHost {
@@ -453,23 +508,27 @@ mod tests {
             self
         }
 
-        /// 記録された副作用のうち activity のメッセージだけを取り出す。
-        fn activities(&self) -> Vec<(&str, &str)> {
-            self.effects
+        /// 記録された副作用のうち activity の (source, 表示行) だけを取り出す。
+        fn activities(&self) -> Vec<(&str, String)> {
+            self.activities
                 .iter()
-                .filter_map(|e| match e {
-                    Effect::Activity(src, msg) => Some((src.as_str(), msg.as_str())),
-                    _ => None,
-                })
+                .map(|a| (a.source.as_str(), a.display()))
                 .collect()
         }
 
-        /// 指定プレフィックスで始まる activity が何件出たか。
-        fn count_activity(&self, prefix: &str) -> usize {
-            self.activities()
-                .iter()
-                .filter(|(_, msg)| msg.starts_with(prefix))
-                .count()
+        /// 指定 kind の activity が何件出たか。
+        fn count_kind(&self, kind: ActivityKind) -> usize {
+            self.activities.iter().filter(|a| a.kind == kind).count()
+        }
+
+        /// 指定 kind の activity を 1 件だけ取る (複数あれば panic)。
+        fn only(&self, kind: ActivityKind) -> &Activity {
+            let mut found = self.activities.iter().filter(|a| a.kind == kind);
+            let first = found
+                .next()
+                .unwrap_or_else(|| panic!("no {kind:?} activity"));
+            assert!(found.next().is_none(), "{kind:?} が複数出ている");
+            first
         }
     }
 
@@ -509,8 +568,19 @@ mod tests {
             self.effects.push(Effect::Notify(title.into(), body.into()));
         }
 
-        fn activity(&mut self, source: &str, message: String) {
-            self.effects.push(Effect::Activity(source.into(), message));
+        fn activity(&mut self, activity: Activity) {
+            self.activities.push(activity.clone());
+            self.effects.push(Effect::Activity(
+                activity.source.clone(),
+                activity.kind.as_str(),
+                activity.display(),
+            ));
+        }
+
+        fn sweep_history(&mut self, _now: u64) -> usize {
+            self.effects.push(Effect::Sweep);
+            self.sweeps += 1;
+            0
         }
 
         fn save_tasks(&mut self, store: &TaskStore) {
@@ -599,11 +669,12 @@ mod tests {
     /// #26 Phase 1 の実機検証 (56 件生成 / 境界が全トリガーで同一) に対応する。
     #[test]
     fn first_tick_expands_the_full_horizon() {
+        let mut state = WorkerState::default();
         let mut host = FakeHost::default();
         let specs = vec![spec("hourly", "@hourly"), spec("daily", "@daily 06:00")];
         let store = store_of(vec![]);
 
-        heartbeat(&mut host, &specs, &store, base(), grace());
+        heartbeat(&mut host, &specs, &store, &mut state, base(), grace());
 
         // @hourly は 48h ぶんで 48 件 (起点 00:00 は「境界より後」なので含まれない)。
         // @daily 06:00 は 2 件 (初日と翌日)。
@@ -630,7 +701,7 @@ mod tests {
         assert_eq!(boundary(&store, "hourly"), Some(base() + 2 * DAY));
         assert_eq!(boundary(&store, "daily"), Some(base() + 2 * DAY));
 
-        assert_eq!(host.count_activity("[expanded]"), 2);
+        assert_eq!(host.count_kind(ActivityKind::Expanded), 2);
         // 展開だけの心拍でも境界が動いているので永続化される。
         assert_eq!(host.saves, 1);
     }
@@ -638,11 +709,12 @@ mod tests {
     /// 展開は wall-clock グリッドに載る。`@daily 06:00` は UTC の 06:00 ちょうど。
     #[test]
     fn expansion_lands_on_the_wall_clock_grid() {
+        let mut state = WorkerState::default();
         let mut host = FakeHost::default();
         let specs = vec![spec("daily", "@daily 06:00")];
         let store = store_of(vec![]);
 
-        heartbeat(&mut host, &specs, &store, base(), grace());
+        heartbeat(&mut host, &specs, &store, &mut state, base(), grace());
 
         let tasks = lock_tasks(&store);
         let times: Vec<u64> = tasks.tasks.iter().map(|t| t.scheduled_at).collect();
@@ -652,19 +724,27 @@ mod tests {
     /// 閾値に達していないトリガーは再展開しない (毎心拍展開しない)。
     #[test]
     fn second_tick_does_not_re_expand() {
+        let mut state = WorkerState::default();
         let mut host = FakeHost::default();
         let specs = vec![spec("hourly", "@hourly")];
         let store = store_of(vec![]);
 
-        heartbeat(&mut host, &specs, &store, base(), grace());
+        heartbeat(&mut host, &specs, &store, &mut state, base(), grace());
         let after_first = ids(&store);
         let saves_after_first = host.saves;
 
         // 1 分後。境界は now + 48h - 1m で、閾値 (now + 24h) にはまだ遠い。
-        heartbeat(&mut host, &specs, &store, base() + MINUTE, grace());
+        heartbeat(
+            &mut host,
+            &specs,
+            &store,
+            &mut state,
+            base() + MINUTE,
+            grace(),
+        );
 
         assert_eq!(ids(&store), after_first);
-        assert_eq!(host.count_activity("[expanded]"), 1);
+        assert_eq!(host.count_kind(ActivityKind::Expanded), 1);
         // 展開も実行も無い心拍は書き込まない (write amplification を避ける)。
         assert_eq!(host.saves, saves_after_first);
     }
@@ -674,17 +754,18 @@ mod tests {
     /// 1 週間前の境界で起動しても過去のタスクは 1 件も生成しない (#26 「過去は生成しない」)。
     #[test]
     fn stale_boundary_does_not_generate_past_tasks() {
+        let mut state = WorkerState::default();
         let mut host = FakeHost::default();
         let specs = vec![spec("hourly", "@hourly")];
         let store = store_of(vec![]);
 
         // 1 週間前に展開して、そこから 1 週間アプリを閉じていた状況を作る。
         let long_ago = base() - 7 * DAY;
-        heartbeat(&mut host, &specs, &store, long_ago, grace());
+        heartbeat(&mut host, &specs, &store, &mut state, long_ago, grace());
         // 積まれた過去タスクは検証対象ではないので捨てる (境界だけ残す)。
         lock_tasks(&store).tasks.clear();
 
-        heartbeat(&mut host, &specs, &store, base(), grace());
+        heartbeat(&mut host, &specs, &store, &mut state, base(), grace());
 
         let tasks = lock_tasks(&store);
         assert!(
@@ -705,22 +786,23 @@ mod tests {
     /// 実行される。#26 決定事項 8 の origin 別猶予。
     #[test]
     fn sleep_resume_skips_schedule_tasks_but_runs_adhoc() {
+        let mut state = WorkerState::default();
         let specs = vec![spec("hourly", "@hourly")];
         let mut host = FakeHost::default().reply("hourly", Ok(Some(tick_result("起きました"))));
         let store = store_of(vec![]);
 
         // 00:00 に起動。01:00 / 02:00 / ... が積まれる。
-        heartbeat(&mut host, &specs, &store, base(), grace());
+        heartbeat(&mut host, &specs, &store, &mut state, base(), grace());
         // スリープ前に手動実行を予約した想定の ad-hoc を 1 件積む。
         lock_tasks(&store).insert(adhoc("manual-hourly-1", "hourly", base() + MINUTE));
 
         // 3 時間スリープして 03:00 ちょうどに復帰。
         let resumed = base() + 3 * HOUR;
-        heartbeat(&mut host, &specs, &store, resumed, grace());
+        heartbeat(&mut host, &specs, &store, &mut state, resumed, grace());
 
         // 01:00 (2h 遅れ) と 02:00 (1h 遅れ) が猶予 (2 分) を超えて破棄される。
         // 03:00 は遅れ 0 なので実行される。
-        assert_eq!(host.count_activity("[skipped]"), 2);
+        assert_eq!(host.count_kind(ActivityKind::Skipped), 2);
         assert!(!ids(&store).contains(&format!("hourly@{}", base() + HOUR)));
         assert!(!ids(&store).contains(&format!("hourly@{}", base() + 2 * HOUR)));
 
@@ -742,21 +824,23 @@ mod tests {
     /// 猶予内 (心拍 2 回分) の遅れは実行する。「心拍が拾い損ねた」ぶんは失わない。
     #[test]
     fn delay_within_grace_still_runs() {
+        let mut state = WorkerState::default();
         let specs = vec![spec("hourly", "@hourly")];
         let mut host = FakeHost::default().reply("hourly", Ok(Some(tick_result("定時報告"))));
         let store = store_of(vec![]);
 
-        heartbeat(&mut host, &specs, &store, base(), grace());
+        heartbeat(&mut host, &specs, &store, &mut state, base(), grace());
         // 01:00 の予定を 90 秒遅れで拾う (猶予 120 秒以内)。
         heartbeat(
             &mut host,
             &specs,
             &store,
+            &mut state,
             base() + HOUR + 90 * 1000,
             grace(),
         );
 
-        assert_eq!(host.count_activity("[skipped]"), 0);
+        assert_eq!(host.count_kind(ActivityKind::Skipped), 0);
         assert!(host
             .effects
             .contains(&Effect::Notify("hourly trigger".into(), "定時報告".into())));
@@ -768,17 +852,25 @@ mod tests {
     /// 境界は進み続けるので、resume 後に「止めていた間の予定」が遡って積まれることはない。
     #[test]
     fn paused_trigger_drops_due_tasks_but_keeps_expanding() {
+        let mut state = WorkerState::default();
         let mut specs = vec![spec("hourly", "@hourly")];
         let mut host = FakeHost::default();
         let store = store_of(vec![]);
 
-        heartbeat(&mut host, &specs, &store, base(), grace());
+        heartbeat(&mut host, &specs, &store, &mut state, base(), grace());
         let boundary_before = boundary(&store, "hourly");
 
         specs[0].paused = true;
-        heartbeat(&mut host, &specs, &store, base() + HOUR, grace());
+        heartbeat(
+            &mut host,
+            &specs,
+            &store,
+            &mut state,
+            base() + HOUR,
+            grace(),
+        );
 
-        assert_eq!(host.count_activity("[paused]"), 1);
+        assert_eq!(host.count_kind(ActivityKind::Paused), 1);
         assert!(!host.effects.iter().any(|e| matches!(e, Effect::Tick(_))));
         // 破棄されたので同じタスクが次の心拍でもう一度 due になることはない。
         assert!(!ids(&store).contains(&format!("hourly@{}", base() + HOUR)));
@@ -791,11 +883,12 @@ mod tests {
     /// schedule を変えて再起動すると、そのトリガーだけ再展開され、他は境界も予定も不変。
     #[test]
     fn schedule_change_re_expands_only_that_trigger() {
+        let mut state = WorkerState::default();
         let mut host = FakeHost::default();
         let specs = vec![spec("hourly", "@hourly"), spec("daily", "@daily 06:00")];
         let store = store_of(vec![]);
 
-        heartbeat(&mut host, &specs, &store, base(), grace());
+        heartbeat(&mut host, &specs, &store, &mut state, base(), grace());
         let daily_before: Vec<String> = ids(&store)
             .into_iter()
             .filter(|id| id.starts_with("daily@"))
@@ -808,12 +901,11 @@ mod tests {
         let mut host2 = FakeHost::default();
         reconcile_at_startup(&mut host2, &restarted, &store, restart_at);
 
+        let rescheduled = host2.only(ActivityKind::Rescheduled);
+        assert_eq!(rescheduled.source, "hourly");
         assert_eq!(
-            host2.activities(),
-            vec![(
-                "hourly",
-                "[rescheduled] schedule が変更されたため未実行の予定を破棄して再展開します"
-            )]
+            rescheduled.display(),
+            "[rescheduled] schedule が変更されたため未実行の予定を破棄して再展開します"
         );
         // 変更されたトリガーの予定は消え、境界は now に戻る。
         assert!(!ids(&store).iter().any(|id| id.starts_with("hourly@")));
@@ -829,7 +921,14 @@ mod tests {
         assert_eq!(boundary(&store, "daily"), daily_boundary);
 
         // 次の心拍で :30 グリッドに載り直す。
-        heartbeat(&mut host2, &restarted, &store, restart_at, grace());
+        heartbeat(
+            &mut host2,
+            &restarted,
+            &store,
+            &mut state,
+            restart_at,
+            grace(),
+        );
         let first_hourly = lock_tasks(&store)
             .tasks
             .iter()
@@ -842,10 +941,11 @@ mod tests {
     /// トリガーを消して再起動すると、そのトリガーを指すタスクと展開状態が破棄される。
     #[test]
     fn removed_trigger_is_reaped_at_startup() {
+        let mut state = WorkerState::default();
         let mut host = FakeHost::default();
         let specs = vec![spec("hourly", "@hourly"), spec("daily", "@daily 06:00")];
         let store = store_of(vec![]);
-        heartbeat(&mut host, &specs, &store, base(), grace());
+        heartbeat(&mut host, &specs, &store, &mut state, base(), grace());
 
         // daily が manifest から消えた状態で再起動。
         let restarted = vec![spec("hourly", "@hourly")];
@@ -854,7 +954,7 @@ mod tests {
 
         assert!(!ids(&store).iter().any(|id| id.starts_with("daily@")));
         assert_eq!(boundary(&store, "daily"), None);
-        assert_eq!(host2.count_activity("[orphaned]"), 2);
+        assert_eq!(host2.count_kind(ActivityKind::Orphaned), 2);
         // hourly は無傷。
         assert!(ids(&store).iter().any(|id| id.starts_with("hourly@")));
     }
@@ -868,7 +968,7 @@ mod tests {
 
         reconcile_at_startup(&mut host, &specs, &store, base());
 
-        assert_eq!(host.activities(), Vec::<(&str, &str)>::new());
+        assert!(host.activities().is_empty());
     }
 
     // ---- 実行できないトリガー ------------------------------------------------
@@ -877,16 +977,17 @@ mod tests {
     /// `[unavailable]` で破棄される (`[orphaned]` と言い分ける)。
     #[test]
     fn unrunnable_trigger_is_not_expanded_and_drops_its_tasks() {
+        let mut state = WorkerState::default();
         let mut host = FakeHost::default();
         let mut broken = spec("broken", "@hourly");
         broken.runnable = false;
         // 前回起動時に積まれた予定が残っている状況。
         let store = store_of(vec![adhoc("manual-broken-1", "broken", base())]);
 
-        heartbeat(&mut host, &[broken], &store, base(), grace());
+        heartbeat(&mut host, &[broken], &store, &mut state, base(), grace());
 
-        assert_eq!(host.count_activity("[unavailable]"), 1);
-        assert_eq!(host.count_activity("[expanded]"), 0);
+        assert_eq!(host.count_kind(ActivityKind::Unavailable), 1);
+        assert_eq!(host.count_kind(ActivityKind::Expanded), 0);
         assert!(ids(&store).is_empty());
     }
 
@@ -895,6 +996,7 @@ mod tests {
     /// 破棄する — 「トリガーが消えた」と「まだ実行できない」は原因の切り分けが違う。
     #[test]
     fn task_without_a_trigger_is_unsupported() {
+        let mut state = WorkerState::default();
         let mut host = FakeHost::default();
         let store = store_of(vec![Task {
             id: "note-1".into(),
@@ -904,9 +1006,9 @@ mod tests {
             created_at: base(),
         }]);
 
-        heartbeat(&mut host, &[], &store, base(), grace());
+        heartbeat(&mut host, &[], &store, &mut state, base(), grace());
 
-        assert_eq!(host.count_activity("[unsupported]"), 1);
+        assert_eq!(host.count_kind(ActivityKind::Unsupported), 1);
         assert_eq!(host.activities()[0].0, "__task__");
         assert!(ids(&store).is_empty());
     }
@@ -914,12 +1016,13 @@ mod tests {
     /// manifest から消えたトリガーを指すタスクが心拍まで生き残った場合は `[orphaned]`。
     #[test]
     fn task_for_unknown_trigger_is_orphaned() {
+        let mut state = WorkerState::default();
         let mut host = FakeHost::default();
         let store = store_of(vec![adhoc("manual-ghost-1", "ghost", base())]);
 
-        heartbeat(&mut host, &[], &store, base(), grace());
+        heartbeat(&mut host, &[], &store, &mut state, base(), grace());
 
-        assert_eq!(host.count_activity("[orphaned]"), 1);
+        assert_eq!(host.count_kind(ActivityKind::Orphaned), 1);
         assert!(ids(&store).is_empty());
     }
 
@@ -928,18 +1031,19 @@ mod tests {
     /// 手動実行で積まれた ad-hoc タスクは次の心拍で実行され、展開済み境界を触らない。
     #[test]
     fn manual_run_executes_without_moving_the_boundary() {
+        let mut state = WorkerState::default();
         let specs = vec![spec("hourly", "@hourly")];
         let mut host = FakeHost::default().reply("hourly", Ok(Some(tick_result("手動実行"))));
         let store = store_of(vec![]);
 
-        heartbeat(&mut host, &specs, &store, base(), grace());
+        heartbeat(&mut host, &specs, &store, &mut state, base(), grace());
         let boundary_before = boundary(&store, "hourly");
         let scheduled_before = ids(&store);
 
         // run_trigger_now 相当: 即 due な ad-hoc を積んで心拍を起こす。
         let manual_at = base() + MINUTE;
         lock_tasks(&store).insert(adhoc("manual-hourly-1", "hourly", manual_at));
-        heartbeat(&mut host, &specs, &store, manual_at, grace());
+        heartbeat(&mut host, &specs, &store, &mut state, manual_at, grace());
 
         assert!(host
             .effects
@@ -952,13 +1056,21 @@ mod tests {
     /// ad-hoc が猶予 (24h) を超えると `[expired]` で破棄される。
     #[test]
     fn adhoc_beyond_grace_expires() {
+        let mut state = WorkerState::default();
         let mut host = FakeHost::default();
         let specs = vec![spec("hourly", "@hourly")];
         let store = store_of(vec![adhoc("manual-hourly-1", "hourly", base())]);
 
-        heartbeat(&mut host, &specs, &store, base() + DAY + HOUR, grace());
+        heartbeat(
+            &mut host,
+            &specs,
+            &store,
+            &mut state,
+            base() + DAY + HOUR,
+            grace(),
+        );
 
-        assert_eq!(host.count_activity("[expired]"), 1);
+        assert_eq!(host.count_kind(ActivityKind::Expired), 1);
         assert!(!ids(&store).contains(&"manual-hourly-1".to_string()));
     }
 
@@ -967,6 +1079,7 @@ mod tests {
     /// state読 → tick → notify → state保存 → 削除+save の順であること。
     #[test]
     fn side_effects_happen_in_the_documented_order() {
+        let mut state = WorkerState::default();
         let specs = vec![spec("hourly", "@hourly")];
         let mut host = FakeHost::default().reply(
             "hourly",
@@ -981,15 +1094,17 @@ mod tests {
         let store =
             store_without_expansion("hourly", vec![adhoc("manual-hourly-1", "hourly", base())]);
 
-        heartbeat(&mut host, &specs, &store, base(), grace());
+        heartbeat(&mut host, &specs, &store, &mut state, base(), grace());
 
         assert_eq!(
             host.effects,
             vec![
+                // retention の掃除は実行より先。この心拍が積む履歴を消させないため (#42)。
+                Effect::Sweep,
                 Effect::ReadState("hourly".into()),
                 Effect::Tick("hourly".into()),
                 Effect::Notify("明示タイトル".into(), "本文".into()),
-                Effect::Activity("hourly".into(), "本文".into()),
+                Effect::Activity("hourly".into(), "notify", "本文".into()),
                 Effect::WriteState("hourly".into(), r#"{"seen":1}"#.into()),
                 Effect::Save(0),
             ]
@@ -1000,6 +1115,7 @@ mod tests {
     /// 次回起動でもう一度実行される。
     #[test]
     fn crash_before_cleanup_keeps_the_task() {
+        let mut state = WorkerState::default();
         let specs = vec![spec("hourly", "@hourly")];
         let mut host = FakeHost::default().reply(
             "hourly",
@@ -1016,7 +1132,7 @@ mod tests {
             store_without_expansion("hourly", vec![adhoc("manual-hourly-1", "hourly", base())]);
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            heartbeat(&mut host, &specs, &store, base(), grace());
+            heartbeat(&mut host, &specs, &store, &mut state, base(), grace());
         }));
         assert!(result.is_err(), "write_state で panic するはず");
 
@@ -1055,33 +1171,36 @@ mod tests {
     /// tick() がエラーを返してもタスクは消す (毎心拍リトライのノイズを避ける)。
     #[test]
     fn tick_error_still_consumes_the_task() {
+        let mut state = WorkerState::default();
         let specs = vec![spec("hourly", "@hourly")];
         let mut host = FakeHost::default().reply("hourly", Err("ReferenceError: x".into()));
         let store = store_of(vec![adhoc("manual-hourly-1", "hourly", base())]);
 
-        heartbeat(&mut host, &specs, &store, base(), grace());
+        heartbeat(&mut host, &specs, &store, &mut state, base(), grace());
 
-        assert_eq!(host.count_activity("[error]"), 1);
+        assert_eq!(host.count_kind(ActivityKind::Error), 1);
         assert!(!ids(&store).contains(&"manual-hourly-1".to_string()));
     }
 
     /// notify を返さない tick() は通知も activity も出さない (静かに終わる)。
     #[test]
     fn tick_without_notify_is_silent() {
+        let mut state = WorkerState::default();
         let specs = vec![spec("hourly", "@hourly")];
         let mut host = FakeHost::default().reply("hourly", Ok(None));
         let store =
             store_without_expansion("hourly", vec![adhoc("manual-hourly-1", "hourly", base())]);
 
-        heartbeat(&mut host, &specs, &store, base(), grace());
+        heartbeat(&mut host, &specs, &store, &mut state, base(), grace());
 
         assert!(!host.effects.iter().any(|e| matches!(e, Effect::Notify(..))));
-        assert_eq!(host.activities(), Vec::<(&str, &str)>::new());
+        assert!(host.activities().is_empty());
     }
 
     /// 同一心拍で複数トリガーが due になっても 1 回しか永続化しない。
     #[test]
     fn one_save_per_heartbeat() {
+        let mut state = WorkerState::default();
         let specs = vec![spec("a", "@hourly"), spec("b", "@hourly")];
         let mut host = FakeHost::default();
         let store = store_of(vec![
@@ -1089,9 +1208,126 @@ mod tests {
             adhoc("manual-b-1", "b", base()),
         ]);
 
-        heartbeat(&mut host, &specs, &store, base(), grace());
+        heartbeat(&mut host, &specs, &store, &mut state, base(), grace());
 
         assert_eq!(host.saves, 1);
         assert!(host.saved.iter().all(|id| !id.starts_with("manual-")));
+    }
+
+    // ---- 履歴 (#42) ----------------------------------------------------------
+
+    /// retention の掃除は起動直後に 1 回走り、その後は閾値 (1h) 条件で走る。
+    /// 心拍ごとに DELETE を撃たないこと。
+    #[test]
+    fn history_sweep_follows_the_threshold() {
+        let mut state = WorkerState::default();
+        let specs = vec![spec("hourly", "@hourly")];
+        let mut host = FakeHost::default();
+        let store = store_of(vec![]);
+
+        heartbeat(&mut host, &specs, &store, &mut state, base(), grace());
+        assert_eq!(host.sweeps, 1, "起動直後は必ず 1 回走る");
+
+        heartbeat(
+            &mut host,
+            &specs,
+            &store,
+            &mut state,
+            base() + 30 * MINUTE,
+            grace(),
+        );
+        assert_eq!(host.sweeps, 1, "閾値未満では走らない");
+
+        heartbeat(
+            &mut host,
+            &specs,
+            &store,
+            &mut state,
+            base() + HOUR,
+            grace(),
+        );
+        assert_eq!(host.sweeps, 2);
+    }
+
+    /// タスク由来のイベントは元のタスクを持つ。実行後にタスクは消えるので、履歴側は
+    /// スナップショットとして持つしかない (#42)。
+    #[test]
+    fn task_derived_activities_carry_the_task() {
+        let mut state = WorkerState::default();
+        let specs = vec![spec("hourly", "@hourly")];
+        let mut host = FakeHost::default().reply("hourly", Ok(Some(tick_result("定時報告"))));
+        let store =
+            store_without_expansion("hourly", vec![adhoc("manual-hourly-1", "hourly", base())]);
+
+        heartbeat(&mut host, &specs, &store, &mut state, base(), grace());
+
+        let notify = host.only(ActivityKind::Notify);
+        let task = notify.task.as_ref().expect("通知はタスク由来");
+        assert_eq!(task.id, "manual-hourly-1");
+        assert_eq!(task.origin, TaskOrigin::Adhoc);
+        assert_eq!(task.scheduled_at, base());
+    }
+
+    /// 破棄系も同じくタスクを持つ。「どの予定がなぜ流れたか」が後から辿れる。
+    #[test]
+    fn discarded_tasks_are_recorded_with_their_task() {
+        let mut state = WorkerState::default();
+        let specs = vec![spec("hourly", "@hourly")];
+        let mut host = FakeHost::default();
+        let store = store_of(vec![]);
+
+        heartbeat(&mut host, &specs, &store, &mut state, base(), grace());
+        heartbeat(
+            &mut host,
+            &specs,
+            &store,
+            &mut state,
+            base() + 3 * HOUR,
+            grace(),
+        );
+
+        let skipped: Vec<_> = host
+            .activities
+            .iter()
+            .filter(|a| a.kind == ActivityKind::Skipped)
+            .collect();
+        assert_eq!(skipped.len(), 2);
+        assert_eq!(
+            skipped
+                .iter()
+                .map(|a| a.task.as_ref().unwrap().scheduled_at)
+                .collect::<Vec<_>>(),
+            vec![base() + HOUR, base() + 2 * HOUR]
+        );
+    }
+
+    /// 展開・再展開はタスクに紐付かない (トリガー単位のイベント)。
+    #[test]
+    fn trigger_level_activities_have_no_task() {
+        let mut state = WorkerState::default();
+        let specs = vec![spec("hourly", "@hourly")];
+        let mut host = FakeHost::default();
+        let store = store_of(vec![]);
+
+        heartbeat(&mut host, &specs, &store, &mut state, base(), grace());
+
+        assert!(host.only(ActivityKind::Expanded).task.is_none());
+    }
+
+    /// 表示用の 1 行は 0.2.0 と同じ形。kind を列に出したことで UI の見た目が
+    /// 変わってはいけない (#42 のスコープは永続化であって UI ではない)。
+    #[test]
+    fn display_strings_are_unchanged_from_0_2_0() {
+        let mut state = WorkerState::default();
+        let specs = vec![spec("hourly", "@hourly")];
+        let mut host = FakeHost::default();
+        let store = store_of(vec![]);
+
+        heartbeat(&mut host, &specs, &store, &mut state, base(), grace());
+
+        assert_eq!(
+            host.only(ActivityKind::Expanded).display(),
+            "[expanded] 48 件のタスクを積みました (〜2026-01-03T00:00:00Z)"
+        );
     }
 }
