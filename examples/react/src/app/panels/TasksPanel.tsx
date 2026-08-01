@@ -9,7 +9,7 @@ interface Props {
  * 予定日時をローカル時刻で表示する。今日ぶんは時刻だけ、それ以外は日付も添える
  * (タスクリストは 48 時間先まで並ぶので「今日か明日か」が読めないと使えない)。
  */
-function formatScheduledAt(ts: number): string {
+export function formatScheduledAt(ts: number): string {
   const d = new Date(ts);
   const pad = (n: number) => n.toString().padStart(2, "0");
   const time = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
@@ -23,7 +23,7 @@ function formatScheduledAt(ts: number): string {
 }
 
 /** 「あと N 分」の相対表示。過去 (= 心拍待ち or 遅延中) は「実行待ち」と出す。 */
-function formatRelative(ts: number): string {
+export function formatRelative(ts: number): string {
   const diffMs = ts - Date.now();
   if (diffMs <= 0) return "実行待ち";
   const mins = Math.round(diffMs / 60000);

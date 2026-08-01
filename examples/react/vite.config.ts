@@ -1,3 +1,4 @@
+/// <reference types="vitest/config" />
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
@@ -30,5 +31,15 @@ export default defineConfig(async () => ({
       // 3. tell Vite to ignore watching `src-tauri`
       ignored: ["**/src-tauri/**"],
     },
+  },
+  test: {
+    // 表示用の純関数は Date のローカル解釈に依存する。TZ を固定しないと開発者の環境と
+    // CI (UTC) で結果が変わるため、テストだけ固定の TZ で回す。UTC 以外を選ぶのは
+    // 「ローカル時刻で表示している」ことを assertion で言えるようにするため。
+    env: { TZ: "Asia/Tokyo" },
+    // `src` に限定するのは `src-tauri/target` (Rust のビルド出力) を走査させないため。
+    // 拡張子は tsx も含める — コンポーネントのテストを足したときに黙って拾われなく
+    // なるのを防ぐ。
+    include: ["src/**/*.test.{ts,tsx}"],
   },
 }));

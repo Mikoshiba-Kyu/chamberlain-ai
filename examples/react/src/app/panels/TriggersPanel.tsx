@@ -7,7 +7,7 @@ interface Props {
 }
 
 /** 次の予定時刻をローカル時刻で表示する。null は「積まれていない」。 */
-function formatNextFireAt(ts: number | null): string {
+export function formatNextFireAt(ts: number | null): string {
   if (ts === null) return "予定なし";
   const d = new Date(ts);
   const pad = (n: number) => n.toString().padStart(2, "0");

@@ -36,3 +36,17 @@ pnpm sync:template:check    # 差分があれば非 0 (CI が実行する)
 - `package.json` / `src-tauri/Cargo.toml` — workspace のパッケージ名。`Cargo.toml` は `chamberlain-core` を **path 依存**で引く (これが examples の存在意義)
 - `src-tauri/tauri.conf.json` — `identifier` が app_data のパスを決めるため固定
 - `src-tauri/src/main.rs` — lib 名の参照
+
+`package.json` は同期対象外なので、**依存やスクリプトを足すときは 2 箇所に手で入れる**必要があります (片方だけだと CI では気づけません)。
+
+### フロントエンドのテスト
+
+テストファイルも template 側が真実です (`src/**/*.test.{ts,tsx}`)。scaffold されたプロジェクトに同梱されることを意図しています。
+
+`templates/react` は pnpm workspace のメンバーではないので、**実行は同期先の `examples/react`** で行います。
+
+```bash
+pnpm --filter chamberlain-example-react test    # vitest (CI が実行する)
+```
+
+同じ理由で `templates/react` 内のファイルはエディタが依存を解決できません (`Cannot find module 'vitest'`)。型は `examples/react` 側の `tsc` が見ています。
