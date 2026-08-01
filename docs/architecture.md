@@ -66,7 +66,14 @@ Chamberlain は cargo + pnpm の 2 系統 workspace として構成される (�
 chamberlain-ai/
 ├── packages/
 │   └── core/                       # フレームワーク本体 (Rust クレート)
-│       └── src/lib.rs              # builder(config) + framework logic
+│       └── src/
+│           ├── lib.rs              # builder() + discovery + invoke commands + TauriHost
+│           ├── worker.rs           # 心拍の配線層 (WorkerHost 境界)
+│           ├── tasks.rs            # タスクリストと分類 (純関数)
+│           ├── schedule.rs         # schedule DSL と発火時刻の計算 (純関数)
+│           ├── secrets.rs          # keyring + JS op
+│           ├── chat.rs / ai.rs     # Type II 秘書チャット / Anthropic クライアント
+│           └── http.rs             # トリガー向け fetch
 ├── examples/
 │   └── react/                      # 常設プレイグラウンド (フル Tauri + React アプリ)
 │       ├── src/                    # React フロントエンド
@@ -167,6 +174,20 @@ manifest.schedule ──(展開器: 閾値条件)──▶ タスクリスト �
 2. **due 取り出し** — `scheduled_at <= now` なタスクを昇順に取る。ここに schedule の解釈は入らない
 3. **分類** — 孤児 / pause / 遅延超過を破棄し、残りを実行する
 4. **後片付け** — 処理済みタスクを消して 1 回だけ永続化する
+
+### 心拍の層分け (#46)
+
+心拍は 3 層に分かれている。**下の層ほど副作用を持たず、テストできる。**
+
+| 層 | 置き場 | 持つもの |
+|---|---|---|
+| 判断 | `tasks.rs` / `schedule.rs` | 「due なタスク 1 件をどう扱うか」「次の発火時刻はいつか」。純関数 |
+| 配線 | `worker.rs` | 副作用を繋ぐ**順序**。`heartbeat(host, specs, store, now, grace)` が一巡を持つ |
+| 接続 | `lib.rs` の `TauriHost` | `AppHandle` / `rustyscript::Runtime` / ロード済みモジュールの実体 |
+
+配線層が触れる副作用は `WorkerHost` trait の 6 メソッド (state 読み書き / `tick()` 呼び出し / OS 通知 / activity / タスク永続化) に数え上げてある。**ここに無い副作用を worker が持ってはならない** — 持った瞬間その経路がテストの外に出るため。
+
+`heartbeat` が `now` を引数に取るので、テストは fake host を差して時計を進めるだけでシナリオを書ける (長期停止からの復帰・スリープ復帰・pause 中の due・schedule 変更・孤児掃除・at-least-once)。JS 実行も境界の裏なので、心拍のテストに V8 は要らない。
 
 ### schedule DSL (#26 決定事項 4 / 5)
 

@@ -42,6 +42,11 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # 純粋ロジック (schedule / tasks) と配線層 (worker) のテスト。webview も
+      # OS 通知も起動しないので Linux runner で完結する (#46)
+      - name: cargo test
+        run: cargo test --workspace
+
       # crates.io に上げる成果物そのものを検証する。src/bootstrap.js のように
       # Cargo のデフォルト include (src/**/*.rs) から漏れるファイルは workspace の
       # cargo check では検出できず、publish 後の成果物だけが壊れる

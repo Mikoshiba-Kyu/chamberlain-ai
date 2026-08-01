@@ -4,6 +4,7 @@ mod http;
 mod schedule;
 mod secrets;
 mod tasks;
+mod worker;
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -23,9 +24,9 @@ use tauri_plugin_store::StoreExt;
 
 use crate::schedule::{parse_schedule, resolve_tz, Schedule};
 use crate::secrets::SecretsService;
-use crate::tasks::{
-    classify_due, expand_trigger, needs_expansion, reconcile, Disposition, ExpansionState, Task,
-    TaskOrigin, TaskStore, TriggerRuntimeState, TriggerSpecView,
+use crate::tasks::{Task, TaskOrigin, TaskStore};
+use crate::worker::{
+    heartbeat, lock_tasks, reconcile_at_startup, TickResult, TriggerSpec, WorkerHost,
 };
 
 /// 心臓周期。展開型スケジューラ (#26) では心拍は「due なタスクを取り出す粒度」であり、
@@ -85,22 +86,6 @@ struct ActivityEvent {
     ts: u64,
     source: String,
     message: String,
-}
-
-#[derive(Deserialize)]
-struct NotifyPayload {
-    /// 省略時は fire_trigger 側で manifest.name をデフォルトに使う
-    #[serde(default)]
-    title: Option<String>,
-    body: String,
-}
-
-#[derive(Deserialize, Default)]
-struct TickResult {
-    #[serde(default)]
-    notify: Option<NotifyPayload>,
-    #[serde(default)]
-    state: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -270,20 +255,6 @@ fn emit_activity(app: &AppHandle, source: &str, message: String) {
     );
 }
 
-/// トリガー tick が返した notify を OS 通知 + activity イベントに流す。
-/// title は明示 > manifest.name の順で決まる (activity 側は body だけを流す)。
-fn fire_trigger(
-    app: &AppHandle,
-    trigger_id: &str,
-    trigger_name: &str,
-    title: Option<String>,
-    body: String,
-) {
-    let effective_title = title.unwrap_or_else(|| trigger_name.to_string());
-    send_notification(app, &effective_title, &body);
-    emit_activity(app, trigger_id, body);
-}
-
 fn read_trigger_state(app: &AppHandle, trigger_id: &str) -> serde_json::Value {
     match app.store(STATE_STORE_FILE) {
         Ok(store) => store
@@ -336,10 +307,8 @@ fn drop_legacy_fire_times(app: &AppHandle) {
     }
 }
 
-/// `tasks.json` からタスクリストと展開状態を読む。
-///
-/// 壊れた値は「空」として扱い、起動を止めない。タスクリストは再展開で復元できる
-/// (境界が失われると 1 回だけ余分に展開されるだけで、冪等性の観点でも安全側に倒れる)。
+/// `tasks.json` からタスクリストと展開状態を読む。JSON の解釈そのものは
+/// [`TaskStore::from_stored`] にあり (テスト可能)、ここは store プラグインとの接続だけ。
 fn load_task_store(app: &AppHandle) -> TaskStore {
     let store = match app.store(TASKS_STORE_FILE) {
         Ok(s) => s,
@@ -348,33 +317,10 @@ fn load_task_store(app: &AppHandle) -> TaskStore {
             return TaskStore::default();
         }
     };
-    let tasks = store
-        .get(TASKS_KEY)
-        .and_then(|v| match serde_json::from_value::<Vec<Task>>(v) {
-            Ok(t) => Some(t),
-            Err(e) => {
-                eprintln!("tasks.json: unreadable task list, starting empty: {e}");
-                None
-            }
-        })
-        .unwrap_or_default();
-    let expansion = store
-        .get(EXPANSION_KEY)
-        .and_then(
-            |v| match serde_json::from_value::<BTreeMap<String, ExpansionState>>(v) {
-                Ok(e) => Some(e),
-                Err(e) => {
-                    eprintln!("tasks.json: unreadable expansion state, starting empty: {e}");
-                    None
-                }
-            },
-        )
-        .unwrap_or_default();
-
-    let mut loaded = TaskStore { tasks, expansion };
-    // due 取り出しは「先頭から scheduled_at 昇順」を前提にしている。手で編集された
-    // tasks.json を読んだ場合にもこの不変条件を成立させる。
-    loaded.normalize();
+    let (loaded, warnings) = TaskStore::from_stored(store.get(TASKS_KEY), store.get(EXPANSION_KEY));
+    for w in warnings {
+        eprintln!("{w}");
+    }
     loaded
 }
 
@@ -388,20 +334,15 @@ fn save_task_store(app: &AppHandle, state: &TaskStore) {
             return;
         }
     };
-    match serde_json::to_value(&state.tasks) {
-        Ok(v) => store.set(TASKS_KEY, v),
+    let (tasks, expansion) = match state.to_stored() {
+        Ok(v) => v,
         Err(e) => {
-            eprintln!("failed to serialize task list: {e}");
+            eprintln!("{e}");
             return;
         }
-    }
-    match serde_json::to_value(&state.expansion) {
-        Ok(v) => store.set(EXPANSION_KEY, v),
-        Err(e) => {
-            eprintln!("failed to serialize expansion state: {e}");
-            return;
-        }
-    }
+    };
+    store.set(TASKS_KEY, tasks);
+    store.set(EXPANSION_KEY, expansion);
     if let Err(e) = store.save() {
         eprintln!("failed to persist task store: {e}");
     }
@@ -519,174 +460,95 @@ fn discover_triggers(app: &AppHandle, triggers_dir: &Path) -> Vec<TriggerInfo> {
     deduped
 }
 
-/// タスクリストを掴む。poison は「前回の panic の残骸」として無視して中身を取り出す。
-///
-/// 通常なら poison は異常の伝播として尊重すべきだが、ここでは 1 度の panic 以降
-/// タスクリストが永久に触れなくなる (= 秘書が二度と動かない) 方が実害が大きい。
-fn lock_tasks(store: &Mutex<TaskStore>) -> std::sync::MutexGuard<'_, TaskStore> {
-    store
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
 fn find_trigger<'a>(triggers: &'a [TriggerInfo], id: &str) -> Option<&'a TriggerInfo> {
     triggers.iter().find(|t| t.manifest.id == id)
 }
 
-/// ms since epoch を UTC の ISO 8601 で表示する。observability メッセージ用。
+/// 心拍から見えるトリガーの写像を作る。`paused` は心拍ごとに読み直す値なので、
+/// この関数も心拍ごとに呼ぶ (#46: 配線層のテストのために worker は [`TriggerSpec`] しか
+/// 知らない)。
 ///
-/// ローカル時刻ではなく UTC を出すのは意図的。この repo の dev container のように
-/// `/etc/localtime` と `TZ` env が食い違う環境があり (`resolve_tz` の doc 参照)、
-/// `chrono::Local` は前者を見るため、トリガーの発火時刻計算とログの表示がずれる。
-/// UTC 固定なら「どちらの時刻か」で迷わない。
-fn fmt_utc(ms: u64) -> String {
-    match i64::try_from(ms)
-        .ok()
-        .and_then(chrono::DateTime::from_timestamp_millis)
-    {
-        Some(dt) => dt.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-        None => format!("<invalid ts {ms}>"),
-    }
-}
-
-/// 遅延を人が読める粒度に丸める。分未満は秒、1 時間未満は分、それ以上は時間+分。
-fn fmt_delay(ms: u64) -> String {
-    let secs = ms / 1000;
-    if secs < 60 {
-        return format!("{secs}s");
-    }
-    let mins = secs / 60;
-    if mins < 60 {
-        return format!("{mins}m");
-    }
-    format!("{}h{}m", mins / 60, mins % 60)
-}
-
-/// 閾値条件を満たしたトリガーを展開する (#26 決定事項 6)。
-///
-/// 展開対象は「実行可能なトリガー」だけ。構成エラーのあるトリガーや JS のロードに失敗した
-/// トリガーを展開すると、実行できないタスクを積んでから due 時に破棄するだけになる。
-///
-/// 戻り値はタスクリスト / 境界が変化したか (呼び出し側が save の要否を判断する)。
-fn expand_pending_triggers(
-    app: &AppHandle,
-    triggers: &[TriggerInfo],
-    loaded: &BTreeMap<String, rustyscript::ModuleHandle>,
-    task_store: &Mutex<TaskStore>,
-    now: u64,
-) -> bool {
-    let mut store = lock_tasks(task_store);
-    let mut dirty = false;
-
-    for t in triggers {
-        let id = &t.manifest.id;
-        if t.schedule_error.is_some() || !loaded.contains_key(id) {
-            continue;
-        }
-        // 境界が無い = reconcile 直後に消えた等の異常時。now を起点にすれば過去は生成しない。
-        let boundary = store
-            .expansion
-            .get(id)
-            .map(|s| s.expanded_until)
-            .unwrap_or(now);
-        if !needs_expansion(boundary, now) {
-            continue;
-        }
-
-        let (generated, new_boundary) = expand_trigger(id, &t.schedule, &t.tz, boundary, now);
-        let added = store.extend(generated);
-
-        // 境界は生成 0 件でも進める。`@at` のように規則が尽きたトリガーで毎心拍
-        // 展開を再試行しないため。
-        store
-            .expansion
-            .entry(id.clone())
-            .and_modify(|s| s.expanded_until = new_boundary)
-            .or_insert_with(|| ExpansionState {
-                expanded_until: new_boundary,
-                schedule: t.manifest.schedule.clone(),
-                tz: t.manifest.tz.clone(),
-            });
-        dirty = true;
-
-        if added > 0 {
-            emit_activity(
-                app,
-                id,
-                format!(
-                    "[expanded] {added} 件のタスクを積みました (〜{})",
-                    fmt_utc(new_boundary)
-                ),
-            );
-        }
-    }
-    dirty
-}
-
-/// 起動時にタスクリストを現在の manifest と突き合わせ、結果を観測面に流す。
-///
-/// 突き合わせには **discovery で見えている全トリガー** を渡す (ロードに失敗したものも含む)。
-/// ロード失敗は一時的なこともあり、それだけで展開済み境界や積まれたタスクを破棄すると
-/// 「1 回のビルド事故でスケジュールの記憶が消える」ことになる。実行可否は展開側
-/// ([`expand_pending_triggers`]) と due 判定側が別途見る。
-fn reconcile_at_startup(
-    app: &AppHandle,
-    triggers: &[TriggerInfo],
-    task_store: &Mutex<TaskStore>,
-    now: u64,
-) {
-    let views: Vec<TriggerSpecView<'_>> = triggers
+/// `runnable` は「構成エラーが無く、かつ JS がロード済み」。どちらを欠いても展開されず、
+/// 既に積まれたタスクは due 時に `[unavailable]` で破棄される。
+fn build_specs(triggers: &[TriggerInfo], host: &TauriHost) -> Vec<TriggerSpec> {
+    triggers
         .iter()
-        .map(|t| TriggerSpecView {
-            id: &t.manifest.id,
-            schedule: &t.manifest.schedule,
-            tz: t.manifest.tz.as_deref(),
+        .map(|t| TriggerSpec {
+            id: t.manifest.id.clone(),
+            name: t.manifest.name.clone(),
+            schedule_raw: t.manifest.schedule.clone(),
+            tz_raw: t.manifest.tz.clone(),
+            schedule: t.schedule.clone(),
+            tz: t.tz,
+            paused: t.paused.load(Ordering::Relaxed),
+            runnable: t.schedule_error.is_none() && host.is_loaded(&t.manifest.id),
         })
-        .collect();
+        .collect()
+}
 
-    let mut store = lock_tasks(task_store);
-    let report = reconcile(&mut store, &views, now);
+/// 本番の [`WorkerHost`]。worker スレッドが所有する副作用の実体をひとまとめにする。
+///
+/// `rustyscript::Runtime` は V8 の thread affinity を持つのでこの構造体ごと worker
+/// スレッドに閉じ込める (`AppHandle` は `Send + Sync` なので問題ない)。
+struct TauriHost {
+    app: AppHandle,
+    runtime: rustyscript::Runtime,
+    /// ロードに成功したトリガーのモジュール。起動時に 1 回作られ、以後変わらない。
+    loaded: BTreeMap<String, rustyscript::ModuleHandle>,
+}
 
-    for (task_id, trigger_id) in &report.orphaned {
-        eprintln!("dropped task '{task_id}': trigger '{trigger_id}' no longer exists");
-        emit_activity(
-            app,
-            trigger_id,
-            format!("[orphaned] トリガーが存在しないため予定を破棄しました ({task_id})"),
-        );
+impl TauriHost {
+    fn is_loaded(&self, trigger_id: &str) -> bool {
+        self.loaded.contains_key(trigger_id)
     }
-    for trigger_id in &report.rescheduled {
-        eprintln!("trigger '{trigger_id}': schedule changed, re-expanding");
-        emit_activity(
-            app,
-            trigger_id,
-            "[rescheduled] schedule が変更されたため未実行の予定を破棄して再展開します".to_string(),
-        );
+}
+
+impl WorkerHost for TauriHost {
+    fn read_state(&mut self, trigger_id: &str) -> serde_json::Value {
+        read_trigger_state(&self.app, trigger_id)
     }
-    save_task_store(app, &store);
+
+    fn write_state(&mut self, trigger_id: &str, state: serde_json::Value) {
+        write_trigger_state(&self.app, trigger_id, state);
+    }
+
+    fn call_tick(
+        &mut self,
+        trigger_id: &str,
+        ctx: serde_json::Value,
+    ) -> Result<Option<TickResult>, String> {
+        // runtime (可変借用) と loaded (不変借用) を同時に使うためフィールドを分解する。
+        let Self {
+            runtime, loaded, ..
+        } = self;
+        let handle = loaded
+            .get(trigger_id)
+            .ok_or_else(|| format!("trigger '{trigger_id}' is not loaded"))?;
+        runtime
+            .call_function(Some(handle), "tick", rustyscript::json_args!(ctx))
+            .map_err(|e| e.to_string())
+    }
+
+    fn notify(&mut self, title: &str, body: &str) {
+        send_notification(&self.app, title, body);
+    }
+
+    fn activity(&mut self, source: &str, message: String) {
+        emit_activity(&self.app, source, message);
+    }
+
+    fn save_tasks(&mut self, store: &TaskStore) {
+        save_task_store(&self.app, store);
+    }
 }
 
 /// JS ワーカー: 単一の rustyscript Runtime に N モジュールを載せ、心拍ごとに
 /// 「due なタスクを取り出して実行する」。V8 の thread affinity を守るため、Runtime は
 /// この std::thread に閉じ込め、tokio 側と UI 側からは mpsc で心拍を送るだけ。
 ///
-/// # 心拍 1 回の流れ (#26 決定事項 2 / 6 / 8)
-///
-/// 1. **展開** — `expanded_until` が閾値に迫ったトリガーをホライズンまで展開する
-/// 2. **due 取り出し** — `scheduled_at <= now` なタスクを昇順に取る。ここに schedule の
-///    解釈は一切入らない (時刻はタスクが持っている)
-/// 3. **分類** — 孤児 / pause / 遅延超過を破棄し、残りを実行する
-/// 4. **後片付け** — 処理済みタスクを消して 1 回だけ永続化する
-///
-/// # 順序の根拠
-///
-/// トリガー 1 件の実行順序は state読 → tick(ctx) → notify → state保存 → タスク削除。
-/// - notify が state 保存より先: プロセスクラッシュ時の "at least once" を優先
-///   (秘書は「1 回多く言う > 一言忘れる」)
-/// - タスク削除が最後: 同じ理由。実行中にクラッシュしたタスクはリストに残り、次回起動で
-///   もう一度試される
-/// - tick() がエラーを返してもタスクは消す。schedule の意味を「実行を試みる時刻」に統一し、
-///   エラーで毎心拍リトライになるノイズを避ける (0.1.x の fire_time 更新方針を踏襲)
+/// 心拍 1 回の中身は [`crate::worker::heartbeat`] にある。ここが持つのは
+/// 「Runtime を立てて、モジュールを載せて、時計を送る」までで、副作用の順序や
+/// 分類の判断は [`TauriHost`] の裏に押し出してある (#46)。
 ///
 /// 戻り値は心拍への割り込み用 Sender。手動実行 (#20) がこれを使って次の心拍を待たずに
 /// タスクを処理させる。
@@ -759,148 +621,21 @@ fn spawn_trigger_worker(
             loaded.insert(t.manifest.id.clone(), handle);
         }
 
+        let mut host = TauriHost {
+            app: app_for_worker,
+            runtime,
+            loaded,
+        };
+
         // 0.1.x の残骸を掃除してから、永続タスクリストを現在の manifest と突き合わせる。
-        drop_legacy_fire_times(&app_for_worker);
-        reconcile_at_startup(&app_for_worker, &triggers, &task_store, now_millis());
+        drop_legacy_fire_times(&host.app);
+        let specs = build_specs(&triggers, &host);
+        reconcile_at_startup(&mut host, &specs, &task_store, now_millis());
 
         while tick_rx.recv().is_ok() {
-            let now = now_millis();
-
-            // 1. 展開 (閾値条件)。
-            let dirty =
-                expand_pending_triggers(&app_for_worker, &triggers, &loaded, &task_store, now);
-
-            // 2. due 取り出し。ロックは掴んだまま JS を回さない (list_tasks / delete_task が
-            //    tick() の実行時間ぶん待たされるのを避ける)。
-            let due = lock_tasks(&task_store).due(now);
-
-            // 3. 分類と実行。
-            let mut handled: Vec<String> = Vec::new();
-            for task in due {
-                let trigger = task
-                    .trigger_id
-                    .as_deref()
-                    .and_then(|tid| find_trigger(&triggers, tid));
-                let handle = task.trigger_id.as_deref().and_then(|tid| loaded.get(tid));
-                // 実行可能なのは「discovery で見えていて、かつ JS がロード済み」のときだけ。
-                // どちらかを欠く場合は classify_due に None を渡して破棄させる。
-                let runtime_state = match (trigger, handle) {
-                    (Some(t), Some(_)) => Some(TriggerRuntimeState {
-                        paused: t.paused.load(Ordering::Relaxed),
-                    }),
-                    _ => None,
-                };
-
-                let source = task.trigger_id.clone().unwrap_or_else(|| "__task__".into());
-                match classify_due(&task, now, runtime_state, schedule_grace) {
-                    Disposition::Run { delay_ms } => {
-                        // classify_due が Run を返した = trigger と handle が揃っている。
-                        let (Some(t), Some(handle)) = (trigger, handle) else {
-                            // trigger_id を持たないタスク (Phase 3 の自然言語タスク) は
-                            // Phase 1 では実行経路が無い。積まれたら破棄して痕跡を残す。
-                            emit_activity(
-                                &app_for_worker,
-                                &source,
-                                "[unsupported] 実行対象のトリガーが無いタスクは Phase 1 では実行できません"
-                                    .to_string(),
-                            );
-                            handled.push(task.id.clone());
-                            continue;
-                        };
-                        let id = &t.manifest.id;
-                        let current_state = read_trigger_state(&app_for_worker, id);
-                        // scheduledAt / delayMs を渡すのは追加決定 11。遅延をどう伝えるかは
-                        // framework が本文に前置きするのではなく、トリガー側に判断させる。
-                        let ctx = serde_json::json!({
-                            "now": now,
-                            "state": current_state,
-                            "scheduledAt": task.scheduled_at,
-                            "delayMs": delay_ms,
-                        });
-                        let result: Result<Option<TickResult>, _> = runtime.call_function(
-                            Some(handle),
-                            "tick",
-                            rustyscript::json_args!(ctx),
-                        );
-                        match result {
-                            Ok(Some(res)) => {
-                                if let Some(notify) = res.notify {
-                                    fire_trigger(
-                                        &app_for_worker,
-                                        id,
-                                        &t.manifest.name,
-                                        notify.title,
-                                        notify.body,
-                                    );
-                                }
-                                if let Some(new_state) = res.state {
-                                    write_trigger_state(&app_for_worker, id, new_state);
-                                }
-                            }
-                            Ok(None) => {}
-                            Err(e) => {
-                                eprintln!("trigger '{id}' tick() error: {e}");
-                                emit_activity(&app_for_worker, id, format!("[error] {e}"));
-                            }
-                        }
-                    }
-                    Disposition::Orphaned => {
-                        // discovery では見えているのに実行できない場合と、manifest から
-                        // 消えている場合を言い分ける (原因の切り分けが変わるため)。
-                        let message = if trigger.is_some() {
-                            "[unavailable] トリガーが実行できない状態 (構成エラー / ロード失敗) \
-                             のため予定を破棄しました"
-                                .to_string()
-                        } else {
-                            "[orphaned] トリガーが存在しないため予定を破棄しました".to_string()
-                        };
-                        emit_activity(&app_for_worker, &source, message);
-                    }
-                    Disposition::Paused => {
-                        emit_activity(
-                            &app_for_worker,
-                            &source,
-                            format!(
-                                "[paused] 停止中のため {} の予定を破棄しました",
-                                fmt_utc(task.scheduled_at)
-                            ),
-                        );
-                    }
-                    Disposition::SkippedLate { delay_ms } => {
-                        emit_activity(
-                            &app_for_worker,
-                            &source,
-                            format!(
-                                "[skipped] {} の予定に {} 遅れているため実行しませんでした",
-                                fmt_utc(task.scheduled_at),
-                                fmt_delay(delay_ms)
-                            ),
-                        );
-                    }
-                    Disposition::Expired { delay_ms } => {
-                        emit_activity(
-                            &app_for_worker,
-                            &source,
-                            format!(
-                                "[expired] {} の予定が猶予を超えた ({} 遅れ) ため未実行のまま破棄しました",
-                                fmt_utc(task.scheduled_at),
-                                fmt_delay(delay_ms)
-                            ),
-                        );
-                    }
-                }
-                handled.push(task.id.clone());
-            }
-
-            // 4. 後片付け。実行後に消すことで at-least-once を保つ。
-            //    展開だけがあった心拍でも境界が動いているので save は必要。
-            if !handled.is_empty() || dirty {
-                let mut store = lock_tasks(&task_store);
-                for id in &handled {
-                    store.remove(id);
-                }
-                save_task_store(&app_for_worker, &store);
-            }
+            // paused はここで読み直す (UI から心拍の合間に切り替わる)。
+            let specs = build_specs(&triggers, &host);
+            heartbeat(&mut host, &specs, &task_store, now_millis(), schedule_grace);
         }
     });
 
