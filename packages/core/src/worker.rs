@@ -179,6 +179,7 @@ pub(crate) fn reconcile_at_startup<H: WorkerHost>(
     specs: &[TriggerSpec],
     task_store: &Mutex<TaskStore>,
     now: u64,
+    schedule_grace: Duration,
 ) {
     let views: Vec<TriggerSpecView<'_>> = specs
         .iter()
@@ -191,7 +192,7 @@ pub(crate) fn reconcile_at_startup<H: WorkerHost>(
 
     let report = {
         let mut store = lock_tasks(task_store);
-        reconcile(&mut store, &views, now)
+        reconcile(&mut store, &views, now, schedule_grace)
     };
 
     for (task_id, trigger_id) in &report.orphaned {
@@ -208,6 +209,24 @@ pub(crate) fn reconcile_at_startup<H: WorkerHost>(
             trigger_id,
             ActivityKind::Rescheduled,
             "schedule が変更されたため未実行の予定を破棄して再展開します".to_string(),
+        ));
+    }
+
+    for sweep in &report.stale {
+        eprintln!(
+            "trigger '{}': dropped {} stale task(s), oldest {}",
+            sweep.trigger_id,
+            sweep.count,
+            fmt_utc(sweep.oldest)
+        );
+        host.activity(Activity::new(
+            &sweep.trigger_id,
+            ActivityKind::Stale,
+            format!(
+                "{} 件の予定を遅延で破棄しました (最古 {})",
+                sweep.count,
+                fmt_utc(sweep.oldest)
+            ),
         ));
     }
 
@@ -899,7 +918,7 @@ mod tests {
         let restarted = vec![spec("hourly", "@hourly :30"), spec("daily", "@daily 06:00")];
         let restart_at = base() + 10 * MINUTE;
         let mut host2 = FakeHost::default();
-        reconcile_at_startup(&mut host2, &restarted, &store, restart_at);
+        reconcile_at_startup(&mut host2, &restarted, &store, restart_at, grace());
 
         let rescheduled = host2.only(ActivityKind::Rescheduled);
         assert_eq!(rescheduled.source, "hourly");
@@ -950,7 +969,7 @@ mod tests {
         // daily が manifest から消えた状態で再起動。
         let restarted = vec![spec("hourly", "@hourly")];
         let mut host2 = FakeHost::default();
-        reconcile_at_startup(&mut host2, &restarted, &store, base() + MINUTE);
+        reconcile_at_startup(&mut host2, &restarted, &store, base() + MINUTE, grace());
 
         assert!(!ids(&store).iter().any(|id| id.starts_with("daily@")));
         assert_eq!(boundary(&store, "daily"), None);
@@ -966,7 +985,7 @@ mod tests {
         let specs = vec![spec("hourly", "@hourly")];
         let store = store_of(vec![]);
 
-        reconcile_at_startup(&mut host, &specs, &store, base());
+        reconcile_at_startup(&mut host, &specs, &store, base(), grace());
 
         assert!(host.activities().is_empty());
     }
@@ -1212,6 +1231,80 @@ mod tests {
 
         assert_eq!(host.saves, 1);
         assert!(host.saved.iter().all(|id| !id.starts_with("manual-")));
+    }
+
+    // ---- 長期停止からの復帰 (#50) --------------------------------------------
+
+    /// 2 日閉じていた後の起動。0.2.0 では心拍が `[skipped]` を 1 件ずつ出して観測面を
+    /// 埋め、起動時にしか出ない `[expanded]` を押し流していた。起動時に畳んで捨てる。
+    #[test]
+    fn long_downtime_collapses_into_one_line_per_trigger() {
+        let specs = vec![spec("hourly", "@hourly"), spec("daily", "@daily 06:00")];
+        let store = store_of(vec![]);
+
+        // 2 日前に起動して 48h ぶんを積み、そのまま閉じた状況を作る。
+        let before = base() - 2 * DAY;
+        {
+            let mut warmup = FakeHost::default();
+            let mut state = WorkerState::default();
+            heartbeat(&mut warmup, &specs, &store, &mut state, before, grace());
+        }
+        let stacked = ids(&store).len();
+        assert!(stacked > 40, "前提: 相応の件数が積まれている ({stacked})");
+
+        // 2 日後に起動。
+        let mut host = FakeHost::default();
+        reconcile_at_startup(&mut host, &specs, &store, base(), grace());
+
+        // トリガーごとに 1 行だけ。
+        assert_eq!(host.count_kind(ActivityKind::Stale), 2);
+        assert_eq!(host.count_kind(ActivityKind::Skipped), 0);
+
+        let hourly = host
+            .activities
+            .iter()
+            .find(|a| a.kind == ActivityKind::Stale && a.source == "hourly")
+            .unwrap();
+        // 48 件積まれたうち、ちょうど base() に来る 1 件は猶予内なので残る (心拍が実行する)。
+        // 境界のこちら側とあちら側で扱いが分かれることの確認でもある。
+        assert_eq!(
+            hourly.display(),
+            format!(
+                "[stale] 47 件の予定を遅延で破棄しました (最古 {})",
+                fmt_utc(before + HOUR)
+            )
+        );
+        assert!(ids(&store).contains(&format!("hourly@{}", base())));
+
+        // 続く心拍は静か。破棄済みなので [skipped] は 1 件も出ない。
+        let mut state = WorkerState::default();
+        heartbeat(&mut host, &specs, &store, &mut state, base(), grace());
+        assert_eq!(host.count_kind(ActivityKind::Skipped), 0);
+        // 起動時にしか出ないイベントが埋もれない。
+        assert_eq!(host.count_kind(ActivityKind::Expanded), 2);
+    }
+
+    /// スリープ復帰程度の飛びは従来どおり心拍が 1 件ずつ扱う。畳むのは起動時だけで、
+    /// 数件しか出ない場面では 1 件ずつの方が読みやすい。
+    #[test]
+    fn short_gaps_still_report_per_task() {
+        let mut state = WorkerState::default();
+        let specs = vec![spec("hourly", "@hourly")];
+        let mut host = FakeHost::default();
+        let store = store_of(vec![]);
+
+        heartbeat(&mut host, &specs, &store, &mut state, base(), grace());
+        heartbeat(
+            &mut host,
+            &specs,
+            &store,
+            &mut state,
+            base() + 3 * HOUR,
+            grace(),
+        );
+
+        assert_eq!(host.count_kind(ActivityKind::Skipped), 2);
+        assert_eq!(host.count_kind(ActivityKind::Stale), 0);
     }
 
     // ---- 履歴 (#42) ----------------------------------------------------------
