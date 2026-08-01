@@ -51,8 +51,10 @@ jobs:
           - label: macOS (Apple Silicon)
             runner: macos-latest
             target: aarch64-apple-darwin
+          # Intel は macos-13 が retirement 済みで、指定すると runner が割り当てられず
+          # ジョブが queued のまま止まる (2026-08 に実測)。現行の Intel ラベルはこれ。
           - label: macOS (Intel)
-            runner: macos-13
+            runner: macos-15-intel
             target: x86_64-apple-darwin
           - label: Linux (x86_64)
             runner: ubuntu-latest
