@@ -366,7 +366,12 @@ pub(crate) fn heartbeat<H: WorkerHost>(
     let swept = sweep_stale_tasks(host, task_store, now, schedule_grace);
 
     // 2. 展開 (閾値条件)。
-    let dirty = swept | expand_pending(host, specs, task_store, now);
+    //
+    // 2 つを別々の束縛にするのは、`swept || expand_pending(..)` と書くと短絡評価で
+    // 「掃除が起きた心拍では展開しない」になるため。副作用のある関数を論理演算子の
+    // 右辺に置かない。
+    let expanded = expand_pending(host, specs, task_store, now);
+    let dirty = swept || expanded;
 
     // 3. due 取り出し。ロックは掴んだまま JS を回さない (list_tasks / delete_task が
     //    tick() の実行時間ぶん待たされるのを避ける)。
@@ -468,16 +473,19 @@ pub(crate) fn heartbeat<H: WorkerHost>(
                     .with_task(&task),
                 );
             }
-            // ここには来ない。猶予超過は step 1 の掃除が先に拾う (#53)。
-            // 掃除と `classify_due` の判定がずれた場合の安全網として残してある —
-            // 黙って実行してしまうより、痕跡を残して破棄する方がよい。
+            // **ここには来ない。** 猶予超過は step 2 の掃除が先に拾う (#53)。
+            // [`sweep_stale`] と [`classify_due`] の判定がずれた場合の安全網として
+            // 残してある — 黙って実行してしまうより、痕跡を残して破棄する方がよい。
+            //
+            // 通常経路と**同じ文言にしない**のは、万一これが出たときに「掃除が壊れて
+            // いる」と読めるようにするため。同じ行に見えると不変条件の破れに気づけない。
             Disposition::SkippedLate { delay_ms } => {
                 host.activity(
                     Activity::new(
                         &source,
                         ActivityKind::Skipped,
                         format!(
-                            "{} の予定に {} 遅れているため実行しませんでした",
+                            "{} の予定に {} 遅れています (掃除が拾えていません: framework の不具合)",
                             fmt_utc(task.scheduled_at),
                             fmt_delay(delay_ms)
                         ),
