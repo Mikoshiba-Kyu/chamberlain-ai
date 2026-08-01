@@ -91,6 +91,10 @@ fn dev_mode_enabled() -> bool {
 /// UI が「起動前に起きたこと」と「今起きたこと」を同じ配列に混ぜられるようにするため (#42)。
 #[derive(Clone, Serialize)]
 struct ActivityEvent {
+    /// 履歴上の行 id。UI が live emit と保存済み履歴を突き合わせる同一性に使う。
+    /// 履歴 DB が開けなかった環境では null になるので、UI 側にフォールバックが要る。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<i64>,
     ts: u64,
     source: String,
     /// 種別の安定した識別子 (`"skipped"` 等)。0.3.0 で追加 (#42)。UI がフィルタや
@@ -287,14 +291,20 @@ pub(crate) fn now_millis() -> u64 {
 /// 見えなくなる方が実害が大きい。
 fn record_activity(app: &AppHandle, history: &HistoryRef, activity: &Activity) {
     let ts = now_millis();
-    if let Some(store) = lock_history(history).as_ref() {
-        if let Err(e) = store.append(ts, activity) {
-            eprintln!("failed to persist activity: {e}");
-        }
-    }
+    let id = match lock_history(history).as_ref() {
+        Some(store) => match store.append(ts, activity) {
+            Ok(id) => Some(id),
+            Err(e) => {
+                eprintln!("failed to persist activity: {e}");
+                None
+            }
+        },
+        None => None,
+    };
     let _ = app.emit(
         "activity",
         ActivityEvent {
+            id,
             ts,
             source: activity.source.clone(),
             kind: activity.kind.as_str().to_string(),
@@ -485,9 +495,11 @@ fn discover_triggers(
         }
 
         // schedule error はトリガーを捨てずに TriggerInfo に持たせ、UI から
-        // 「壊れてる」と見えるようにする。stderr + activity にも流すが、activity は
-        // discovery が .setup() 内で走る都合上 UI リスナー未接続で捨てられる可能性が
-        // 高いため、list_triggers の error フィールドが実質的な観測面。
+        // 「壊れてる」と見えるようにする。stderr + activity にも流す。
+        //
+        // 0.2.0 まで、この activity は discovery が .setup() 内で走る都合上 UI リスナー
+        // 未接続で捨てられていた。#42 で履歴に永続化されるようになり、UI は起動後に
+        // list_activity で読めるようになっている。
         let (schedule, schedule_error) = match parse_schedule(&manifest.schedule) {
             Ok(spec) => (spec, None),
             Err(e) => {
@@ -792,6 +804,7 @@ fn list_activity(limit: Option<usize>, history: State<'_, HistoryRef>) -> Vec<Ac
         Ok(rows) => rows
             .into_iter()
             .map(|r| ActivityEvent {
+                id: Some(r.id),
                 ts: r.ts,
                 message: r.display(),
                 source: r.source,

@@ -2,6 +2,11 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 export interface ActivityEvent {
+  /**
+   * 履歴上の行 id。live emit と `listActivity()` の結果を突き合わせる同一性に使う。
+   * 履歴 DB が開けなかった環境では undefined になる。
+   */
+  id?: number;
   ts: number;
   /** トリガー ID。トリガーに紐付かないものは `"__task__"`。 */
   source: string;

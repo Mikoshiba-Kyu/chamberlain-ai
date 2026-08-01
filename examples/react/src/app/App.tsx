@@ -29,8 +29,16 @@ const MAX_EVENTS = 200;
  */
 const TASKS_POLL_MS = 15_000;
 
-/** live emit と保存済み履歴が重なったときの同一判定。 */
-const eventKey = (e: ActivityEvent) => `${e.ts}|${e.source}|${e.message}`;
+/**
+ * live emit と保存済み履歴が重なったときの同一判定。
+ *
+ * 通常は履歴の行 id を使う。同じ心拍で同じトリガーが同じ本文を 2 回出すことがある
+ * (スリープ復帰で ad-hoc と schedule 由来が両方走る等) ため、内容による判定では
+ * 別のイベントを 1 つに潰してしまう。id が無いのは履歴 DB が開けなかった環境だけで、
+ * そのときは listActivity() も空なので突き合わせ自体が起きない。
+ */
+const eventKey = (e: ActivityEvent) =>
+  e.id !== undefined ? `#${e.id}` : `${e.ts}|${e.source}|${e.message}`;
 
 export function App() {
   const [active, setActive] = useState<TabId>("triggers");
@@ -65,7 +73,8 @@ export function App() {
       setEvents((prev) => {
         const seen = new Set(prev.map(eventKey));
         const merged = [...prev, ...stored.filter((e) => !seen.has(eventKey(e)))];
-        merged.sort((a, b) => b.ts - a.ts);
+        // 起動時のイベントは ms まで同着することが多いので、同時刻は id の降順で割る。
+        merged.sort((a, b) => b.ts - a.ts || (b.id ?? 0) - (a.id ?? 0));
         return merged.slice(0, MAX_EVENTS);
       });
     });

@@ -194,6 +194,8 @@ impl Activity {
 /// 永続化された履歴 1 行。読み出し側 (UI / テスト) が受け取る形。
 #[derive(Debug, Clone)]
 pub(crate) struct ActivityRecord {
+    /// 行 id。UI が live emit と突き合わせるための同一性。
+    pub id: i64,
     pub ts: u64,
     pub source: String,
     /// **`ActivityKind` ではなく `String`**。使われなくなった kind の行も読めなければ
@@ -290,8 +292,13 @@ impl HistoryStore {
         Ok(Self { conn })
     }
 
-    /// 1 件追記する。
-    pub(crate) fn append(&self, ts: u64, activity: &Activity) -> rusqlite::Result<()> {
+    /// 1 件追記する。戻り値は行 id。
+    ///
+    /// **id を返すのは live emit と保存済み履歴の突き合わせのため。** UI は起動時に両方を
+    /// 受け取るので、同じイベントを 2 回並べないための同一判定が要る。`ts + source + message`
+    /// では、同じ心拍で同じトリガーが同じ本文を 2 回出した場合 (スリープ復帰で ad-hoc と
+    /// schedule 由来が両方走る等) に別のイベントを 1 つに潰してしまう。
+    pub(crate) fn append(&self, ts: u64, activity: &Activity) -> rusqlite::Result<i64> {
         let task = activity.task.as_ref();
         self.conn.execute(
             "INSERT INTO activity (ts, source, kind, message, task_id, task_origin, scheduled_at)
@@ -306,24 +313,25 @@ impl HistoryStore {
                 task.map(|t| t.scheduled_at as i64),
             ],
         )?;
-        Ok(())
+        Ok(self.conn.last_insert_rowid())
     }
 
     /// 直近 `limit` 件を**新しい順**で返す。UI の初期表示はこれを読む。
     pub(crate) fn recent(&self, limit: usize) -> rusqlite::Result<Vec<ActivityRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT ts, source, kind, message, task_id, task_origin, scheduled_at
+            "SELECT id, ts, source, kind, message, task_id, task_origin, scheduled_at
              FROM activity ORDER BY ts DESC, id DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map([limit as i64], |row| {
             Ok(ActivityRecord {
-                ts: row.get::<_, i64>(0)? as u64,
-                source: row.get(1)?,
-                kind: row.get(2)?,
-                message: row.get(3)?,
-                task_id: row.get(4)?,
-                task_origin: row.get(5)?,
-                scheduled_at: row.get::<_, Option<i64>>(6)?.map(|v| v as u64),
+                id: row.get(0)?,
+                ts: row.get::<_, i64>(1)? as u64,
+                source: row.get(2)?,
+                kind: row.get(3)?,
+                message: row.get(4)?,
+                task_id: row.get(5)?,
+                task_origin: row.get(6)?,
+                scheduled_at: row.get::<_, Option<i64>>(7)?.map(|v| v as u64),
             })
         })?;
         rows.collect()
@@ -456,6 +464,24 @@ mod tests {
             rows.iter().map(|r| r.message.as_str()).collect::<Vec<_>>(),
             vec!["4", "3", "2"]
         );
+    }
+
+    /// 内容が完全に同じ 2 件でも別の行として残り、id で区別できる。
+    ///
+    /// UI は live emit と保存済み履歴を突き合わせるので、ここが潰れると**イベントが
+    /// 1 件消える**。スリープ復帰で ad-hoc と schedule 由来が同じ心拍で走り、同じ本文を
+    /// 返す場合に実際に起きうる。
+    #[test]
+    fn identical_events_stay_distinguishable_by_id() {
+        let s = store();
+        let same = Activity::new("t", ActivityKind::Notify, "おはようございます".into());
+
+        let first = s.append(base(), &same).unwrap();
+        let second = s.append(base(), &same).unwrap();
+
+        assert_ne!(first, second);
+        let ids: Vec<i64> = s.recent(10).unwrap().iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![second, first]);
     }
 
     /// 同一 ts でも挿入順の逆で決定的に並ぶ (同じ心拍で複数イベントが出る)。
