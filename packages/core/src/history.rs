@@ -75,8 +75,10 @@ pub(crate) enum ActivityKind {
     Unavailable,
     /// 停止中のため破棄した。
     Paused,
-    /// schedule 由来の予定が猶予を超えて遅れたため破棄した。
+    /// schedule 由来の予定が猶予を超えて遅れたため破棄した (心拍中に 1 件ずつ)。
     Skipped,
+    /// 長期停止からの復帰で、猶予を超えた予定をトリガー単位に一括破棄した (#50)。
+    Stale,
     /// ad-hoc の予定が猶予 (24h) を超えたため破棄した。
     Expired,
     /// トリガーを持たないタスクは Phase 1 では実行経路が無い。
@@ -102,6 +104,7 @@ impl ActivityKind {
             Self::Unavailable => "unavailable",
             Self::Paused => "paused",
             Self::Skipped => "skipped",
+            Self::Stale => "stale",
             Self::Expired => "expired",
             Self::Unsupported => "unsupported",
             Self::Manual => "manual",
@@ -124,6 +127,7 @@ impl ActivityKind {
             Self::Unavailable => Some("[unavailable]"),
             Self::Paused => Some("[paused]"),
             Self::Skipped => Some("[skipped]"),
+            Self::Stale => Some("[stale]"),
             Self::Expired => Some("[expired]"),
             Self::Unsupported => Some("[unsupported]"),
             Self::Manual => Some("[manual]"),
@@ -239,6 +243,7 @@ fn parse_kind(s: &str) -> Option<ActivityKind> {
         Unavailable,
         Paused,
         Skipped,
+        Stale,
         Expired,
         Unsupported,
         Manual,
@@ -672,6 +677,7 @@ mod tests {
             ActivityKind::Unavailable,
             ActivityKind::Paused,
             ActivityKind::Skipped,
+            ActivityKind::Stale,
             ActivityKind::Expired,
             ActivityKind::Unsupported,
             ActivityKind::Manual,
