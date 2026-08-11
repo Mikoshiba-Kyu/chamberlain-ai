@@ -87,6 +87,12 @@ pub(crate) enum ActivityKind {
     Manual,
     /// 予定が削除された。
     Deleted,
+    /// manifest の宣言に無い権限をトリガーが要求したので拒否した (#56)。
+    ///
+    /// 種類ごとに kind を分けない。UI から見て意味があるのは「宣言の外に出ようとして
+    /// 止められた」という 1 つの概念で、何が止まったか (secret / 宛先ホスト) は
+    /// `message` が持つ。#57 の宛先ホスト拒否もこの kind に乗る。
+    Denied,
 }
 
 impl ActivityKind {
@@ -109,6 +115,7 @@ impl ActivityKind {
             Self::Unsupported => "unsupported",
             Self::Manual => "manual",
             Self::Deleted => "deleted",
+            Self::Denied => "denied",
         }
     }
 
@@ -132,6 +139,7 @@ impl ActivityKind {
             Self::Unsupported => Some("[unsupported]"),
             Self::Manual => Some("[manual]"),
             Self::Deleted => Some("[deleted]"),
+            Self::Denied => Some("[denied]"),
         }
     }
 }
@@ -162,7 +170,10 @@ impl TaskRef {
 /// 観測面に流す 1 件。live emit (Tauri event) と永続化の両方がこれを受け取る。
 #[derive(Debug, Clone)]
 pub(crate) struct Activity {
-    /// トリガー ID。トリガーに紐付かないものは `"__task__"`。
+    /// トリガー ID。トリガーに紐付かないものは framework 側の予約 ID を使う:
+    /// タスク由来だがトリガーを解決できないものは `"__task__"`、トリガーにも
+    /// タスクにも帰属しない framework 自身のものは `"__meta__"` (#56 の `[denied]` 等)。
+    /// どちらも discovery が予約しているのでトリガーが名乗ることはない。
     pub source: String,
     pub kind: ActivityKind,
     /// プレフィックスを含まない本文。表示用の文字列は [`Activity::display`] が組み立てる。
@@ -248,6 +259,7 @@ fn parse_kind(s: &str) -> Option<ActivityKind> {
         Unsupported,
         Manual,
         Deleted,
+        Denied,
     ]
     .into_iter()
     .find(|k| k.as_str() == s)

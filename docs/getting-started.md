@@ -59,3 +59,15 @@ chamberlain.ai.complete(opts: {
 ```
 
 `ctx` は tick に渡される純粋データ (`{ now, state }`) で、副作用のある API は `chamberlain.*` 側に分けてあります。詳細な設計意図と契約は [`docs/architecture.md`](./architecture.md#ambient-global-chamberlain) を参照してください。
+
+### 読む secret は manifest に宣言する
+
+`getSecret(name)` は **`manifest.json` の `requiredSecrets` に書いた名前しか返しません** (0.3.0 / #56)。宣言していない名前を渡すと `null` が返り、活動ログに `[denied]` が出ます。「keyring に入れたのに null が返る」ときはまず宣言を確認してください。
+
+```json
+{
+  "requiredSecrets": ["github_token"]
+}
+```
+
+`anthropic_api_key` だけは宣言しても返りません (framework が持つキーです)。トリガーから AI を使う場合は `chamberlain.ai.complete` を呼んでください。

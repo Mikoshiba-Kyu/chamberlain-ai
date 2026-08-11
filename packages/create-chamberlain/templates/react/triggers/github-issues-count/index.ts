@@ -21,6 +21,8 @@ const REPO = "Mikoshiba-Kyu/chamberlain-ai";
 // bootstrap.js が globalThis.chamberlain を生やしている。
 // 型は将来 core パッケージから import する形になる (別 Issue、# TBD)。
 declare const chamberlain: {
+  // manifest.json の requiredSecrets に書いた名前しか返らない (#56)。宣言外は null が
+  // 返り、活動ログに [denied] が出る。このトリガーは "github_token" を宣言している。
   getSecret(name: string): Promise<string | null>;
   ai: {
     complete(opts: { prompt: string; system?: string; model?: string }): Promise<string>;
