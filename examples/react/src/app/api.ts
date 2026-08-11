@@ -13,8 +13,8 @@ export interface ActivityEvent {
   /**
    * 種別の安定した識別子 (`"notify"` / `"skipped"` / `"expanded"` 等)。
    *
-   * 0.3.0 で追加 (#42)。`message` の `[...]` プレフィックスはこれから組み立てられて
-   * いるので、フィルタや表示の出し分けは文字列パースではなくこちらを見る。
+   * `message` の `[...]` プレフィックスはこれから組み立てられているので、フィルタや
+   * 表示の出し分けは文字列パースではなくこちらを見る。
    */
   kind: string;
   /** 表示用の 1 行。 */
@@ -31,12 +31,7 @@ export interface TriggerListItem {
   name: string;
   description: string | null;
   paused: boolean;
-  /**
-   * manifest に宣言された生の schedule 文字列 (`"@daily 09:00"` 等)。
-   *
-   * 0.2.0 で `scheduleType` は削除された。interval 系統が廃止されて wall-clock のみに
-   * なったため、`nextFireAt` の意味論が分岐しなくなった (#26 決定事項 4)。
-   */
+  /** manifest に宣言された生の schedule 文字列 (`"@daily 09:00"` 等)。 */
   schedule: string;
   /**
    * タスクリスト上でこのトリガーに積まれている最も早い予定時刻 (ms since epoch)。
@@ -49,8 +44,7 @@ export interface TriggerListItem {
   /**
    * 起動時 discovery で見つかった構成エラー (例: schedule パース失敗、allowedHosts の
    * 書式不正)。このフィールドが非 null の間、そのトリガーは load / 展開されない。
-   * UI 上で「壊れてる」ことを可視化するのが目的 (activity は startup 時に UI 未接続で
-   * 捨てられる可能性が高いため、ここが実質的な観測面)。
+   * UI 上で「壊れてる」ことを可視化するのが目的。
    */
   error: string | null;
   /**
@@ -120,9 +114,9 @@ export const chamberlainApi = {
   /**
    * 保存済みの履歴を新しい順に取る (#42)。
    *
-   * worker は `.setup()` 内で動き出すため、`[schedule error]` や `[expanded]` は
-   * この webview のリスナーが繋がる前に emit されて捨てられる。**起動時のイベントを
-   * 見るにはこれを読む必要がある。**
+   * worker は `.setup()` 内で動き出すため、`[config error]` や `[expanded]` は
+   * この webview のリスナーが繋がる前に emit される。**起動時のイベントを見るには
+   * これを読む必要がある。**
    */
   listActivity: (limit?: number) =>
     invoke<ActivityEvent[]>("list_activity", { limit }),

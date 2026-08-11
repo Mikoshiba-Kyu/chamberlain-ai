@@ -154,10 +154,10 @@ fn next_hop(
 
 /// 転送先が別ホストなら、認証情報を持つヘッダを落とす。
 ///
-/// **reqwest の redirect policy を切った代償**。あちらは追跡時にこれを自前でやっていたので、
-/// 追跡を core に移した時点で一緒に落ちていた。`allowedHosts` は守りにならない —
-/// `["api.github.com", "*.githubusercontent.com"]` のように**両方とも正当に宣言されている**
-/// 構成 (GitHub の asset 取得はまさにこれ) で、片方向けの token がもう片方に届いてしまう。
+/// リダイレクト追跡を自前でやる以上、reqwest がやっていたこれも自前で行う必要がある。
+/// `allowedHosts` は守りにならない — `["api.github.com", "*.githubusercontent.com"]` の
+/// ように**両方とも正当に宣言されている**構成 (GitHub の asset 取得はまさにこれ) で、
+/// 片方向けの token がもう片方に届いてしまう。
 ///
 /// 落とす対象と cross-host の判定は reqwest の `remove_sensitive_headers` に合わせてある
 /// (ホストに加えてポートも見る)。
@@ -371,9 +371,9 @@ mod tests {
         names
     }
 
-    /// **宣言の内側でも**、別ホストへ渡るときは認証情報を落とす。reqwest の redirect policy を
-    /// 切った時点でこれが落ちていた。`["api.github.com", "*.githubusercontent.com"]` は
-    /// どちらも正当な宣言なので、`allowedHosts` はここでは守りにならない。
+    /// **宣言の内側でも**、別ホストへ渡るときは認証情報を落とす。
+    /// `["api.github.com", "*.githubusercontent.com"]` はどちらも正当な宣言なので、
+    /// `allowedHosts` はここでは守りにならない。
     #[test]
     fn credentials_do_not_survive_a_cross_host_redirect() {
         assert_eq!(

@@ -64,10 +64,8 @@ export function App() {
         else unlisten = fn;
       });
     // 保存済みの履歴で初期表示を埋める (#42)。worker は setup() 内で動き出すので、
-    // 起動時のイベント ([schedule error] / [expanded] / [rescheduled] / [orphaned]) は
-    // 上のリスナーが繋がる前に流れている。
-    //
-    // live 側と重なる可能性があるので ts + source + message で重複を落とす。
+    // 起動時のイベント ([config error] / [expanded] / [rescheduled] / [orphaned]) は
+    // 上のリスナーが繋がる前に流れている。live 側と重なる分は eventKey で落とす。
     chamberlainApi.listActivity(MAX_EVENTS).then((stored) => {
       if (cancelled) return;
       setEvents((prev) => {

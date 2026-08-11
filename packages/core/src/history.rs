@@ -14,22 +14,21 @@
 //! **エンドユーザーが手で編集できること**を設計に織り込んでいる ([`crate::tasks::TaskStore::normalize`]
 //! の存在理由)。性質が違うので保存先も分ける。
 //!
-//! # 起動時イベントの gap がこれで閉じる
+//! # 起動時イベントの gap を閉じる
 //!
-//! `emit_activity` は Tauri の `Emitter::emit` で JS に飛ばすだけだったので、worker が
-//! `.setup()` 内で起動する都合上、**webview のリスナーが繋がる前のイベントは捨てられていた**
-//! (`[schedule error]` / `[expanded]` / `[rescheduled]` / `[orphaned]`)。永続化すれば UI は
-//! 起動後に保存済みの履歴を読めばよく、接続タイミングに依存しなくなる。
+//! worker は `.setup()` 内で起動するので、`[config error]` / `[expanded]` /
+//! `[rescheduled]` / `[orphaned]` は **webview のリスナーが繋がる前に emit される**。
+//! 永続化してあれば UI は起動後に保存済みの履歴を読めばよく、接続タイミングに依存しない。
 //!
-//! # kind を列に出す
+//! # kind は列に持つ
 //!
-//! 0.2.0 まで種別は `message` 文字列のプレフィックス (`[skipped]` 等) で表現されていた。
-//! フィルタや集計のたびに文字列パースが要るので、[`ActivityKind`] を独立した列にする。
-//! **DB 上は enum ではなく TEXT** である。将来使われなくなった kind の行も読めなければ
-//! ならないため (retention 30 日でも移行期間中は古い行が残る)。
+//! 種別を `message` のプレフィックス (`[skipped]` 等) で表すと、フィルタや集計のたびに
+//! 文字列パースが要る。よって [`ActivityKind`] を独立した列にする。**DB 上は enum では
+//! なく TEXT** である。使われなくなった kind の行も読めなければならないため
+//! (retention 30 日でも移行期間中は古い行が残る)。
 //!
 //! 表示用のプレフィックスは [`ActivityKind::prefix`] から組み立てる。文字列側とマッピングを
-//! 二重に持たないための措置で、UI から見た `message` は 0.2.0 と同じ形のまま。
+//! 二重に持たないための措置。
 
 use std::path::Path;
 use std::time::Duration;
@@ -49,10 +48,8 @@ pub(crate) const MAX_ROWS: usize = 20_000;
 /// (時刻イベントにすると起動保証の問題が出るのは #26 決定事項 6 と同じ理由)。
 pub(crate) const SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
-/// 履歴イベントの種別。
-///
-/// 0.2.0 の activity プレフィックス一覧をそのまま列にしたもの。値は DB に入る安定した
-/// 識別子なので、**一度出荷した文字列は変えない** (古い行が読めなくなる)。
+/// 履歴イベントの種別。値は DB に入る安定した識別子なので、**一度出荷した文字列は
+/// 変えない** (古い行が読めなくなる)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ActivityKind {
     /// トリガーが返した通知本文。唯一エンドユーザー向けのイベント。
@@ -63,9 +60,8 @@ pub(crate) enum ActivityKind {
     LoadError,
     /// トリガーの JS がインスタンス化できなかった。
     InstantiateError,
-    /// discovery 時点の schedule / tz の構成エラー。**0.3.0 で [`ActivityKind::ConfigError`]
-    /// に統合された**。新しい行は書かれないが、保存済みの行を読むために残す
-    /// (モジュール doc: 一度出荷した文字列は変えない)。
+    /// 廃止。[`ActivityKind::ConfigError`] に統合されたので新しい行は書かれないが、
+    /// 保存済みの行を読むために残す (モジュール doc: 一度出荷した文字列は変えない)。
     ScheduleError,
     /// 展開器がタスクを積んだ。
     Expanded,
@@ -89,11 +85,10 @@ pub(crate) enum ActivityKind {
     Manual,
     /// 予定が削除された。
     Deleted,
-    /// manifest の宣言に無い権限をトリガーが要求したので拒否した (#56)。
+    /// manifest の宣言に無い権限をトリガーが要求したので拒否した (#56 / #57)。
     ///
-    /// 種類ごとに kind を分けない。UI から見て意味があるのは「宣言の外に出ようとして
-    /// 止められた」という 1 つの概念で、何が止まったか (secret / 宛先ホスト) は
-    /// `message` が持つ。#57 の宛先ホスト拒否もこの kind に乗る。
+    /// secret と宛先ホストで kind を分けない。UI から見て意味があるのは「宣言の外に
+    /// 出ようとして止められた」という 1 つの概念で、何が止まったかは `message` が持つ。
     Denied,
     /// トリガーが `chamberlain.ai.complete` を呼んだ (#57)。
     ///
@@ -103,11 +98,9 @@ pub(crate) enum ActivityKind {
     AiCall,
     /// manifest が壊れていて、トリガーを実行対象にできない (#57)。
     ///
-    /// `schedule` / `tz` / `allowedHosts` のどれが壊れていても**同じ kind** で出す。
-    /// [`ActivityKind::Denied`] と同じ判断で、UI から見て意味があるのは「manifest が
-    /// 壊れていて動かせない」という 1 つの概念であり、どの項目かは `message` が持つ。
-    /// これらは下流でも `TriggerInfo.config_error` に合流し、`; ` で連ねた 1 本の
-    /// 文字列として同じ「構成エラー」バッジになる。
+    /// `schedule` / `tz` / `allowedHosts` のどれが壊れていても**同じ kind** で出す
+    /// ([`ActivityKind::Denied`] と同じ判断)。どの項目かは `message` が持ち、下流でも
+    /// `TriggerInfo.config_error` に `; ` で連ねて 1 本の「構成エラー」になる。
     ///
     /// 権限の宣言が壊れている場合に部分的に捨てて動かさないのは、#55 の同意画面に出す
     /// 文字列と実際の制限がずれるため (宣言が強制力を持たない同意はシアターになる)。
@@ -220,7 +213,7 @@ impl Activity {
         self
     }
 
-    /// UI に出す 1 行。0.2.0 の `message` と同じ形 (`[skipped] ...`) を kind から組み立てる。
+    /// UI に出す 1 行 (`[skipped] ...`)。プレフィックスは kind から組み立てる。
     pub(crate) fn display(&self) -> String {
         match self.kind.prefix() {
             Some(prefix) => format!("{prefix} {}", self.message),
@@ -615,7 +608,7 @@ mod tests {
     }
 
     /// ファイルに開いた DB がプロセスをまたいで読める。**これが #42 の眼目** —
-    /// 「起動時に emit されて誰にも見えなかったイベント」が次の起動で読めること。
+    /// 起動時に emit されて UI に届かなかったイベントが、次の起動で読めること。
     #[test]
     fn rows_survive_reopening_the_file() {
         let dir = std::env::temp_dir().join(format!("chamberlain-history-{}", std::process::id()));
@@ -684,7 +677,7 @@ mod tests {
     }
 
     /// 将来の版が書いた未知の kind でも行は読めるし表示もできる。retention 30 日の
-    /// 移行期間中に古い / 新しい行が混ざるため (Mastra の legacy outcome と同じ問題)。
+    /// 移行期間中は古い行と新しい行が混ざるため。
     #[test]
     fn unknown_kind_is_still_readable() {
         let s = store();

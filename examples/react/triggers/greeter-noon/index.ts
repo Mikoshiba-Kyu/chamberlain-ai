@@ -1,4 +1,4 @@
-// 昼 10:00 の挨拶。#18 で greeter を 4 分割した 2 つ目。
+// 昼 10:00 の挨拶。
 
 type State = { greetCount?: number };
 

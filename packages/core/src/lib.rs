@@ -73,9 +73,8 @@ const EXPANSION_KEY: &str = "expansion";
 /// トリガーはこの ID を名乗れない (discovery で reject)。
 const META_NAMESPACE: &str = "__meta__";
 
-/// 0.1.x が `__meta__` に持っていた「トリガー ID → 最終 fire 時刻」の map。
-/// 0.2.0 でタスクリストが唯一の真実になったため廃止された (#26 波及範囲)。
-/// 起動時に残骸を掃除するためだけに名前を残している。
+/// 廃止された「トリガー ID → 最終 fire 時刻」の map (#26 でタスクリストが唯一の真実に
+/// なった)。起動時に古い state ファイルから残骸を掃除するためだけに名前を残している。
 const LEGACY_META_FIRE_TIMES_KEY: &str = "fire_times";
 
 /// CHAMBERLAIN_DEV=1 が立っているか。builder() 起動時に一度だけ evaluate する。
@@ -83,14 +82,11 @@ fn dev_mode_enabled() -> bool {
     matches!(std::env::var("CHAMBERLAIN_DEV").ok().as_deref(), Some("1"))
 }
 
-/// Activity event emitted whenever a trigger fires. This is the primary
-/// observability surface Chamberlain exposes to its UI — see issue #6
-/// ("UI as observability plane"): every trigger firing, notification, or
-/// proactive action must also arrive here so the developer can watch the
-/// secretary's behavior without depending on OS-level notification rendering.
+/// 観測面 (#6) に流す 1 件。トリガーの発火・通知・能動的な動作はすべてここに現れ、
+/// OS 通知の描画に依存せず秘書の挙動を追えるようにする。
 ///
 /// live emit (Tauri event) と `list_activity` (永続履歴の読み出し) は**同じ形**を返す。
-/// UI が「起動前に起きたこと」と「今起きたこと」を同じ配列に混ぜられるようにするため (#42)。
+/// UI が「起動前に起きたこと」と「今起きたこと」を同じ配列に混ぜられるようにするため。
 #[derive(Clone, Serialize)]
 struct ActivityEvent {
     /// 履歴上の行 id。UI が live emit と保存済み履歴を突き合わせる同一性に使う。
@@ -99,10 +95,10 @@ struct ActivityEvent {
     id: Option<i64>,
     ts: u64,
     source: String,
-    /// 種別の安定した識別子 (`"skipped"` 等)。0.3.0 で追加 (#42)。UI がフィルタや
-    /// 表示の出し分けに使う。`message` の prefix はこれから組み立てられている。
+    /// 種別の安定した識別子 (`"skipped"` 等)。UI がフィルタや表示の出し分けに使う。
+    /// `message` の prefix はこれから組み立てられている。
     kind: String,
-    /// 表示用の 1 行。0.2.0 と同じ形 (`[skipped] ...`)。
+    /// 表示用の 1 行 (`[skipped] ...`)。
     message: String,
     /// 元になったタスクのスナップショット。展開・再展開など、タスクに紐付かない
     /// イベントでは null。
@@ -122,12 +118,11 @@ struct TriggerManifest {
     #[serde(default)]
     description: Option<String>,
     entry: String,
-    /// トリガーが読んでよい secret 名の一覧。設定 UI に自動的に露出される。
+    /// トリガーが読んでよい secret 名の一覧 (#56)。設定 UI に自動的に露出される。
     ///
-    /// **0.3.0 でこれは実行時の権限になった** (#56)。宣言していない名前を
-    /// `chamberlain.getSecret(name)` に渡すと `null` が返り、拒否が `[denied]` として
-    /// 観測面に残る。0.2.0 までは UI 表示専用で、実行時の強制力を持っていなかった。
-    /// 判断は [`crate::permissions`] にある。
+    /// **これは実行時の権限である。** 宣言していない名前を `chamberlain.getSecret(name)`
+    /// に渡すと `null` が返り、拒否が `[denied]` として観測面に残る。判断は
+    /// [`crate::permissions`] にある。
     #[serde(default, rename = "requiredSecrets")]
     required_secrets: Vec<String>,
     /// このトリガーが `chamberlain.http.fetch` で出てよい宛先ホストの一覧 (#57)。
@@ -140,13 +135,10 @@ struct TriggerManifest {
     allowed_hosts: Vec<String>,
     /// 発火時刻の生成規則を DSL 文字列で宣言。必須。`@` 始まりのみ
     /// (`"@hourly"` / `"@hourly :45"` / `"@every 10m"` / `"@daily 09:00"` 等)。
-    ///
-    /// **0.2.0 で interval 形式 (`"5m"` / `"1h"`) は廃止された** (#26 決定事項 4)。
     /// 展開器がこの規則を絶対時刻のタスクに変換する。詳細は [`crate::schedule`] 参照。
     schedule: String,
-    /// IANA TZ 名 (例: `"Asia/Tokyo"`)。省略時は OS の user local を
-    /// [`iana_time_zone`] で解決する。
-    /// dev container の TZ 問題は `.devcontainer/devcontainer.json` の `containerEnv.TZ` で解決済み。
+    /// IANA TZ 名 (例: `"Asia/Tokyo"`)。省略時は OS の user local を解決する
+    /// ([`crate::schedule::resolve_tz`])。
     #[serde(default)]
     tz: Option<String>,
 }
@@ -163,10 +155,9 @@ struct TriggerInfo {
     /// config_error があるトリガーではダミー値 (UTC)。同上、参照されない。
     tz: chrono_tz::Tz,
     /// manifest の構成エラー (schedule パース失敗 / tz 解決失敗 / `allowedHosts` の
-    /// 書式不正)。Some のトリガーは worker が load/展開しない。UI 側 (list_triggers) には
-    /// 「壊れたトリガー」として残す。目的は「1t とタイポしたトリガーが影も形も無くなる」
-    /// UX を避けること。
-    /// load/instantiate error は現状 activity のみ、この gap は将来 unify したい。
+    /// 書式不正)。Some のトリガーは worker が load/展開しないが、UI (list_triggers) には
+    /// 「壊れたトリガー」として残す — タイポしたトリガーが影も形も無くなる UX を避ける。
+    /// load/instantiate error は現状 activity のみで、この gap は将来 unify したい。
     config_error: Option<String>,
     /// 検証済みの `allowedHosts` (#57)。`config_error` があるトリガーでは空。
     hosts: Vec<HostPattern>,
@@ -202,9 +193,6 @@ impl TickSignal {
 
 /// UI が受け取るトリガー一覧の要素。manifest 由来 + 現在の paused 状態 +
 /// 次に積まれているタスクの時刻 + 起動時 discovery で見つかった構成エラー。
-///
-/// `scheduleType` は 0.2.0 で削除された。interval 系統が廃止されて wall-clock のみになり
-/// (#26 決定事項 4)、`nextFireAt` の意味論が分岐しなくなったため。
 #[derive(Serialize)]
 struct TriggerListItem {
     id: String,
@@ -369,7 +357,7 @@ fn write_trigger_state(app: &AppHandle, trigger_id: &str, state: serde_json::Val
     }
 }
 
-/// 0.1.x の `__meta__.fire_times` を掃除する (#26 波及範囲: fire_times は廃止)。
+/// 古い state ファイルに残った `__meta__.fire_times` を掃除する。
 ///
 /// 残しておいても実害は無いが、`triggers-state.json` を開いた開発者が「どちらが真実か」で
 /// 迷う。タスクリストが唯一の真実だと state ファイル上でも明示する。
@@ -468,13 +456,11 @@ fn open_history(app: &AppHandle) -> Option<HistoryStore> {
 /// - manifest 読み取り失敗 / JSON 不正 → その 1 個をスキップ、他は続行
 /// - id 重複 → 先勝ち、後発をスキップして log
 /// - id が予約語 `__meta__` → reject
-/// - schedule 不正 / tz 解決失敗 → reject し activity にも `[schedule error]` で流す
+/// - schedule 不正 / tz 解決失敗 → reject し activity にも `[config error]` で流す
 /// - 実行順序を安定させるため id 昇順にソート
 ///
-/// 発火間隔の下限チェックはここには無い。0.2.0 で interval 系統が廃止され、下限は
-/// DSL パーサ側 (`@every` の許可値が 5 分以上) が構文として担保するようになった
-/// (#26 決定事項 4 / 5)。これに伴い dev モードでの下限緩和も消えている
-/// (秒スケールは分グリッドに原理的に載らないため、dev の反復手段は手動実行に移った)。
+/// 発火間隔の下限チェックはここには無い。下限は DSL パーサ側 (`@every` の許可値が
+/// 5 分以上) が構文として担保する (#26 決定事項 5)。
 fn discover_triggers(
     app: &AppHandle,
     history: &HistoryRef,
@@ -520,12 +506,9 @@ fn discover_triggers(
             continue;
         }
 
-        // schedule error はトリガーを捨てずに TriggerInfo に持たせ、UI から
-        // 「壊れてる」と見えるようにする。stderr + activity にも流す。
-        //
-        // 0.2.0 まで、この activity は discovery が .setup() 内で走る都合上 UI リスナー
-        // 未接続で捨てられていた。#42 で履歴に永続化されるようになり、UI は起動後に
-        // list_activity で読めるようになっている。
+        // 構成エラーはトリガーを捨てずに TriggerInfo に持たせ、UI から「壊れてる」と
+        // 見えるようにする。stderr + activity にも流す (discovery は .setup() 内で走るので
+        // UI リスナーには届かないが、履歴に残るので起動後に list_activity で読める)。
         let (schedule, config_error) = match parse_schedule(&manifest.schedule) {
             Ok(spec) => (spec, None),
             Err(e) => {
@@ -543,7 +526,7 @@ fn discover_triggers(
             }
         };
 
-        // tz 解決は schedule error があっても走らせるが、失敗した場合はエラーを追記する。
+        // tz 解決は schedule のパースに失敗していても走らせ、両方壊れていれば連ねて出す。
         let (tz, config_error) = match resolve_tz(manifest.tz.as_deref()) {
             Ok(t) => (t, config_error),
             Err(e) => {
@@ -591,10 +574,8 @@ fn discover_triggers(
     }
 
     // sort → dedup の順にしないと、id 重複時にどちらが生き残るかが read_dir 順
-    // (filesystem 順) 依存で非決定になる (Issue #21 #6)。id 昇順にしてから先勝ちなら、
-    // 「同じ id が複数ある時は最初に見つかった dir が勝つ」が dir 名の辞書順で決まる。
-    // ソートキーは manifest.id なので dir 名で完全に決まる訳ではないが、少なくとも
-    // 同じ input からは同じ結果が出る。
+    // (filesystem 順) 依存で非決定になる (Issue #21 #6)。id 昇順にしてから先勝ちにすれば、
+    // 少なくとも同じ input からは同じ結果が出る。
     result.sort_by(|a, b| a.manifest.id.cmp(&b.manifest.id));
 
     let mut seen = HashSet::new();
@@ -873,7 +854,7 @@ fn spawn_trigger_worker(
             host.loaded.insert(t.manifest.id.clone(), handle);
         }
 
-        // 0.1.x の残骸を掃除してから、永続タスクリストを現在の manifest と突き合わせる。
+        // 古い state の残骸を掃除してから、永続タスクリストを現在の manifest と突き合わせる。
         drop_legacy_fire_times(&host.app);
         let specs = build_specs(&triggers, &host);
         reconcile_at_startup(&mut host, &specs, &task_store, now_millis());
@@ -914,8 +895,8 @@ fn spawn_trigger_worker(
 /// 保存済みの履歴を新しい順に返す (#42)。
 ///
 /// **このコマンドが起動時イベントの gap を閉じる。** worker は `.setup()` 内で動き出すため、
-/// `[schedule error]` / `[expanded]` / `[rescheduled]` / `[orphaned]` は webview の
-/// リスナーが繋がる前に emit されて捨てられていた。UI は起動後にこれを読めばよい。
+/// `[config error]` / `[expanded]` / `[rescheduled]` / `[orphaned]` は webview のリスナーが
+/// 繋がる前に emit される。UI は起動後にこれを読めばよい。
 #[tauri::command]
 fn list_activity(limit: Option<usize>, history: State<'_, HistoryRef>) -> Vec<ActivityEvent> {
     // 上限を設けるのは、UI が誤って全期間を要求しても DB とメモリを踏み抜かないため。
@@ -1029,16 +1010,13 @@ fn delete_task(
     Ok(())
 }
 
-/// トリガーを今すぐ 1 回実行する (#20 を #26 Phase 1 に吸収)。
+/// トリガーを今すぐ 1 回実行する (#20)。
 ///
-/// 実装は「即 due な ad-hoc タスクを 1 件積んで心拍を起こす」。#20 では
-/// 「`last_fire_at` を更新しない独立動作」と決めていたが、`fire_times` 自体が廃止された
-/// ため意味論を作り直す必要があった。ad-hoc タスクは展開済み境界を触らないので、
-/// 手動実行が定期スケジュールを乱すことはない。
+/// 実装は「即 due な ad-hoc タスクを 1 件積んで心拍を起こす」。ad-hoc タスクは展開済み
+/// 境界を触らないので、手動実行が定期スケジュールを乱すことはない。
 ///
-/// このコマンドは 0.2.0 で dev の反復手段でもある。分グリッドの DSL では秒スケールが
-/// 表現できなくなり、`CHAMBERLAIN_DEV=1` による schedule 下限の緩和が消えたため
-/// (#26 決定事項 5)。
+/// dev の反復手段でもある。分グリッドの DSL では秒スケールを表現できないので、
+/// トリガーを何度も試したいときはこれを使う (#26 決定事項 5)。
 #[tauri::command]
 fn run_trigger_now(
     app: AppHandle,
@@ -1213,10 +1191,9 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
                 })
                 .build(app)?;
 
-            // dev モードは env-var 単独判定 (compile-time feature 化しない)。
-            // 0.2.0 で緩和するのは心拍だけになった。schedule の下限は DSL パーサが構文として
-            // 担保しており (`@every` は 5 分以上)、秒スケールは分グリッドに載らないため
-            // (#26 決定事項 5)。dev の反復手段は手動実行 (`run_trigger_now`) に移った。
+            // dev モードは env-var 単独判定 (compile-time feature 化しない)。緩めるのは
+            // 心拍だけ。schedule の下限は DSL パーサが構文として担保しており (`@every` は
+            // 5 分以上)、dev の反復手段は手動実行 (`run_trigger_now`) が担う (#26 決定事項 5)。
             let dev_mode = dev_mode_enabled();
             let tick_interval = if dev_mode {
                 TICK_INTERVAL_DEV
@@ -1241,8 +1218,8 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
                     PathBuf::new()
                 }
             };
-            // 履歴 DB は discovery より先に開く。discovery が出す `[schedule error]` は
-            // 「起動時に emit されて誰にも見えない」代表例で、#42 が閉じたい gap そのもの。
+            // 履歴 DB は discovery より先に開く。discovery が出す `[config error]` は
+            // 「起動時に emit されて誰にも見えない」代表例なので、必ず永続化する (#42)。
             let history: HistoryRef = Arc::new(Mutex::new(open_history(app.handle())));
             app.manage(history.clone());
 
