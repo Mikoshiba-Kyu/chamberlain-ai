@@ -6,6 +6,19 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING**: `manifest.json` の `requiredSecrets` が実行時の権限になった (#56 / #55)。`chamberlain.getSecret(name)` は宣言した名前しか返さず、宣言外は `null` + 活動ログに `[denied]` が残る。焼き込みか実行時登録かで区別しない。実行時登録 (#55) を開く前に「宣言と実際の権限の乖離」を潰しておくための変更
+- **BREAKING**: `anthropic_api_key` はトリガーから読めなくなった。`requiredSecrets` に書いても `null` が返る。framework が持つキーであり、トリガーが AI を使うなら `chamberlain.ai.complete` を経由する
+
+### Added
+
+- 活動ログの kind に `denied` を追加。manifest の宣言の外に出ようとして止められたことを表す
+
+### Migration
+
+`getSecret` を呼んでいるトリガーは、読む名前を `manifest.json` の `requiredSecrets` に列挙してください。宣言漏れは例外ではなく `null` として現れるため、**トリガー側は「未設定」と同じ経路に落ちます**。活動ログの `[denied]` が実質的な検出手段です。
+
 ## [0.2.0] - 2026-07-30
 
 ### Added

@@ -2,6 +2,7 @@ mod ai;
 mod chat;
 mod history;
 mod http;
+mod permissions;
 mod schedule;
 mod secrets;
 mod tasks;
@@ -24,6 +25,7 @@ use tauri_plugin_notification::{NotificationExt, PermissionState};
 use tauri_plugin_store::StoreExt;
 
 use crate::history::{origin_str, Activity, ActivityKind, HistoryStore, MAX_ROWS, RETENTION};
+use crate::permissions::{TriggerGrants, TriggerPermissions};
 use crate::schedule::{parse_schedule, resolve_tz, Schedule};
 use crate::secrets::SecretsService;
 use crate::tasks::{Task, TaskOrigin, TaskStore};
@@ -120,9 +122,12 @@ struct TriggerManifest {
     #[serde(default)]
     description: Option<String>,
     entry: String,
-    /// トリガーが動作するために必要な secret 名の一覧。設定 UI に自動的に露出される。
-    /// トリガーコードは `chamberlain.getSecret(name)` で任意名を読めるが、この宣言があると
-    /// UI が「そのキーが未設定です」を提示できるようになる。
+    /// トリガーが読んでよい secret 名の一覧。設定 UI に自動的に露出される。
+    ///
+    /// **0.3.0 でこれは実行時の権限になった** (#56)。宣言していない名前を
+    /// `chamberlain.getSecret(name)` に渡すと `null` が返り、拒否が `[denied]` として
+    /// 観測面に残る。0.2.0 までは UI 表示専用で、実行時の強制力を持っていなかった。
+    /// 判断は [`crate::permissions`] にある。
     #[serde(default, rename = "requiredSecrets")]
     required_secrets: Vec<String>,
     /// 発火時刻の生成規則を DSL 文字列で宣言。必須。`@` 始まりのみ
@@ -590,6 +595,22 @@ fn build_specs(triggers: &[TriggerInfo], host: &TauriHost) -> Vec<TriggerSpec> {
         .collect()
 }
 
+/// manifest の宣言を実行時の権限の形に写す (#56)。
+///
+/// **焼き込みか実行時登録かで区別しない。** 例外を作ると「焼き込みなら何でもできる」抜け道に
+/// なり、#55 で焼き込みを偽装する経路が価値を持ってしまう。詳細は [`crate::permissions`]。
+fn build_grants(triggers: &[TriggerInfo]) -> BTreeMap<String, TriggerGrants> {
+    triggers
+        .iter()
+        .map(|t| {
+            (
+                t.manifest.id.clone(),
+                TriggerGrants::with_secrets(t.manifest.required_secrets.iter().cloned()),
+            )
+        })
+        .collect()
+}
+
 /// 本番の [`WorkerHost`]。worker スレッドが所有する副作用の実体をひとまとめにする。
 ///
 /// `rustyscript::Runtime` は V8 の thread affinity を持つのでこの構造体ごと worker
@@ -605,6 +626,38 @@ struct TauriHost {
 impl TauriHost {
     fn is_loaded(&self, trigger_id: &str) -> bool {
         self.loaded.contains_key(trigger_id)
+    }
+
+    /// `OpState` に載せた [`TriggerPermissions`] を触る。
+    ///
+    /// **JS が動いていない間だけ呼べる。** `op_state()` の `RefCell` は op の実行中に
+    /// 借りられているので、JS 実行中に呼ぶと panic する。呼び出し箇所を
+    /// [`Self::run_js`] の前後に限っているのはこのため。
+    fn with_permissions<R>(&mut self, f: impl FnOnce(&mut TriggerPermissions) -> R) -> R {
+        let op_state = self.runtime.deno_runtime().op_state();
+        let mut op_state = op_state.borrow_mut();
+        f(op_state.borrow_mut::<TriggerPermissions>())
+    }
+
+    /// トリガーの JS を「そのトリガーとして」動かす (#56)。**JS を動かす経路は必ずここを
+    /// 通す** — 通さない経路は実行文脈の外になり、その JS からは何も読めなくなる。
+    ///
+    /// 呼び出し元の識別を JS 側に名乗らせると自己申告になるので、Rust 側が実行の前後で
+    /// 現在のトリガーを立てる。op はこれを見て manifest の宣言と突き合わせる。
+    ///
+    /// 拒否は op の中では activity にできない (op は `AppHandle` を持たない) ので、
+    /// 溜まったものをここで回収して `[denied]` として観測面に流す。帰属先を持たない拒否
+    /// (= run_js を通らない経路から来たもの) は、今動かしているトリガーのせいにせず
+    /// framework 側 (`__meta__`) に付ける。誤った帰属は観測面としては無いより悪い。
+    fn run_js<R>(&mut self, trigger_id: &str, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.with_permissions(|p| p.enter(trigger_id));
+        let result = f(self);
+        for denial in self.with_permissions(|p| p.leave()) {
+            let source = denial.trigger_id.unwrap_or_else(|| META_NAMESPACE.into());
+            eprintln!("denied for '{source}': {}", denial.message);
+            self.activity(Activity::new(source, ActivityKind::Denied, denial.message));
+        }
+        result
     }
 }
 
@@ -622,16 +675,22 @@ impl WorkerHost for TauriHost {
         trigger_id: &str,
         ctx: serde_json::Value,
     ) -> Result<Option<TickResult>, String> {
-        // runtime (可変借用) と loaded (不変借用) を同時に使うためフィールドを分解する。
-        let Self {
-            runtime, loaded, ..
-        } = self;
-        let handle = loaded
-            .get(trigger_id)
-            .ok_or_else(|| format!("trigger '{trigger_id}' is not loaded"))?;
-        runtime
-            .call_function(Some(handle), "tick", rustyscript::json_args!(ctx))
-            .map_err(|e| e.to_string())
+        // 未ロードの判定は run_js の外で済ませる。中で早期 return すると
+        // enter したまま leave されない経路ができる。
+        if !self.is_loaded(trigger_id) {
+            return Err(format!("trigger '{trigger_id}' is not loaded"));
+        }
+        self.run_js(trigger_id, |host| {
+            // runtime (可変借用) と loaded (不変借用) を同時に使うためフィールドを分解する。
+            let Self {
+                runtime, loaded, ..
+            } = host;
+            // 直前の is_loaded で存在を確認済み。
+            let handle = &loaded[trigger_id];
+            runtime
+                .call_function(Some(handle), "tick", rustyscript::json_args!(ctx))
+                .map_err(|e| e.to_string())
+        })
     }
 
     fn notify(&mut self, title: &str, body: &str) {
@@ -698,12 +757,15 @@ fn spawn_trigger_worker(
         };
 
         // OpState に SecretsService を注入。op_chamberlain_get_secret がここから
-        // service 名 (tauri identifier) を借りて keyring を叩く。
-        runtime
-            .deno_runtime()
-            .op_state()
-            .borrow_mut()
-            .put(secrets_service);
+        // service 名 (tauri identifier) を借りて keyring を叩く。併せて、extension が
+        // 載せた既定の TriggerPermissions を manifest 由来の宣言で差し替える (#56)。
+        // op から見える権限の判断材料はこれだけで、JS 側から差し替える手段は無い。
+        {
+            let op_state = runtime.deno_runtime().op_state();
+            let mut op_state = op_state.borrow_mut();
+            op_state.put(secrets_service);
+            op_state.put(TriggerPermissions::new(build_grants(&triggers)));
+        }
 
         let mut host = TauriHost {
             app: app_for_worker,
@@ -735,7 +797,12 @@ fn spawn_trigger_worker(
                     continue;
                 }
             };
-            let handle = match host.runtime.load_module(&module) {
+            // load_module はモジュールのトップレベルを実行する = JS が動く。宣言を正しく
+            // 書いたトリガーが初期化時に自分の secret を読めるよう、ここも実行文脈に含める。
+            // 含めなくても既定拒否で安全側には倒れるが、正しいトリガーが理由の分かりにくい
+            // [denied] を踏むことになる。
+            let loaded = host.run_js(&t.manifest.id, |host| host.runtime.load_module(&module));
+            let handle = match loaded {
                 Ok(h) => h,
                 Err(e) => {
                     eprintln!("failed to instantiate trigger '{}': {e}", t.manifest.id);

@@ -362,7 +362,7 @@ Tauri の `TrayIconBuilder`。メニュー: Open Chamberlain / Send test notific
 
 Secret store (#13):
 
-- `list_declared_secrets() -> Vec<DeclaredSecretItem>` — トリガー manifest の `requiredSecrets` を集約して UI に返す。framework 必須の `anthropic_api_key` を先頭に含む
+- `list_declared_secrets() -> Vec<DeclaredSecretItem>` — トリガー manifest の `requiredSecrets` を集約して UI に返す。framework 必須の `anthropic_api_key` を先頭に含む。**この宣言は 0.3.0 から実行時の権限でもある** ([トリガーの権限](#トリガーの権限-56) 節)
 - `has_secret(name) -> bool` / `set_secret(name, value)` / `delete_secret(name)`
 
 Type II チャット (#14):
@@ -409,7 +409,7 @@ Rust 側で `serde_json` によりパース。unknown フィールドは silentl
 - `entry` (必須) — パッケージ dir 相対のエントリスクリプトパス。通常は `"index.ts"`
 - `schedule` (必須) — 発火時刻の生成規則。`@` 始まりのみ。`"@hourly"` / `"@hourly :45"` / `"@every 10m"` / `"@daily 09:00"` / `"@weekly MON 09:00"` / `"@monthly 15 09:00"` / `"@at 2026-08-01T18:30"` (詳細は [schedule DSL](#schedule-dsl-26-決定事項-4--5) 節)。**0.2.0 で interval 形式 (`"5m"` / `"1h"`) は廃止された**
 - `tz` (任意) — IANA TZ 名 (例: `"Asia/Tokyo"`)。省略時は OS の user local を [`iana_time_zone`] で解決 (#18)
-- `requiredSecrets` (任意) — このトリガーが `chamberlain.getSecret(name)` で読む予定の secret 名一覧。Settings UI が「未設定です」の表示に使う (#13)
+- `requiredSecrets` (任意) — このトリガーが `chamberlain.getSecret(name)` で読む secret 名一覧。Settings UI が「未設定です」の表示に使う (#13) と同時に、**実行時にこの宣言の外の名前を拒否する** (#56、[トリガーの権限](#トリガーの権限-56) 節)
 
 manifest を分離ファイルにする理由は「Rust が JS を動かさずに一覧を作れる」「Chrome/VS Code/npm と同じパターンで開発者に説明不要」「将来 marketplace の話が出た時にそのまま嵌る」など。決定の経緯は #8。
 
@@ -469,6 +469,29 @@ chamberlain.http.fetch(url: string, opts?: {
 なぜ `ctx` に入れず ambient global にしたか: `ctx` は「今 tick のスナップショット」で pure data。keyring 参照や外部 API 呼び出しはスナップショットではないので分ける。将来 `chamberlain.readAsset(...)` 等もここに増える (未確定の論点参照)。
 
 `chamberlain.http.fetch` が独立した op として存在するのは、rustyscript の JS runtime に Web `fetch` が入っていないため。「HTTP は core が握る (JS 側は薄い呼び出しだけ)」という方針を選んだ。理由は (1) 既に `ai.complete` で HTTP が core にある、(2) tauri app の権限モデル / ネットワーク境界を将来 core 側で一元管理しやすい、(3) rustyscript の web feature を有効化すると runtime が肥大化し JS 側挙動の予測性が下がる、の 3 点。
+
+### トリガーの権限 (#56)
+
+**`chamberlain.*` の副作用は manifest の宣言の範囲でしか通らない。** 0.2.0 まで `requiredSecrets` は Settings UI の表示用データにすぎず、`requiredSecrets: []` と宣言したトリガーが任意の名前を `getSecret` で読めた。焼き込みだけの間は「トリガーの作者 = アプリの作者」なので信頼で閉じるが、実行時登録 (#55) を開くと**宣言と実際の権限が乖離したまま他人のコードを受け入れる**ことになるので、先に閉じてある。
+
+前提として、Chamberlain の JS 環境は既に capability-based sandbox である。rustyscript が引く deno クレートは `deno_console` / `deno_crypto` / `deno_url` / `deno_webidl` の 4 つだけで、`deno_fetch` も `deno_fs` も `deno_net` も `deno_process` も入っていない。**トリガーの JS にはファイルもネットワークもプロセスも環境として存在せず**、副作用は例外なく core が注入した op を通る。したがって「op の口を締める」だけで権限モデルが成立する。
+
+| 判断 | 中身 |
+|---|---|
+| 宣言にある名前 | 従来どおり読める |
+| 宣言に無い名前 | `null` を返し、`[denied]` として観測面に残る |
+| `anthropic_api_key` | **宣言してあっても常に拒否**。framework が持つキーであり、Type I が AI を使うなら `chamberlain.ai.complete` を経由すべきで、生値を渡す理由が無い。判定は綴りではなく**解決先**で行う (`ANTHROPIC-API-KEY` のような別綴りも env fallback の正規化で同じキーに落ちるため、綴り一致では素通りする) |
+| トリガーの実行文脈の外 | 拒否 (既定は拒否) |
+
+例外ではなく `null` を返すのは、未設定の secret と同じ形にするため。トリガーは既に「null なら諦める」を書いているはずで、拒否のためだけに別の分岐を書かせる理由が無い。代わりに拒否は `[denied]` に残るので、宣言し忘れは観測面から気付ける。
+
+**焼き込みか実行時登録かで区別しない。** 例外を作ると「焼き込みなら何でもできる」抜け道になり、#55 で「焼き込みを偽装する」経路が価値を持ってしまう。
+
+呼び出し元の識別は Rust 側が持つ。op に trigger id を引数で渡すと自己申告になり、他人のコードに対する強制力が消えるため。JS 実行は単一スレッド上で直列なので、「今どのトリガーを実行中か」を `OpState` に 1 つ持てば足りる (`crate::permissions`)。
+
+**既知の限界**: 全トリガーが 1 つの V8 isolate を共有しているため、トリガー A が `await` しなかった promise がトリガー B の実行中に解決すると B の権限で通る。塞ぐにはトリガーごとの isolate 分離が要るが割に合わないため採らない (#59 と同じ判断)。
+
+`http.fetch` の宛先ホスト宣言は #57 で入る。**secret のスコープと出口の制限はセットで初めて意味を持つ** — secret をスコープしても出口が空いていれば、正当に持つ token を任意の場所へ送れるため。
 
 ## 状態モデル
 
@@ -610,6 +633,7 @@ UI 側 (`chamberlainApi.onActivity`) は `@tauri-apps/api/event` の `listen` �
 | `[stale]` | 猶予を超えた予定を 2 件以上まとめて破棄 (長期の不在からの復帰) |
 | `[expired]` | ad-hoc の予定が猶予 (24h) を超えたため未実行のまま破棄 |
 | `[manual]` / `[deleted]` | 手動実行の予約 / 予定の削除 |
+| `[denied]` | manifest の宣言に無い権限をトリガーが要求したので拒否した ([トリガーの権限](#トリガーの権限-56) 節) |
 
 捨てるにしても痕跡を残すのが観測面原則に合う。
 
