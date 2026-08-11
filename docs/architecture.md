@@ -218,7 +218,7 @@ manifest.schedule ──(展開器: 閾値条件)──▶ タスクリスト �
 discovery でのバリデーション:
 
 - schedule 省略 → discovery で完全に捨てる (manifest 不正と同じ扱い)
-- schedule パース失敗 / tz 解決失敗 → **トリガー自体は list_triggers に `error` フィールド付きで残す**。worker は load / 展開しない。stderr と activity にも `[schedule error]` で流すが、activity は `.setup()` 内で emit されるため UI 未接続で捨てられる可能性が高く、`list_triggers().error` が実質的な観測面
+- schedule パース失敗 / tz 解決失敗 / `allowedHosts` の書式不正 → **トリガー自体は list_triggers に `error` フィールド付きで残す**。worker は load / 展開しない。stderr と activity にも `[config error]` で流すが、activity は `.setup()` 内で emit されるため UI 未接続で捨てられる可能性が高く、`list_triggers().error` が実質的な観測面
 - 発火間隔の下限チェックはもう無い。下限は DSL パーサが構文として担保する (`@every` の許可値が 5 分以上)
 - 予約 id `__meta__` → discovery で完全に捨てる (framework 内部用の namespace 衝突)
 
@@ -362,7 +362,7 @@ Tauri の `TrayIconBuilder`。メニュー: Open Chamberlain / Send test notific
 
 Secret store (#13):
 
-- `list_declared_secrets() -> Vec<DeclaredSecretItem>` — トリガー manifest の `requiredSecrets` を集約して UI に返す。framework 必須の `anthropic_api_key` を先頭に含む。**この宣言は 0.3.0 から実行時の権限でもある** ([トリガーの権限](#トリガーの権限-56) 節)
+- `list_declared_secrets() -> Vec<DeclaredSecretItem>` — トリガー manifest の `requiredSecrets` を集約して UI に返す。framework 必須の `anthropic_api_key` を先頭に含む。**この宣言は 0.3.0 から実行時の権限でもある** ([トリガーの権限](#トリガーの権限-56--57) 節)
 - `has_secret(name) -> bool` / `set_secret(name, value)` / `delete_secret(name)`
 
 Type II チャット (#14):
@@ -397,7 +397,8 @@ Chrome 拡張 / VS Code 拡張 / npm package と同じ mental model。単一フ�
   "entry": "index.ts",
   "schedule": "@daily 06:00",
   "tz": "Asia/Tokyo",
-  "requiredSecrets": []
+  "requiredSecrets": [],
+  "allowedHosts": []
 }
 ```
 
@@ -409,7 +410,8 @@ Rust 側で `serde_json` によりパース。unknown フィールドは silentl
 - `entry` (必須) — パッケージ dir 相対のエントリスクリプトパス。通常は `"index.ts"`
 - `schedule` (必須) — 発火時刻の生成規則。`@` 始まりのみ。`"@hourly"` / `"@hourly :45"` / `"@every 10m"` / `"@daily 09:00"` / `"@weekly MON 09:00"` / `"@monthly 15 09:00"` / `"@at 2026-08-01T18:30"` (詳細は [schedule DSL](#schedule-dsl-26-決定事項-4--5) 節)。**0.2.0 で interval 形式 (`"5m"` / `"1h"`) は廃止された**
 - `tz` (任意) — IANA TZ 名 (例: `"Asia/Tokyo"`)。省略時は OS の user local を [`iana_time_zone`] で解決 (#18)
-- `requiredSecrets` (任意) — このトリガーが `chamberlain.getSecret(name)` で読む secret 名一覧。Settings UI が「未設定です」の表示に使う (#13) と同時に、**実行時にこの宣言の外の名前を拒否する** (#56、[トリガーの権限](#トリガーの権限-56) 節)
+- `requiredSecrets` (任意) — このトリガーが `chamberlain.getSecret(name)` で読む secret 名一覧。Settings UI が「未設定です」の表示に使う (#13) と同時に、**実行時にこの宣言の外の名前を拒否する** (#56、[トリガーの権限](#トリガーの権限-56--57) 節)
+- `allowedHosts` (任意) — このトリガーが `chamberlain.http.fetch` で出てよい宛先ホスト一覧 (#57)。`"api.github.com"` (完全一致) と `"*.example.com"` (サブドメインのみ) を書ける。**書かなければ一切ネットワークに出られない**
 
 manifest を分離ファイルにする理由は「Rust が JS を動かさずに一覧を作れる」「Chrome/VS Code/npm と同じパターンで開発者に説明不要」「将来 marketplace の話が出た時にそのまま嵌る」など。決定の経緯は #8。
 
@@ -470,7 +472,7 @@ chamberlain.http.fetch(url: string, opts?: {
 
 `chamberlain.http.fetch` が独立した op として存在するのは、rustyscript の JS runtime に Web `fetch` が入っていないため。「HTTP は core が握る (JS 側は薄い呼び出しだけ)」という方針を選んだ。理由は (1) 既に `ai.complete` で HTTP が core にある、(2) tauri app の権限モデル / ネットワーク境界を将来 core 側で一元管理しやすい、(3) rustyscript の web feature を有効化すると runtime が肥大化し JS 側挙動の予測性が下がる、の 3 点。
 
-### トリガーの権限 (#56)
+### トリガーの権限 (#56 / #57)
 
 **`chamberlain.*` の副作用は manifest の宣言の範囲でしか通らない。** 0.2.0 まで `requiredSecrets` は Settings UI の表示用データにすぎず、`requiredSecrets: []` と宣言したトリガーが任意の名前を `getSecret` で読めた。焼き込みだけの間は「トリガーの作者 = アプリの作者」なので信頼で閉じるが、実行時登録 (#55) を開くと**宣言と実際の権限が乖離したまま他人のコードを受け入れる**ことになるので、先に閉じてある。
 
@@ -491,7 +493,40 @@ chamberlain.http.fetch(url: string, opts?: {
 
 **既知の限界**: 全トリガーが 1 つの V8 isolate を共有しているため、トリガー A が `await` しなかった promise がトリガー B の実行中に解決すると B の権限で通る。塞ぐにはトリガーごとの isolate 分離が要るが割に合わないため採らない (#59 と同じ判断)。
 
-`http.fetch` の宛先ホスト宣言は #57 で入る。**secret のスコープと出口の制限はセットで初めて意味を持つ** — secret をスコープしても出口が空いていれば、正当に持つ token を任意の場所へ送れるため。
+#### 出口: `allowedHosts` (#57)
+
+**secret のスコープと出口の制限はセットで初めて意味を持つ。** secret をスコープしても出口が空いていれば、`requiredSecrets: ["github_token"]` と正しく宣言したトリガーがその token を任意のサーバに POST できる。両方あって初めて **「GitHub token は `api.github.com` にしか出ない」が機構として言える**。
+
+| 判断 | 中身 |
+|---|---|
+| 宣言の書き方 | `"api.github.com"` (完全一致) / `"*.example.com"` (サブドメインのみ、apex は含まない) |
+| 宣言外のホスト | **例外**を投げる + `[denied]`。`getSecret` の `null` と違うのは、fetch に「値が無い」に相当する戻り値が無いため (握り潰すとトリガーは空レスポンスを掴んで進む) |
+| スキーム | https のみ。平文はループバック (`localhost` と `127.0.0.0/8`) だけ許す。IPv6 リテラルは `:` を含むため `allowedHosts` に宣言できない |
+| リダイレクト | **追跡するが、ホップごとに同じ宣言と照合する**。上限 5 ホップ。別ホストへ渡るときは `Authorization` / `Cookie` 等を落とす |
+| タイムアウト | リダイレクト込みで 30s。1 ホップごとではない |
+| 粒度 | ホストまで。パスもポートも見ない (Chrome の `host_permissions` と同じ) |
+
+リダイレクトを reqwest に任せると照合を挟めず、**宣言済みホストが 302 を返すだけで宛先の制限が抜ける**。かといって追跡をやめると、レスポンスヘッダを返さない今の `fetch` ではトリガー側が自力で追えず、リダイレクトする API が使えなくなる。そこで共有 Client の追跡を切り、op が 1 ホップずつ進めながら照合する。
+
+**追跡を自前でやると、reqwest がやっていた 2 つを引き継ぐ必要がある。** 1 つはクロスホスト時の認証ヘッダ除去 — `allowedHosts` はここでは守りにならず、`["api.github.com", "*.githubusercontent.com"]` のように**両方とも正当に宣言されている**構成 (GitHub の asset 取得がまさにこれ) で、片方向けの token がもう片方に届く。もう 1 つはタイムアウトの意味で、`Client::timeout` は 1 リクエスト単位なので放っておくと 30s × ホップ数まで伸びる。JS は単一スレッドで直列なので、1 本の fetch が延びるとその間ほかのトリガーの tick が全部止まる。
+
+宣言として意味を持たない書き方は **discovery で reject し、そのトリガーを実行対象から外す**。単独の `*`、`*.com` のような公開サフィックス直下、スキームやパスやポートを含む文字列が該当する。悪い宣言を黙って捨てて残りで動かすと、#55 の同意画面に出す文字列と実際の制限がずれる — 宣言が強制力を持たない状態で同意だけ取るのはセキュリティシアターなので、宣言が読めないうちは走らせない方を採る。
+
+公開サフィックスの完全な判定 (PSL) は持たない。`*.co.uk` のような 2 ラベルの公開サフィックスは通る。ここで弾きたいのは「明らかに宣言を放棄している書き方」であって、PSL の維持まで背負うと単一開発者の手に余る (#55 の「やらないと決めるもの」と同じ判断)。
+
+#### `ai.complete` は宣言ではなく記録で扱う (#57)
+
+宛先を core が決める (Anthropic 固定) ので `allowedHosts` のような形が取れない。一方これは **framework が持つ API キーの持ち出し**にあたり、無制限に呼べるとエンドユーザーの課金でトリガー作者の用事が処理できてしまう。そこで宣言は取らず、**呼び出しを必ず履歴に残す** (`[ai]`)。レート制限は必要になってから。
+
+記録するのは model と回数だけで、**prompt は残さない**。中身を書くと履歴がそのまま漏洩面になるし、長さを入れると下の重複排除のキーが毎回変わってまとめる意味が消える。知りたいのは呼び出しの量で、それは回数が持つ。
+
+Type II の秘書チャット (`chat_send`) はこの経路を通らない。あちらはエンドユーザー自身が自分の秘書に話しかけているので、「誰かのコードが裏で API を使った」記録とは意味が違う。
+
+#### 記録は 1 実行につき種類ごとに 1 行
+
+`[denied]` も `[ai]` も、同じ実行の中で同じものが繰り返されたら 1 行にまとめ、回数を添える (`... (×1000)`)。まとまるかどうかは**本文がキー**なので、本文には呼び出しごとに変わる値を入れない (拒否は URL 全体ではなくホスト名で書く)。
+
+**重複排除だけでは足りない。** 本文にはトリガーが決めた文字列 (secret 名 / ホスト / model 名) が入るので、毎回違う名前で呼べば種類数はいくらでも増やせる。そこで種類数にも上限 (32) を置き、溢れた分は kind ごとの 1 行へ畳む。本文自体も 200 文字で切る — 切らないと `ai.complete({ model: "A".repeat(10_000_000) })` が 10 MB の行を履歴に書ける。ループの中で `getSecret` を呼ぶトリガー 1 つが 20,000 行の retention を使い切り、本物の `[notify]` / `[error]` を押し流せてしまうため。宣言し忘れの検出手段が `[denied]` である以上、その経路自身が観測面を潰せる状態は許容できない。
 
 ## 状態モデル
 
@@ -633,7 +668,9 @@ UI 側 (`chamberlainApi.onActivity`) は `@tauri-apps/api/event` の `listen` �
 | `[stale]` | 猶予を超えた予定を 2 件以上まとめて破棄 (長期の不在からの復帰) |
 | `[expired]` | ad-hoc の予定が猶予 (24h) を超えたため未実行のまま破棄 |
 | `[manual]` / `[deleted]` | 手動実行の予約 / 予定の削除 |
-| `[denied]` | manifest の宣言に無い権限をトリガーが要求したので拒否した ([トリガーの権限](#トリガーの権限-56) 節) |
+| `[denied]` | manifest の宣言に無い権限をトリガーが要求したので拒否した ([トリガーの権限](#トリガーの権限-56--57) 節) |
+| `[ai]` | トリガーが `chamberlain.ai.complete` を呼んだ (framework の API キーの持ち出しなので記録する) |
+| `[config error]` | manifest (`schedule` / `tz` / `allowedHosts`) が壊れていて実行対象にできない。0.2.0 の `[schedule error]` はここに統合された |
 
 捨てるにしても痕跡を残すのが観測面原則に合う。
 

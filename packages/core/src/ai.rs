@@ -14,6 +14,7 @@ use deno_core::{op2, OpState};
 use deno_error::JsErrorBox;
 use serde::{Deserialize, Serialize};
 
+use crate::permissions::TriggerPermissions;
 use crate::secrets::{store as secret_store, SecretsService, ANTHROPIC_API_KEY_NAME};
 
 pub const DEFAULT_MODEL: &str = "claude-sonnet-5";
@@ -133,6 +134,15 @@ struct CompleteArgs {
     model: Option<String>,
 }
 
+/// トリガーから呼ばれる `chamberlain.ai.complete`。
+///
+/// **宛先の宣言は取らない代わりに、呼び出しを必ず履歴に残す** (#57)。宛先は core が決める
+/// (Anthropic 固定) ので `allowedHosts` のような形が取れない一方、これは framework が持つ
+/// API キーの持ち出しにあたる — 無制限に呼べると、エンドユーザーの課金でトリガー作者の
+/// 用事が処理される。レート制限は必要になってから。
+///
+/// 記録するのは model と回数だけで、**prompt は残さない**。履歴はエンドユーザーの手元に
+/// 平文で溜まるので、内容まで書くと観測面がそのまま漏洩面になる。
 #[op2(async)]
 #[string]
 pub async fn op_chamberlain_ai_complete(
@@ -142,7 +152,14 @@ pub async fn op_chamberlain_ai_complete(
     // await 前に必要な情報を全部同期的に取り出しておく。
     // OpState を await 越しに保持しないための定型パターン。
     let api_key = {
-        let state = state.borrow();
+        let mut state = state.borrow_mut();
+
+        // 記録は呼び出しの「試行」に対して残す。キー未設定や API エラーで落ちた場合も
+        // 呼びに行ったこと自体は事実で、抑えたいのは呼び出しの量だから。
+        state
+            .borrow_mut::<TriggerPermissions>()
+            .record_ai_call(args.model.as_deref().unwrap_or(DEFAULT_MODEL));
+
         let service = state.borrow::<SecretsService>().0.clone();
         secret_store::get(&service, ANTHROPIC_API_KEY_NAME)
             .map_err(|e| JsErrorBox::generic(format!("failed to read anthropic_api_key: {e}")))?

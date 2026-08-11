@@ -71,3 +71,23 @@ chamberlain.ai.complete(opts: {
 ```
 
 `anthropic_api_key` だけは宣言しても返りません (framework が持つキーです)。トリガーから AI を使う場合は `chamberlain.ai.complete` を呼んでください。
+
+### 出る先も manifest に宣言する
+
+`http.fetch` は **`allowedHosts` に書いたホストにしか出られません** (0.3.0 / #57)。書かなければ一切ネットワークに出られず、宣言外への fetch は例外になって活動ログに `[denied]` が出ます。
+
+```json
+{
+  "requiredSecrets": ["github_token"],
+  "allowedHosts": ["api.github.com", "*.githubusercontent.com"]
+}
+```
+
+- `"*.example.com"` はサブドメインのみで、`example.com` 自身は含みません (両方使うなら 2 つ書きます)
+- **https のみ**です。平文が通るのは `localhost` と `127.0.0.0/8` だけ
+- リダイレクトは追跡しますが、**転送先も宣言の中になければ拒否されます**
+- 単独の `*` や `*.com`、スキームやパスを含む書き方は起動時に構成エラーになり、そのトリガーは動きません
+
+この 2 つの宣言が「このトリガーは何を読み、どこへ出るのか」の全部です。トリガー一覧にそのまま表示されます。
+
+なお `chamberlain.ai.complete` の呼び出しは、宛先を宣言する代わりに**毎回活動ログに `[ai]` として残ります** (framework の API キーを使うため)。記録されるのは model と回数だけで、prompt は残りません。

@@ -10,14 +10,32 @@
 
 - **BREAKING**: `manifest.json` の `requiredSecrets` が実行時の権限になった (#56 / #55)。`chamberlain.getSecret(name)` は宣言した名前しか返さず、宣言外は `null` + 活動ログに `[denied]` が残る。焼き込みか実行時登録かで区別しない。実行時登録 (#55) を開く前に「宣言と実際の権限の乖離」を潰しておくための変更
 - **BREAKING**: `anthropic_api_key` はトリガーから読めなくなった。`requiredSecrets` に書いても `null` が返る。framework が持つキーであり、トリガーが AI を使うなら `chamberlain.ai.complete` を経由する
+- **BREAKING**: `chamberlain.http.fetch` の宛先を `manifest.json` の `allowedHosts` で宣言するようになった (#57 / #55)。**宣言しなければ一切ネットワークに出られない。** 宣言外のホストへの fetch は例外になり `[denied]` が残る。`"api.github.com"` (完全一致) と `"*.example.com"` (サブドメインのみ) を書ける
+- **BREAKING**: `http.fetch` は https のみになった。平文が通るのはループバック (`localhost` と `127.0.0.0/8`) だけ
+- `http.fetch` のリダイレクト追跡を reqwest から core に移した。**ホップごとに `allowedHosts` と照合する** (宣言済みホストが 302 を返すだけで制限が抜けるのを防ぐ)。上限は 5 ホップで、超えたら 3xx をそのまま返す
+- **BREAKING**: `http.fetch` の 30s タイムアウトは**リダイレクトを含む全体**の上限になった (従来は 1 リクエスト単位)。自前追跡では放置すると 30s × ホップ数まで伸び、その間ほかのトリガーの tick が止まる
+- 別ホストへリダイレクトするとき `Authorization` / `Cookie` / `Proxy-Authorization` 等を落とす。reqwest の redirect policy を切った代わりに core 側で行う。両方のホストが宣言済みでも、片方向けの認証情報をもう片方に渡す理由は無い
+- `[denied]` と `[ai]` は 1 実行につき種類ごとに 1 行にまとめ、回数を添える (`... (×1000)`)。種類数も 32 で頭打ちにし、本文は 200 文字で切る。ループ内の呼び出しが履歴を埋め尽くして本物のイベントを押し流すのを防ぐ
 
 ### Added
 
 - 活動ログの kind に `denied` を追加。manifest の宣言の外に出ようとして止められたことを表す
+- 活動ログの kind に `ai_call` (`[ai]`) を追加。トリガーの `chamberlain.ai.complete` 呼び出しを記録する — framework の API キーの持ち出しにあたるため。model と回数のみで、**prompt は残さない**
+- 活動ログの kind に `config_error` (`[config error]`) を追加。`allowedHosts` の書式不正など、manifest が壊れているトリガーは実行対象から外れる。**`schedule` / `tz` の失敗もこの kind に統合された** (`schedule_error` は保存済みの行を読むためだけに残る) — UI から見て意味があるのは「manifest が壊れていて動かせない」という 1 つの概念で、どの項目かは message が持つ
+- `TriggerListItem` に `requiredSecrets` / `allowedHosts` を追加。トリガー一覧が「何を読み、どこへ出るのか」を表示する。実行時登録 (#55) の同意画面はこれと同じものを入れる前に見せる
 
 ### Migration
 
 `getSecret` を呼んでいるトリガーは、読む名前を `manifest.json` の `requiredSecrets` に列挙してください。宣言漏れは例外ではなく `null` として現れるため、**トリガー側は「未設定」と同じ経路に落ちます**。活動ログの `[denied]` が実質的な検出手段です。
+
+`http.fetch` を呼んでいるトリガーは、出る先を `allowedHosts` に列挙してください。こちらは例外になるので気付けます。http で外部を叩いていた場合は https に変える必要があります。
+
+```json
+{
+  "requiredSecrets": ["github_token"],
+  "allowedHosts": ["api.github.com"]
+}
+```
 
 ## [0.2.0] - 2026-07-30
 

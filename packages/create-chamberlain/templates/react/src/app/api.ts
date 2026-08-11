@@ -47,12 +47,27 @@ export interface TriggerListItem {
    */
   nextFireAt: number | null;
   /**
-   * 起動時 discovery で見つかった構成エラー (例: schedule パース失敗)。
-   * このフィールドが非 null の間、そのトリガーは load / 展開されない。
+   * 起動時 discovery で見つかった構成エラー (例: schedule パース失敗、allowedHosts の
+   * 書式不正)。このフィールドが非 null の間、そのトリガーは load / 展開されない。
    * UI 上で「壊れてる」ことを可視化するのが目的 (activity は startup 時に UI 未接続で
    * 捨てられる可能性が高いため、ここが実質的な観測面)。
    */
   error: string | null;
+  /**
+   * このトリガーが読める secret 名 (#56)。
+   *
+   * **表示用の飾りではなく、実際に効いている制限そのもの。** ここに無い名前を
+   * `getSecret` に渡しても null しか返らない。
+   */
+  requiredSecrets: string[];
+  /**
+   * このトリガーが `http.fetch` で出られる宛先 (#57)。`"api.github.com"` や
+   * `"*.example.com"` (サブドメインのみ)。空なら一切ネットワークに出られない。
+   *
+   * requiredSecrets と合わせて「このトリガーは何を読み、どこへ出るのか」になる。
+   * 実行時登録 (#55) の同意画面はこの 2 つを見せる。
+   */
+  allowedHosts: string[];
 }
 
 /**
