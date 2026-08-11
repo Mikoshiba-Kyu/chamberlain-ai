@@ -351,7 +351,7 @@ Tauri の `TrayIconBuilder`。メニュー: Open Chamberlain / Send test notific
 
 トリガー制御:
 
-- `list_triggers() -> Vec<TriggerListItem>` — 起動時に discover したトリガーを UI 表示用に返す。`nextFireAt` は**タスクリストの投影**であり、framework が別に持っている「次回発火予定」ではない。`scheduleType` は 0.2.0 で削除された (interval 系統廃止により意味論が分岐しなくなったため)
+- `list_triggers() -> Vec<TriggerListItem>` — 起動時に discover したトリガーを UI 表示用に返す。`nextFireAt` は**タスクリストの投影**であり、framework が別に持っている「次回発火予定」ではない
 - `pause_trigger(id: String)` / `resume_trigger(id: String)`
 - `run_trigger_now(id: String)` — 今すぐ 1 回実行する (#20 を #26 Phase 1 に吸収)。実装は「即 due な ad-hoc タスクを 1 件積んで心拍を起こす」。ad-hoc タスクは展開済み境界を触らないので、手動実行が定期スケジュールを乱すことはない
 
@@ -640,6 +640,7 @@ Rust 側から Tauri の `Emitter::emit("activity", ...)` で JS 側に届く。
 
 ```typescript
 interface ActivityEvent {
+  id?: number;      // 履歴上の行 id。live emit と保存済み履歴の同一判定に使う
   ts: number;       // ms since epoch (実際に起きた時刻)
   source: string;   // trigger ID (トリガーに紐付かないものは "__task__")
   kind: string;     // 種別の安定した識別子 ("notify" / "skipped" / ...)
@@ -652,14 +653,13 @@ interface ActivityEvent {
 
 UI 側 (`chamberlainApi.onActivity`) は `@tauri-apps/api/event` の `listen` で購読する。表示は新しい順に直近 200 件 (`MAX_EVENTS`)。
 
-**`kind` は 0.3.0 で追加された (#42)。** それまで種別は `message` のプレフィックスだけで表現されていたが、フィルタや集計のたびに文字列パースが要るので独立した値にした。`message` のプレフィックスは `kind` から組み立てられており、見た目は 0.2.0 と同じ。
+**種別は `message` のプレフィックスではなく `kind` で判定する。** 文字列パース無しでフィルタや集計ができるようにするため。`message` のプレフィックスは `kind` から組み立てられているので、マッピングを二重に持つことはない。
 
 プレフィックス一覧:
 
 | プレフィックス | 意味 |
 |---|---|
 | `[error]` / `[load error]` / `[instantiate error]` | トリガーの tick / ロード / インスタンス化の失敗 |
-| `[schedule error]` | discovery 時点の schedule / tz の構成エラー |
 | `[expanded]` | 展開器がタスクを積んだ |
 | `[rescheduled]` | schedule 変更を検知して再展開した |
 | `[orphaned]` / `[unavailable]` | 実行対象トリガーが消えた / 実行できない状態のため予定を破棄 |
@@ -670,7 +670,9 @@ UI 側 (`chamberlainApi.onActivity`) は `@tauri-apps/api/event` の `listen` �
 | `[manual]` / `[deleted]` | 手動実行の予約 / 予定の削除 |
 | `[denied]` | manifest の宣言に無い権限をトリガーが要求したので拒否した ([トリガーの権限](#トリガーの権限-56--57) 節) |
 | `[ai]` | トリガーが `chamberlain.ai.complete` を呼んだ (framework の API キーの持ち出しなので記録する) |
-| `[config error]` | manifest (`schedule` / `tz` / `allowedHosts`) が壊れていて実行対象にできない。0.2.0 の `[schedule error]` はここに統合された |
+| `[config error]` | manifest (`schedule` / `tz` / `allowedHosts`) が壊れていて実行対象にできない |
+
+`schedule_error` という kind が DB 上に残ることがあるが、これは `[config error]` に統合される前の行を読むためだけのもので、新しい行は書かれない。
 
 捨てるにしても痕跡を残すのが観測面原則に合う。
 
@@ -680,7 +682,7 @@ UI 側 (`chamberlainApi.onActivity`) は `@tauri-apps/api/event` の `listen` �
 
 すべての activity は emit と同時に `<app_data>/history.db` (SQLite) に追記される。
 
-**これが「起動時イベントが誰にも見えない」gap を閉じる。** worker は `.setup()` 内で動き出すため、`[schedule error]` / `[expanded]` / `[rescheduled]` / `[orphaned]` は webview のリスナーが繋がる前に emit されて捨てられていた。UI は起動後に `chamberlainApi.listActivity()` で保存済みの履歴を読み、live 側と混ぜる (重複は ts + source + message で落とす)。
+**これが「起動時イベントが誰にも見えない」gap を閉じる。** worker は `.setup()` 内で動き出すため、`[config error]` / `[expanded]` / `[rescheduled]` / `[orphaned]` は webview のリスナーが繋がる前に emit される。UI は起動後に `chamberlainApi.listActivity()` で保存済みの履歴を読み、live 側と混ぜる (重複は行 `id` で落とす — 同じ心拍で同じトリガーが同じ本文を 2 回出すことがあるので、内容による判定では別のイベントを 1 つに潰してしまう)。
 
 | 列 | 内容 |
 |---|---|

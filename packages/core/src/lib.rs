@@ -526,7 +526,7 @@ fn discover_triggers(
             }
         };
 
-        // tz 解決は schedule error があっても走らせるが、失敗した場合はエラーを追記する。
+        // tz 解決は schedule のパースに失敗していても走らせ、両方壊れていれば連ねて出す。
         let (tz, config_error) = match resolve_tz(manifest.tz.as_deref()) {
             Ok(t) => (t, config_error),
             Err(e) => {
