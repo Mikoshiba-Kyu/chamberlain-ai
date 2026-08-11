@@ -28,6 +28,9 @@ declare const chamberlain: {
     complete(opts: { prompt: string; system?: string; model?: string }): Promise<string>;
   };
   http: {
+    // manifest.json の allowedHosts に書いたホストにしか出られない (#57)。https のみ
+    // (平文はループバックだけ)。リダイレクトはホップごとに同じ宣言と照合される。
+    // このトリガーは "api.github.com" を宣言している。
     fetch(
       url: string,
       opts?: {

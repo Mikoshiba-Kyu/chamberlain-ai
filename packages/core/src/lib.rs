@@ -25,7 +25,7 @@ use tauri_plugin_notification::{NotificationExt, PermissionState};
 use tauri_plugin_store::StoreExt;
 
 use crate::history::{origin_str, Activity, ActivityKind, HistoryStore, MAX_ROWS, RETENTION};
-use crate::permissions::{TriggerGrants, TriggerPermissions};
+use crate::permissions::{parse_host_pattern, HostPattern, TriggerGrants, TriggerPermissions};
 use crate::schedule::{parse_schedule, resolve_tz, Schedule};
 use crate::secrets::SecretsService;
 use crate::tasks::{Task, TaskOrigin, TaskStore};
@@ -130,6 +130,14 @@ struct TriggerManifest {
     /// 判断は [`crate::permissions`] にある。
     #[serde(default, rename = "requiredSecrets")]
     required_secrets: Vec<String>,
+    /// このトリガーが `chamberlain.http.fetch` で出てよい宛先ホストの一覧 (#57)。
+    ///
+    /// `"api.github.com"` (完全一致) と `"*.example.com"` (サブドメインのみ) を書ける。
+    /// 宣言外のホストへの fetch は失敗し、`[denied]` として観測面に残る。リダイレクトも
+    /// ホップごとに照合される。**書かなければ一切ネットワークに出られない**。
+    /// 検証は discovery で行い、壊れた宣言はトリガーごと実行対象から外す。
+    #[serde(default, rename = "allowedHosts")]
+    allowed_hosts: Vec<String>,
     /// 発火時刻の生成規則を DSL 文字列で宣言。必須。`@` 始まりのみ
     /// (`"@hourly"` / `"@hourly :45"` / `"@every 10m"` / `"@daily 09:00"` 等)。
     ///
@@ -148,17 +156,20 @@ struct TriggerInfo {
     dir: PathBuf,
     paused: Arc<AtomicBool>,
     /// パース済み schedule。**展開器の生成規則**として使う (実行時の発火判定には使わない)。
-    /// schedule_error があるトリガーではダミー値 (`@hourly` 相当)。worker は error を先に見て
+    /// config_error があるトリガーではダミー値 (`@hourly` 相当)。worker は error を先に見て
     /// 展開対象から外すので値は参照されない。
     schedule: Schedule,
     /// 解決済みの TZ。manifest.tz か user local。
-    /// schedule_error があるトリガーではダミー値 (UTC)。同上、参照されない。
+    /// config_error があるトリガーではダミー値 (UTC)。同上、参照されない。
     tz: chrono_tz::Tz,
-    /// schedule パース失敗 / tz 解決失敗時のメッセージ。Some のトリガーは worker が
-    /// load/展開しない。UI 側 (list_triggers) には「壊れたトリガー」として残す。
-    /// 目的は「1t とタイポしたトリガーが影も形も無くなる」UX を避けること。
+    /// manifest の構成エラー (schedule パース失敗 / tz 解決失敗 / `allowedHosts` の
+    /// 書式不正)。Some のトリガーは worker が load/展開しない。UI 側 (list_triggers) には
+    /// 「壊れたトリガー」として残す。目的は「1t とタイポしたトリガーが影も形も無くなる」
+    /// UX を避けること。
     /// load/instantiate error は現状 activity のみ、この gap は将来 unify したい。
-    schedule_error: Option<String>,
+    config_error: Option<String>,
+    /// 検証済みの `allowedHosts` (#57)。`config_error` があるトリガーでは空。
+    hosts: Vec<HostPattern>,
 }
 
 type TriggersRef = Arc<Vec<TriggerInfo>>;
@@ -207,9 +218,19 @@ struct TriggerListItem {
     /// 投影である (#26 決定事項 2)。展開前・構成エラー・全タスク削除済みの場合は null。
     #[serde(rename = "nextFireAt")]
     next_fire_at: Option<u64>,
-    /// schedule パース失敗 / tz 解決失敗等、discovery 時点で見つかった構成エラー。
-    /// Some の間は worker が load/展開しないので UI 側で「壊れてる」表示にできる。
+    /// schedule パース失敗 / tz 解決失敗 / `allowedHosts` 不正等、discovery 時点で
+    /// 見つかった構成エラー。Some の間は worker が load/展開しないので UI 側で
+    /// 「壊れてる」表示にできる。
     error: Option<String>,
+    /// このトリガーが要求している権限 (#56 / #57)。**宣言をそのまま見せるためのもの。**
+    ///
+    /// エンドユーザーが「このトリガーは何を読み、どこへ出るのか」を実行前に読めることが、
+    /// 実行時登録 (#55) の同意画面の中身になる。強制力は core が持っているので、ここに
+    /// 出る文字列は「見せかけ」ではなく実際の制限そのものである。
+    #[serde(rename = "requiredSecrets")]
+    required_secrets: Vec<String>,
+    #[serde(rename = "allowedHosts")]
+    allowed_hosts: Vec<String>,
 }
 
 /// UI が受け取るタスクリストの要素。「秘書がこれから何をするつもりか」を 1 画面で見せ、
@@ -505,7 +526,7 @@ fn discover_triggers(
         // 0.2.0 まで、この activity は discovery が .setup() 内で走る都合上 UI リスナー
         // 未接続で捨てられていた。#42 で履歴に永続化されるようになり、UI は起動後に
         // list_activity で読めるようになっている。
-        let (schedule, schedule_error) = match parse_schedule(&manifest.schedule) {
+        let (schedule, config_error) = match parse_schedule(&manifest.schedule) {
             Ok(spec) => (spec, None),
             Err(e) => {
                 eprintln!(
@@ -515,28 +536,46 @@ fn discover_triggers(
                 record_activity(
                     app,
                     history,
-                    &Activity::new(&manifest.id, ActivityKind::ScheduleError, e.clone()),
+                    &Activity::new(&manifest.id, ActivityKind::ConfigError, e.clone()),
                 );
-                // ダミー値。schedule_error が Some の間 worker は展開しないので参照されない。
+                // ダミー値。config_error が Some の間 worker は展開しないので参照されない。
                 (Schedule::Hourly { minutes: vec![0] }, Some(e))
             }
         };
 
         // tz 解決は schedule error があっても走らせるが、失敗した場合はエラーを追記する。
-        let (tz, schedule_error) = match resolve_tz(manifest.tz.as_deref()) {
-            Ok(t) => (t, schedule_error),
+        let (tz, config_error) = match resolve_tz(manifest.tz.as_deref()) {
+            Ok(t) => (t, config_error),
             Err(e) => {
                 eprintln!("trigger '{}' tz error: {e}", manifest.id);
                 record_activity(
                     app,
                     history,
-                    &Activity::new(&manifest.id, ActivityKind::ScheduleError, e.clone()),
+                    &Activity::new(&manifest.id, ActivityKind::ConfigError, e.clone()),
                 );
-                let combined = match schedule_error {
-                    Some(prev) => Some(format!("{prev}; {e}")),
-                    None => Some(e),
-                };
-                (chrono_tz::UTC, combined)
+                (chrono_tz::UTC, append_config_error(config_error, &e))
+            }
+        };
+
+        // allowedHosts の検証 (#57)。**壊れた宣言はトリガーごと実行対象から外す。**
+        // 悪い書き方 (`"*"` 等) を黙って捨てて残りで動かすと、#55 の同意画面が出す文字列と
+        // 実際の制限がずれる。宣言が強制力を持たない状態で同意だけ取るのはシアターなので、
+        // 宣言が読めないうちは走らせない方を採る。
+        let (hosts, config_error) = match manifest
+            .allowed_hosts
+            .iter()
+            .map(|h| parse_host_pattern(h))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(hosts) => (hosts, config_error),
+            Err(e) => {
+                eprintln!("trigger '{}' allowedHosts error: {e}", manifest.id);
+                record_activity(
+                    app,
+                    history,
+                    &Activity::new(&manifest.id, ActivityKind::ConfigError, e.clone()),
+                );
+                (Vec::new(), append_config_error(config_error, &e))
             }
         };
 
@@ -546,7 +585,8 @@ fn discover_triggers(
             paused: Arc::new(AtomicBool::new(false)),
             schedule,
             tz,
-            schedule_error,
+            config_error,
+            hosts,
         });
     }
 
@@ -590,9 +630,18 @@ fn build_specs(triggers: &[TriggerInfo], host: &TauriHost) -> Vec<TriggerSpec> {
             schedule: t.schedule.clone(),
             tz: t.tz,
             paused: t.paused.load(Ordering::Relaxed),
-            runnable: t.schedule_error.is_none() && host.is_loaded(&t.manifest.id),
+            runnable: t.config_error.is_none() && host.is_loaded(&t.manifest.id),
         })
         .collect()
+}
+
+/// discovery で見つかった構成エラーを積む。同じトリガーが複数の項目で壊れていることは
+/// あるので、`; ` で連ねて 1 本の文字列にする。
+fn append_config_error(prev: Option<String>, e: &str) -> Option<String> {
+    Some(match prev {
+        Some(prev) => format!("{prev}; {e}"),
+        None => e.to_string(),
+    })
 }
 
 /// manifest の宣言を実行時の権限の形に写す (#56)。
@@ -605,7 +654,10 @@ fn build_grants(triggers: &[TriggerInfo]) -> BTreeMap<String, TriggerGrants> {
         .map(|t| {
             (
                 t.manifest.id.clone(),
-                TriggerGrants::with_secrets(t.manifest.required_secrets.iter().cloned()),
+                TriggerGrants {
+                    secrets: t.manifest.required_secrets.iter().cloned().collect(),
+                    hosts: t.hosts.clone(),
+                },
             )
         })
         .collect()
@@ -645,17 +697,21 @@ impl TauriHost {
     /// 呼び出し元の識別を JS 側に名乗らせると自己申告になるので、Rust 側が実行の前後で
     /// 現在のトリガーを立てる。op はこれを見て manifest の宣言と突き合わせる。
     ///
-    /// 拒否は op の中では activity にできない (op は `AppHandle` を持たない) ので、
-    /// 溜まったものをここで回収して `[denied]` として観測面に流す。帰属先を持たない拒否
+    /// op は自分では activity を書けない (`AppHandle` を持たない) ので、溜まったものを
+    /// ここで回収して観測面に流す (`[denied]` / `[ai]`)。帰属先を持たない記録
     /// (= run_js を通らない経路から来たもの) は、今動かしているトリガーのせいにせず
     /// framework 側 (`__meta__`) に付ける。誤った帰属は観測面としては無いより悪い。
     fn run_js<R>(&mut self, trigger_id: &str, f: impl FnOnce(&mut Self) -> R) -> R {
         self.with_permissions(|p| p.enter(trigger_id));
         let result = f(self);
-        for denial in self.with_permissions(|p| p.leave()) {
-            let source = denial.trigger_id.unwrap_or_else(|| META_NAMESPACE.into());
-            eprintln!("denied for '{source}': {}", denial.message);
-            self.activity(Activity::new(source, ActivityKind::Denied, denial.message));
+        for op_activity in self.with_permissions(|p| p.leave()) {
+            let source = op_activity
+                .trigger_id
+                .clone()
+                .unwrap_or_else(|| META_NAMESPACE.into());
+            let message = op_activity.display();
+            eprintln!("[{}] {source}: {message}", op_activity.kind.as_str());
+            self.activity(Activity::new(source, op_activity.kind, message));
         }
         result
     }
@@ -775,10 +831,10 @@ fn spawn_trigger_worker(
         };
 
         // 起動時に全モジュールをロード。ロード失敗したものはスキップ (他トリガーは動く)。
-        // schedule_error があるトリガーはこの段階でスキップ (load しない = 展開もされない)。
+        // config_error があるトリガーはこの段階でスキップ (load しない = 展開もされない)。
         // UI には list_triggers 経由で error 付きで見える。
         for t in triggers.iter() {
-            if t.schedule_error.is_some() {
+            if t.config_error.is_some() {
                 continue;
             }
             let entry_path = t.dir.join(&t.manifest.entry);
@@ -905,7 +961,12 @@ fn list_triggers(
             paused: t.paused.load(Ordering::Relaxed),
             schedule: t.manifest.schedule.clone(),
             next_fire_at: store.next_scheduled_for(&t.manifest.id),
-            error: t.schedule_error.clone(),
+            error: t.config_error.clone(),
+            required_secrets: t.manifest.required_secrets.clone(),
+            // 検証済みのパターンから組み立て直す。manifest の生文字列をそのまま出すと、
+            // 大文字や前後の空白の差で「UI に見えている文字列」と「実際に効く宣言」が
+            // ずれる。ここで見せるものは強制力を持つ側と同一でなければならない。
+            allowed_hosts: t.hosts.iter().map(|h| h.as_declared()).collect(),
         })
         .collect()
 }
@@ -988,7 +1049,7 @@ fn run_trigger_now(
     history: State<'_, HistoryRef>,
 ) -> Result<(), String> {
     let trigger = find_trigger(&triggers, &id).ok_or_else(|| format!("unknown trigger: {id}"))?;
-    if let Some(err) = &trigger.schedule_error {
+    if let Some(err) = &trigger.config_error {
         return Err(format!("trigger '{id}' has a configuration error: {err}"));
     }
 

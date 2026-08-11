@@ -250,11 +250,13 @@ mod op_tests {
                 // framework のキーを 2 通りの綴りで宣言させる。どちらも渡らないのが仕様。
                 // 別綴り (ANTHROPIC-API-KEY) は env fallback の正規化で同じ値に解決する
                 // ので、綴り一致で弾いていた頃はここから素通りしていた。
-                TriggerGrants::with_secrets([
-                    "github_token".to_string(),
-                    ANTHROPIC_API_KEY_NAME.to_string(),
-                    "ANTHROPIC-API-KEY".to_string(),
-                ]),
+                TriggerGrants {
+                    secrets: ["github_token", ANTHROPIC_API_KEY_NAME, "ANTHROPIC-API-KEY"]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                    ..Default::default()
+                },
             )])));
         }
 

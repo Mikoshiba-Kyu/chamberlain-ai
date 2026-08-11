@@ -217,6 +217,7 @@ body {
 
 @media (prefers-color-scheme: dark) {
   .trigger-schedule,
+  .trigger-permissions,
   .task-relative {
     color: #a1a1a6;
   }
@@ -258,6 +259,15 @@ body {
 .status-adhoc {
   background: rgba(255, 149, 0, 0.2);
   color: #96590a;
+}
+
+/* manifest が宣言した権限 (#56 / #57)。core が実際に強制している内容そのものなので、
+   エラーではないが「読み飛ばされない程度」の重さで出す。 */
+.trigger-permissions {
+  margin-top: 4px;
+  font-size: 12px;
+  color: #6b6b6f;
+  word-break: break-word;
 }
 
 .trigger-error {

@@ -63,7 +63,9 @@ pub(crate) enum ActivityKind {
     LoadError,
     /// トリガーの JS がインスタンス化できなかった。
     InstantiateError,
-    /// discovery 時点の schedule / tz の構成エラー。
+    /// discovery 時点の schedule / tz の構成エラー。**0.3.0 で [`ActivityKind::ConfigError`]
+    /// に統合された**。新しい行は書かれないが、保存済みの行を読むために残す
+    /// (モジュール doc: 一度出荷した文字列は変えない)。
     ScheduleError,
     /// 展開器がタスクを積んだ。
     Expanded,
@@ -93,6 +95,23 @@ pub(crate) enum ActivityKind {
     /// 止められた」という 1 つの概念で、何が止まったか (secret / 宛先ホスト) は
     /// `message` が持つ。#57 の宛先ホスト拒否もこの kind に乗る。
     Denied,
+    /// トリガーが `chamberlain.ai.complete` を呼んだ (#57)。
+    ///
+    /// 拒否ではない。**framework が持つ API キーの持ち出し**なので、宛先を宣言させる形が
+    /// 取れない代わりに必ず痕跡を残す。エンドユーザーの課金でトリガー作者の用事が
+    /// 処理されていないかを後から追えるようにするための行。
+    AiCall,
+    /// manifest が壊れていて、トリガーを実行対象にできない (#57)。
+    ///
+    /// `schedule` / `tz` / `allowedHosts` のどれが壊れていても**同じ kind** で出す。
+    /// [`ActivityKind::Denied`] と同じ判断で、UI から見て意味があるのは「manifest が
+    /// 壊れていて動かせない」という 1 つの概念であり、どの項目かは `message` が持つ。
+    /// これらは下流でも `TriggerInfo.config_error` に合流し、`; ` で連ねた 1 本の
+    /// 文字列として同じ「構成エラー」バッジになる。
+    ///
+    /// 権限の宣言が壊れている場合に部分的に捨てて動かさないのは、#55 の同意画面に出す
+    /// 文字列と実際の制限がずれるため (宣言が強制力を持たない同意はシアターになる)。
+    ConfigError,
 }
 
 impl ActivityKind {
@@ -116,6 +135,8 @@ impl ActivityKind {
             Self::Manual => "manual",
             Self::Deleted => "deleted",
             Self::Denied => "denied",
+            Self::AiCall => "ai_call",
+            Self::ConfigError => "config_error",
         }
     }
 
@@ -140,6 +161,8 @@ impl ActivityKind {
             Self::Manual => Some("[manual]"),
             Self::Deleted => Some("[deleted]"),
             Self::Denied => Some("[denied]"),
+            Self::AiCall => Some("[ai]"),
+            Self::ConfigError => Some("[config error]"),
         }
     }
 }
@@ -260,6 +283,8 @@ fn parse_kind(s: &str) -> Option<ActivityKind> {
         Manual,
         Deleted,
         Denied,
+        AiCall,
+        ConfigError,
     ]
     .into_iter()
     .find(|k| k.as_str() == s)

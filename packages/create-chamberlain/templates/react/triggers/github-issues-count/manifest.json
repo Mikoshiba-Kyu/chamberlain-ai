@@ -6,5 +6,6 @@
   "author": "chamberlain",
   "entry": "index.ts",
   "requiredSecrets": ["github_token"],
+  "allowedHosts": ["api.github.com"],
   "schedule": "@hourly"
 }
