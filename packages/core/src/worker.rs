@@ -6,17 +6,13 @@
 //!
 //! # なぜ trait を挟むか
 //!
-//! 0.2.0 まで、この一巡は `lib.rs` の worker スレッド内に直に書かれていて `AppHandle` と
-//! `rustyscript::Runtime` に直接依存していた。結果として **配線層のテストが 1 本も書けず**、
-//! #26 Phase 1 の検証は全て実機で手作業になった (#46)。
+//! [`WorkerHost`] は worker が触る副作用を数え上げたもの。本番の実装は `lib.rs` の
+//! `TauriHost` (AppHandle + JS Runtime + ロード済みモジュール)、テストでは記録用の fake を
+//! 差す。これで「時計を進めるだけでシナリオを書く」ことができる。
 //!
-//! [`WorkerHost`] は worker が触る副作用を 6 つに数え上げたものである。本番の実装は
-//! `lib.rs` の `TauriHost` (AppHandle + JS Runtime + ロード済みモジュール)、テストでは
-//! 記録用の fake を差す。これで「時計を進めるだけでシナリオを書く」ことができる。
-//!
-//! JS 実行 ([`WorkerHost::call_tick`]) も境界の裏に置いた。V8 は thread affinity を持ち
+//! JS 実行 ([`WorkerHost::call_tick`]) も境界の裏に置いてある。V8 は thread affinity を持ち
 //! 起動も安くないので、心拍のロジックを検証するのに本物の Runtime を回す必要は無い。
-//! 「トリガーの JS が実際に動くか」は別レイヤの関心であり、`rustyscript` 自体の責務に近い。
+//! 「トリガーの JS が実際に動くか」は別レイヤの関心である。
 //!
 //! # 副作用の順序は仕様である
 //!
@@ -26,7 +22,7 @@
 //! - タスク削除が最後: 同じ理由。実行中にクラッシュしたタスクはリストに残り、次回起動で
 //!   もう一度試される
 //! - tick() がエラーを返してもタスクは消す。schedule の意味を「実行を試みる時刻」に統一し、
-//!   エラーで毎心拍リトライになるノイズを避ける (0.1.x の fire_time 更新方針を踏襲)
+//!   エラーで毎心拍リトライになるノイズを避ける
 //!
 //! この順序はテストで列として固定されている (`side_effects_happen_in_the_documented_order` /
 //! `crash_before_cleanup_keeps_the_task`)。
@@ -81,7 +77,7 @@ pub(crate) trait WorkerHost {
     /// (観測面は activity 側が担保するため)。
     fn notify(&mut self, title: &str, body: &str);
 
-    /// 観測面 (#6) にイベントを流す。live emit と履歴への永続化の両方がここに入る (#42)。
+    /// 観測面 (#6) にイベントを流す。live emit と履歴への永続化の両方がここに入る。
     fn activity(&mut self, activity: Activity);
 
     /// 履歴の retention を適用する。戻り値は消した行数 (観測用)。
@@ -91,8 +87,8 @@ pub(crate) trait WorkerHost {
     fn save_tasks(&mut self, store: &TaskStore);
 }
 
-/// 心拍から見たトリガー 1 つ。`lib.rs` の `TriggerInfo` (PathBuf や AtomicBool を持つ)
-/// から心拍が必要とするぶんだけを写し取ったもの。
+/// 心拍から見たトリガー 1 つ。`lib.rs` の `TriggerInfo` から心拍が必要とするぶんだけを
+/// 写し取ったもの。
 ///
 /// 所有型にしてあるのは、`paused` が心拍ごとに読み直される値だからである。参照で持つと
 /// 「いつの時点の paused か」がライフタイムに紛れる。トリガーは数個の規模なので、
@@ -283,7 +279,7 @@ fn expand_pending<H: WorkerHost>(
 /// 猶予を超えた schedule 由来タスクを掃除し、結果を観測面に流す (#50 / #53)。
 ///
 /// **1 件のときは畳まない。** 1 行にまとめても情報が増えず、代わりに「いつの予定が
-/// 流れたか」が消えるため。心拍が 1 回遅れただけ、という日常的なケースはこちらに落ちる。
+/// 流れたか」が消える。心拍が 1 回遅れただけ、という日常的なケースはこちらに落ちる。
 ///
 /// 戻り値はタスクリストが変化したか (呼び出し側が save の要否を判断する)。
 fn sweep_stale_tasks<H: WorkerHost>(
@@ -473,10 +469,8 @@ pub(crate) fn heartbeat<H: WorkerHost>(
                     .with_task(&task),
                 );
             }
-            // **ここには来ない。** 猶予超過は step 2 の掃除が先に拾う (#53)。
-            // [`sweep_stale`] と [`classify_due`] の判定がずれた場合の安全網として
-            // 残してある — 黙って実行してしまうより、痕跡を残して破棄する方がよい。
-            //
+            // **ここには来ない。** 猶予超過は step 1 の掃除が先に拾う (#53)。
+            // [`sweep_stale`] と [`classify_due`] の判定がずれた場合の安全網であり、
             // 通常経路と**同じ文言にしない**のは、万一これが出たときに「掃除が壊れて
             // いる」と読めるようにするため。同じ行に見えると不変条件の破れに気づけない。
             Disposition::SkippedLate { delay_ms } => {
@@ -551,7 +545,7 @@ mod tests {
         WriteState(String, String),
         Tick(String),
         Notify(String, String),
-        /// (source, kind, 表示用の 1 行)。kind を持つのは #42 で列に出したため。
+        /// (source, kind, 表示用の 1 行)。
         Activity(String, &'static str, String),
         Sweep,
         Save(usize),
@@ -739,7 +733,6 @@ mod tests {
     // ---- 起動直後 ------------------------------------------------------------
 
     /// 空の tasks.json から起動すると、48h ぶんが積まれて境界が `now + 48h` になる。
-    /// #26 Phase 1 の実機検証 (56 件生成 / 境界が全トリガーで同一) に対応する。
     #[test]
     fn first_tick_expands_the_full_horizon() {
         let mut state = WorkerState::default();
@@ -1173,7 +1166,7 @@ mod tests {
         assert_eq!(
             host.effects,
             vec![
-                // retention の掃除は実行より先。この心拍が積む履歴を消させないため (#42)。
+                // retention の掃除は実行より先。この心拍が積む履歴を消させないため。
                 Effect::Sweep,
                 Effect::ReadState("hourly".into()),
                 Effect::Tick("hourly".into()),
@@ -1290,8 +1283,8 @@ mod tests {
 
     // ---- 長期停止からの復帰 (#50) --------------------------------------------
 
-    /// 2 日閉じていた後の起動。0.2.0 では心拍が `[skipped]` を 1 件ずつ出して観測面を
-    /// 埋め、起動時にしか出ない `[expanded]` を押し流していた。起動時に畳んで捨てる。
+    /// 2 日閉じていた後の起動。猶予超過の予定はトリガー単位に畳んで捨て、その回にしか
+    /// 出ない `[expanded]` が押し流されないこと (#50)。
     #[test]
     fn long_downtime_collapses_into_one_line_per_trigger() {
         let specs = vec![spec("hourly", "@hourly"), spec("daily", "@daily 06:00")];
@@ -1322,8 +1315,6 @@ mod tests {
             .iter()
             .find(|a| a.kind == ActivityKind::Stale && a.source == "hourly")
             .unwrap();
-        // 48 件積まれたうち、ちょうど base() に来る 1 件は猶予内なので残る (心拍が実行する)。
-        // 境界のこちら側とあちら側で扱いが分かれることの確認でもある。
         assert_eq!(
             hourly.display(),
             format!(
@@ -1331,8 +1322,8 @@ mod tests {
                 fmt_utc(before + HOUR)
             )
         );
-        // 48 件のうち base() ちょうどに来る 1 件は猶予内なので破棄されず、
-        // 同じ心拍で実行される。境界のこちら側とあちら側で扱いが分かれることの確認。
+        // 48 件のうち base() ちょうどに来る 1 件は猶予内なので破棄されず、同じ心拍で
+        // 実行される。境界のこちら側とあちら側で扱いが分かれることの確認。
         assert!(host.effects.contains(&Effect::Tick("hourly".into())));
 
         // 続く心拍は静か。破棄済みなので同じ行が再び出ることはない。
@@ -1370,7 +1361,6 @@ mod tests {
             grace(),
         );
 
-        // 0.2.0 / #50 時点ではここが 47 件の [skipped] だった。
         assert_eq!(host.count_kind(ActivityKind::Skipped), 0);
         assert_eq!(host.count_kind(ActivityKind::Stale), 1);
         assert_eq!(
@@ -1484,10 +1474,9 @@ mod tests {
         assert!(host.only(ActivityKind::Expanded).task.is_none());
     }
 
-    /// 表示用の 1 行は 0.2.0 と同じ形。kind を列に出したことで UI の見た目が
-    /// 変わってはいけない (#42 のスコープは永続化であって UI ではない)。
+    /// 表示用の 1 行は kind から組み立てられる。UI が読む文字列の形を固定しておく。
     #[test]
-    fn display_strings_are_unchanged_from_0_2_0() {
+    fn display_strings_have_a_stable_shape() {
         let mut state = WorkerState::default();
         let specs = vec![spec("hourly", "@hourly")];
         let mut host = FakeHost::default();

@@ -113,8 +113,6 @@ async function listTemplates() {
   }
 }
 
-// npm publish は tarball から .gitignore を落とす (仕様)。テンプレ内では
-// `_gitignore` として保存しておき、scaffold 時に本来の名前に戻す。
 /**
  * npm は tarball 生成時にドットファイルを特殊扱いする (`.gitignore` は落とされる)。
  * テンプレ側では `_` 始まりで保存し、scaffold 時に復元する。

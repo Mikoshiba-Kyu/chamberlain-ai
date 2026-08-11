@@ -35,8 +35,8 @@ pub mod store {
     /// name を env var 名に変換する。`github_token` -> `CHAMBERLAIN_SECRET_GITHUB_TOKEN`。
     ///
     /// env var 名として有効な `[A-Z0-9_]` 以外の文字 (`-` / `.` / 空白 / 多バイト文字等) は
-    /// すべて `_` に丸める。旧実装は `-` だけを潰していたため、`github.token` のような
-    /// 名前で env fallback が silent に効かなかった (Issue #21 #11)。
+    /// すべて `_` に丸める。一部だけを潰すと `github.token` のような名前で env fallback が
+    /// silent に効かなくなる (Issue #21 #11)。
     ///
     /// **これは多対 1 の写像である。** `anthropic_api_key` / `ANTHROPIC-API-KEY` /
     /// `anthropic.api.key` は同じ env var に落ちる = **同じ secret を指す**。名前の綴りで
@@ -184,7 +184,6 @@ mod op_tests {
     ///
     /// env はプロセス共有で、テストは同一バイナリ内で並行に走る。値を残すと後続のテスト
     /// (特に `store::get` の env fallback を通るもの) の結果を変えてしまう。
-    /// `schedule.rs` の TZ テストと同じ save/restore を、複数変数向けに RAII にしたもの。
     struct EnvGuard(Vec<(String, Option<String>)>);
 
     impl EnvGuard {
@@ -249,7 +248,7 @@ mod op_tests {
                 "declaring".to_string(),
                 // framework のキーを 2 通りの綴りで宣言させる。どちらも渡らないのが仕様。
                 // 別綴り (ANTHROPIC-API-KEY) は env fallback の正規化で同じ値に解決する
-                // ので、綴り一致で弾いていた頃はここから素通りしていた。
+                // ので、綴り一致で弾くとここから素通りしてしまう。
                 TriggerGrants {
                     secrets: ["github_token", ANTHROPIC_API_KEY_NAME, "ANTHROPIC-API-KEY"]
                         .iter()

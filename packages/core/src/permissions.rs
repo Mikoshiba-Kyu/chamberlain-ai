@@ -1,9 +1,7 @@
 //! manifest の宣言を**実行時の権限**として強制する層 (#56 / #55)。
 //!
-//! 0.2.0 までの `requiredSecrets` は [`crate::list_declared_secrets`] が Settings UI に
-//! 「そのキーが未設定です」を出すために集約するだけの表示用データで、実行時の強制力を
-//! 持っていなかった。`requiredSecrets: []` と宣言したトリガーが
-//! `chamberlain.getSecret("anthropic_api_key")` を呼べる状態である。
+//! 宣言 (`requiredSecrets` / `allowedHosts`) は Settings UI に出すだけの表示用データでは
+//! なく、ここが実際に効かせる制限である。
 //!
 //! 焼き込みだけの今は「トリガーの作者 = アプリの作者」なので信頼で閉じているが、#55 で
 //! 実行時登録を開くと**宣言と実際の権限が乖離したまま他人のコードを受け入れる**ことに
@@ -37,11 +35,9 @@ use crate::secrets::{store as secret_store, ANTHROPIC_API_KEY_NAME};
 ///
 /// [`secret_store::get`] は keyring を引く前に `CHAMBERLAIN_SECRET_<UPPERCASE>` を見る。
 /// その名前の正規化は多対 1 で、`ANTHROPIC_API_KEY` も `anthropic-api-key` も
-/// `anthropic.api.key` も `anthropic_api_key` と同じ env var に落ちる。したがって
-/// **綴りの一致で弾くと、別綴りで宣言したトリガーに framework のキーがそのまま渡る**
-/// (`requiredSecrets: ["ANTHROPIC_API_KEY"]` が宣言として通り、store が値を返す)。
-/// Windows の Credential Manager はターゲット名が大文字小文字を区別しないので、keyring
-/// 経路でも同じことが起きうる。
+/// `anthropic.api.key` も同じ env var に落ちる。綴りの一致で弾くと、別綴りで宣言した
+/// トリガーに framework のキーがそのまま渡ってしまう。Windows の Credential Manager は
+/// ターゲット名が大文字小文字を区別しないので、keyring 経路でも同じことが起きうる。
 fn is_framework_secret(name: &str) -> bool {
     secret_store::env_var_name(name) == secret_store::env_var_name(ANTHROPIC_API_KEY_NAME)
 }
@@ -350,7 +346,7 @@ pub(crate) struct OpActivity {
 impl OpActivity {
     /// **本文はここで切り詰める。** 本文にはトリガーが決めた文字列 (secret 名 / ホスト /
     /// model 名) が入るので、素通しすると `ai.complete({ model: "A".repeat(10_000_000) })`
-    /// が 10 MB の行を履歴に書ける。入口が 1 箇所なので、ここで止めれば全経路に効く。
+    /// が 10 MB の行を履歴に書ける。入口はここ 1 箇所なので、全経路に効く。
     fn new(trigger_id: Option<String>, kind: ActivityKind, message: String) -> Self {
         Self {
             trigger_id,
@@ -591,11 +587,9 @@ mod tests {
         );
     }
 
-    /// framework のキーは**綴りを変えても**渡らない。
-    ///
-    /// `store::get` の env fallback は名前を正規化するので、下の綴りはどれも
-    /// `CHAMBERLAIN_SECRET_ANTHROPIC_API_KEY` に解決する = 同じキーが返る。綴りの完全一致で
-    /// 弾いていると、宣言に別綴りを書くだけで framework のキーを持ち出せてしまう。
+    /// framework のキーは**綴りを変えても**渡らない。`store::get` の env fallback は名前を
+    /// 正規化するので、下の綴りはどれも同じキーに解決する。綴りの完全一致で弾くと、宣言に
+    /// 別綴りを書くだけで framework のキーを持ち出せてしまう。
     #[test]
     fn framework_secret_is_denied_under_alias_spellings() {
         for alias in [
@@ -792,8 +786,8 @@ mod tests {
         );
     }
 
-    /// `ai.complete` も同じ仕組みでまとめる。**本文に呼び出しごとに変わる値を入れない**の
-    /// が効く条件で、prompt の長さを入れていた頃はここが 3 行になっていた。
+    /// `ai.complete` も同じ仕組みでまとめる。効く条件は**本文に呼び出しごとに変わる値を
+    /// 入れない**こと (prompt の長さを入れるとここが 3 行に割れる)。
     #[test]
     fn ai_calls_to_the_same_model_collapse_into_one_row_with_a_count() {
         let mut s = state();

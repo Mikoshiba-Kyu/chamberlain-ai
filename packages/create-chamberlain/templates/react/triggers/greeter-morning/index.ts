@@ -1,8 +1,6 @@
-// 朝 06:00 の挨拶。#18 で greeter を 4 分割した 1 つ目。
+// 朝 06:00 の挨拶。wall-clock schedule (`@daily 06:00`) の実運用サンプル (#18)。
 //
-// wall-clock schedule (`@daily 06:00`) が実際に指定時刻で fire することを
-// 検証するのが目的。tick 内での時間帯 dispatch (旧 greeter の実装) は消え、
-// トリガー = 時間帯 という 1:1 の分割になっている。
+// トリガー = 時間帯 の 1:1 対応にしてあり、tick 側で時間帯を判定することはしない。
 
 type State = { greetCount?: number };
 

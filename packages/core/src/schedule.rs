@@ -1,11 +1,10 @@
 //! Schedule DSL パーサと wall-clock 発火時刻計算 (#26 Phase 1)。
 //!
-//! `manifest.schedule` は `@` 始まりの wall-clock DSL のみを受け付ける。
-//! **0.2.0 で interval schedule (`"5m"` / `"1h"`) は廃止された** (#26 決定事項 4)。
-//! 展開型スケジューラでは interval は「wall-clock の生成規則のひとつ」に格下げされ、
-//! `@hourly` が 1 時間 interval と同義になるため、別系統として維持する意味が無くなった。
-//! さらにグリッドに割り切れない interval (`"7m"` 等) は日の境目で間隔が崩れ、展開器が
-//! 「前回展開の末尾時刻」を覚える必要が生じる (展開済み境界 1 つで済まなくなる)。
+//! `manifest.schedule` は `@` 始まりの wall-clock DSL のみを受け付ける。interval 形式
+//! (`"5m"` / `"1h"`) は持たない (#26 決定事項 4) — 展開型では `@hourly` が 1 時間 interval と
+//! 同義になるので別系統を維持する意味が無く、さらにグリッドに割り切れない interval
+//! (`"7m"` 等) は日の境目で間隔が崩れ、展開器が「前回展開の末尾時刻」を覚える必要が生じる
+//! (展開済み境界 1 つで済まなくなる)。
 //!
 //! DSL 一覧:
 //!
@@ -25,7 +24,6 @@
 //!
 //! `@every <N>m` は **N が 5 / 10 / 15 / 20 / 30 の場合のみ有効**。60 の約数なら毎時同じ
 //! 分集合になるため、展開が各時間で独立・冪等になり、展開済み境界 1 つで完結する。
-//! 下限 5 分は旧 interval の下限を踏襲している (説明が増えない)。
 //! カンマ区切りリスト (`@hourly :00,:15,:45`) は意図的に露出させない。リスト構文を認めると
 //! 「曜日リストは? 月リストは?」と滑り出して cron に着地するため (#18)。
 //!
@@ -39,8 +37,8 @@
 //!   1 回目 (早い UTC) のみ発火。2 回目は `next_scheduled_after` が
 //!   翌日の予定を返すことで skip される
 //!
-//! JST は現状 DST 無しなので日本ユーザーには直接影響しないが、将来的にユーザーが
-//! 海外環境で使う場合の挙動を明文化しておく (#18)。
+//! JST に DST は無いので日本の環境では表面化しないが、海外環境での挙動として明文化して
+//! おく (#18)。
 
 use chrono::{
     DateTime, Datelike, MappedLocalTime, NaiveDate, NaiveDateTime, TimeZone, Timelike, Weekday,
@@ -74,9 +72,8 @@ pub(crate) enum Schedule {
 
 /// `manifest.schedule` DSL のエントリ。
 ///
-/// 旧 interval 形式 (`"5m"` / `"1h"`) は 0.2.0 で廃止されたが、単に
-/// "unknown keyword" で落とすとエージェント開発者が移行先を推測できない。
-/// 数字始まりを検出したら移行先を名指しするエラーを返す。
+/// interval 形式 (`"5m"` / `"1h"`) を書かれた場合は、"unknown keyword" ではなく移行先を
+/// 名指しするエラーを返す (推測させないため)。
 pub(crate) fn parse_schedule(s: &str) -> Result<Schedule, String> {
     let trimmed = s.trim();
     if trimmed.is_empty() {
@@ -162,7 +159,7 @@ pub(crate) fn parse_schedule(s: &str) -> Result<Schedule, String> {
     }
 }
 
-/// 旧 interval 形式 (`5m` / `1h` / `10s`) に見えるか。移行エラーメッセージの出し分け用。
+/// interval 形式 (`5m` / `1h` / `10s`) に見えるか。移行エラーメッセージの出し分け用。
 fn looks_like_legacy_interval(s: &str) -> bool {
     let mut chars = s.chars();
     match chars.next_back() {
@@ -433,7 +430,7 @@ mod tests {
             .timestamp_millis() as u64
     }
 
-    // ---- interval 廃止 (#26 決定事項 4) ----
+    // ---- interval 形式は受け付けない (#26 決定事項 4) ----
 
     #[test]
     fn legacy_interval_is_rejected_with_migration_hint() {

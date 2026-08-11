@@ -24,9 +24,8 @@ export function formatNextFireAt(ts: number | null): string {
 export function formatPermissions(
   t: Partial<Pick<TriggerListItem, "requiredSecrets" | "allowedHosts">>,
 ): string | null {
-  // `?? []` は 0.2.x の core を引いたままフロントだけ新しい場合の保険。
-  // リリースは lockstep で、テンプレの `chamberlain-core` の pin は release.yml が
-  // 機械で検査しているが、手で pin を戻された状態でも画面が真っ白にはならないようにする。
+  // `?? []` は core の pin だけ古い状態への保険。release.yml が pin を機械で検査して
+  // いるが、手で戻された場合でも画面が真っ白にはならないようにする。
   const secrets = t.requiredSecrets ?? [];
   const hosts = t.allowedHosts ?? [];
   const parts: string[] = [];
