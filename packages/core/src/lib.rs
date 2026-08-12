@@ -30,7 +30,7 @@ use crate::history::{origin_str, Activity, ActivityKind, HistoryStore, MAX_ROWS,
 use crate::permissions::{parse_host_pattern, HostPattern, TriggerGrants, TriggerPermissions};
 use crate::registry::{
     install_trigger, installed_path, is_reserved_id, uninstall_trigger, validate_entry_path,
-    validate_trigger_id, TriggerSource,
+    validate_registered_entry, validate_trigger_id, TriggerSource,
 };
 use crate::schedule::{parse_schedule, resolve_tz, Schedule};
 use crate::secrets::SecretsService;
@@ -1325,6 +1325,9 @@ fn inspect_candidate(
             manifest.entry
         ));
     }
+    // 「今この場所にある」だけでは足りない。コピーを生き延びない置き方 (ドット始まりの
+    // 下) は、入れた後に load error として現れるので入口で断る。
+    validate_registered_entry(&manifest.entry)?;
 
     // 衝突判定は in-memory の一覧だけでは足りない。登録直後 (再起動前) のトリガーは
     // ディスクにあって一覧に無いので、両方見る。
@@ -1416,7 +1419,28 @@ fn register_trigger(
         ));
     }
 
+    // 置き換え先は id で決まるが、既に居る実体のディレクトリ名は id と違いうる
+    // (`<app_data>/triggers/` に手で置く経路)。畳まずに据えると同じ id の実体が 2 つ残り、
+    // 次の起動でどちらが勝つかが read_dir 順に落ちる (#21 / #6 で消したはずの非決定性)。
+    // 「置き換えました」と言う以上、古い方はここで消す。
+    let superseded = find_trigger(&triggers, &candidate.id)
+        .filter(|t| t.source == TriggerSource::Registered)
+        .map(|t| t.dir.clone())
+        .filter(|prev| prev != &installed_path(dir, &candidate.id));
+
     let stats = install_trigger(&src, dir, &candidate.id)?;
+
+    if let Some(prev) = superseded {
+        // 据え置きは終わっているので、ここで失敗しても新しい方は入っている。
+        // 黙って残すと次の起動で衝突するため、観測面には残す。
+        if let Err(e) = uninstall_trigger(&prev) {
+            eprintln!(
+                "failed to remove the superseded registration of '{}' at {}: {e}",
+                candidate.id,
+                prev.display()
+            );
+        }
+    }
 
     let replaced = candidate.conflict.is_some();
     // 読み飛ばした数も書く。`.git` ごと選んだときに「入っていないもの」が分かる。

@@ -18,6 +18,7 @@
 
 use std::fs;
 use std::path::{Component, Path};
+use std::sync::{Mutex, MutexGuard};
 
 use serde::Serialize;
 
@@ -71,8 +72,30 @@ const MAX_FILES: usize = 200;
 /// 1 トリガーの総バイト数。
 const MAX_TOTAL_BYTES: u64 = 8 * 1024 * 1024;
 
+/// 1 トリガーに含められるディレクトリ数 (コピー先に作る数、根を含む)。
+///
+/// ファイル数と総バイト数だけでは、深さ制限の下でも横に広がる空ディレクトリの木
+/// (`a/1..a/100000`) が上限なしに複製できてしまう。1 バイトも運ばない入力で
+/// `create_dir` を無限に叩かせない。
+const MAX_DIRS: usize = 200;
+
 /// ディレクトリの最大深さ。
 const MAX_DEPTH: usize = 8;
+
+/// 据え置き / 取り外しを直列化する。
+///
+/// 入れ替えは「staging に積む → 旧版を `.old-<id>` へ退避 → rename」の 3 手で進む。
+/// 同じ id に対して 2 本が同時に走ると、後発の頭にある残骸掃除が先発の退避先を消し、
+/// 先発の rename が失敗したときに戻す先が無くなる。**「入れ替えに失敗しても前の
+/// トリガーが残る」はこのモジュールが守っている唯一の約束**なので、UI 側が二重に
+/// 押させない作りであることに頼らず、ここで閉じておく。
+static INSTALL_LOCK: Mutex<()> = Mutex::new(());
+
+/// poisoning は「別の登録がパニックした」以上の意味を持たない。ディスク上の残骸は
+/// `.staging-` / `.old-` の命名規則で次回に掃除できるので、ロックごと使えなくしない。
+fn lock_installs() -> MutexGuard<'static, ()> {
+    INSTALL_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// 登録中の一時ディレクトリの接頭辞。
 ///
@@ -88,6 +111,8 @@ const BACKUP_PREFIX: &str = ".old-";
 pub(crate) struct CopyStats {
     pub files: usize,
     pub bytes: u64,
+    /// 作ったディレクトリ数 (根を含む)。上限の判定にだけ使う。
+    pub dirs: usize,
     /// 読み飛ばしたドット始まりのエントリ数 (`.git` / `.DS_Store` 等)。
     pub skipped: usize,
 }
@@ -146,14 +171,33 @@ pub(crate) fn validate_entry_path(entry: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// 登録経路の `entry` 検証。[`validate_entry_path`] に「コピーを生き延びるか」を足す。
+///
+/// [`copy_tree`] はドット始まりのエントリを読み飛ばすので、`entry` がその下に居ると
+/// **同意画面まで通ったのに再起動後は load error** になる。入れる前に断れば直せる話を、
+/// 入れた後の「壊れているトリガー」に化けさせない。焼き込みには掛けない (コピーを
+/// 通らないので、そこにドット始まりが居ても実際に読める)。
+pub(crate) fn validate_registered_entry(entry: &str) -> Result<(), String> {
+    validate_entry_path(entry)?;
+    let hidden = Path::new(entry)
+        .components()
+        .any(|c| matches!(c, Component::Normal(name) if name.to_string_lossy().starts_with('.')));
+    if hidden {
+        return Err(format!(
+            "entry '{entry}' がドット始まりのファイル/フォルダを含んでいます (登録時にコピーされません)"
+        ));
+    }
+    Ok(())
+}
+
 /// ディレクトリを再帰コピーする。上限を超えたら**途中で失敗する** (呼び出し側が後始末する)。
 ///
 /// - シンボリックリンクは拒否する。追うと `<app_data>` の外を巻き込み、追わなければ
 ///   コピー先で壊れたリンクになる。どちらも「登録できた」と言えない
 /// - ドット始まりのエントリは読み飛ばす。リポジトリのフォルダをそのまま選んだときに
 ///   `.git` を丸ごと持ち込まないため。トリガーの動作に要るものがドット始まりになることは無い
-/// - 上限はファイル数・総バイト数・深さの 3 つ。zip を受ける口 (#55 の論点) を後から
-///   足すときも、展開先をここに通せば同じ上限がかかる
+/// - 上限はファイル数・総バイト数・ディレクトリ数・深さの 4 つ。zip を受ける口 (#55 の
+///   論点) を後から足すときも、展開先をここに通せば同じ上限がかかる
 pub(crate) fn copy_tree(src: &Path, dst: &Path) -> Result<CopyStats, String> {
     let mut stats = CopyStats::default();
     copy_dir(src, dst, 0, &mut stats)?;
@@ -163,6 +207,10 @@ pub(crate) fn copy_tree(src: &Path, dst: &Path) -> Result<CopyStats, String> {
 fn copy_dir(src: &Path, dst: &Path, depth: usize, stats: &mut CopyStats) -> Result<(), String> {
     if depth > MAX_DEPTH {
         return Err(format!("ディレクトリが深すぎます (最大 {MAX_DEPTH} 階層)"));
+    }
+    stats.dirs += 1;
+    if stats.dirs > MAX_DIRS {
+        return Err(format!("ディレクトリが多すぎます (最大 {MAX_DIRS} 個)"));
     }
     fs::create_dir_all(dst).map_err(|e| format!("{} を作成できません: {e}", dst.display()))?;
 
@@ -230,6 +278,8 @@ pub(crate) fn install_trigger(
     id: &str,
 ) -> Result<CopyStats, String> {
     validate_trigger_id(id)?;
+    // 3 手の入れ替えが終わるまで、同じ置き場に対する他の据え置き/取り外しを待たせる。
+    let _guard = lock_installs();
     let dest = installed_path(registered_dir, id);
     let staging = registered_dir.join(format!("{STAGING_PREFIX}{id}"));
     let backup = registered_dir.join(format!("{BACKUP_PREFIX}{id}"));
@@ -270,6 +320,9 @@ pub(crate) fn install_trigger(
 /// 手で消された状態からでも解除は完了させたい。**ただし戻り値は呼び出し側が見ること** —
 /// 何も消せなかったのに「解除しました」と言うと、再起動で戻ってくる。
 pub(crate) fn uninstall_trigger(dir: &Path) -> Result<bool, String> {
+    // 据え置きと同じロックを取る。入れ替えの最中に横から消されると、退避した旧版を
+    // 戻す先が消えている、という形で同じ約束が破れる。
+    let _guard = lock_installs();
     if !dir.is_dir() {
         return Ok(false);
     }
@@ -338,6 +391,20 @@ mod tests {
         }
     }
 
+    /// 登録経路の entry は「今そこにある」だけでなく「コピーを生き延びる」必要がある。
+    /// ドット始まりの下に置かれた entry は同意画面を通ってから load error になる。
+    #[test]
+    fn registered_entry_must_survive_the_copy() {
+        assert!(validate_registered_entry("index.ts").is_ok());
+        assert!(validate_registered_entry("./src/index.ts").is_ok());
+        for entry in [".hidden/index.ts", "src/.build/index.ts", ".index.ts"] {
+            assert!(
+                validate_registered_entry(entry).is_err(),
+                "{entry:?} は弾くはず"
+            );
+        }
+    }
+
     #[test]
     fn copy_tree_copies_nested_files() {
         let root = temp_dir("copy");
@@ -389,6 +456,23 @@ mod tests {
         let err = copy_tree(&src, &dst).unwrap_err();
 
         assert!(err.contains("大きすぎます"), "{err}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 総バイト数の上限は「空のディレクトリが何万個」を止められない。
+    #[test]
+    fn copy_tree_rejects_too_many_directories() {
+        let root = temp_dir("dirs");
+        let src = root.join("src");
+        write(&src.join("manifest.json"), "{}");
+        for i in 0..=MAX_DIRS {
+            fs::create_dir_all(src.join(format!("d{i}"))).unwrap();
+        }
+        let dst = root.join("dst");
+
+        let err = copy_tree(&src, &dst).unwrap_err();
+
+        assert!(err.contains("ディレクトリが多すぎます"), "{err}");
         let _ = fs::remove_dir_all(&root);
     }
 
