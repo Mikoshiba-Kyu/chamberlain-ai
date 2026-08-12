@@ -169,6 +169,20 @@ impl TaskStore {
         self.tasks.len() != before
     }
 
+    /// あるトリガーに紐付くものを丸ごと捨てる (予定 + 展開状態)。戻り値は消した予定の件数。
+    ///
+    /// 実行時の解除 (#58) 用。孤児掃除 ([`reconcile`]) と判断は同じだが、あちらは起動時に
+    /// 「現存するトリガー集合」との差分を取るのに対し、こちらは 1 つを名指しで消す。解除は
+    /// 再起動を待たない — 外した直後に予定リストへ残っていると「消えていないのでは」と
+    /// 読めるし、due になるまで待つと最大 48h ぶん残る。
+    pub(crate) fn purge_trigger(&mut self, trigger_id: &str) -> usize {
+        let before = self.tasks.len();
+        self.tasks
+            .retain(|t| t.trigger_id.as_deref() != Some(trigger_id));
+        self.expansion.remove(trigger_id);
+        before - self.tasks.len()
+    }
+
     /// `scheduled_at <= now` なタスクを昇順で返す (リストからは消さない)。
     ///
     /// 消さない理由: 実行 → 削除 の順にすることで、実行中のクラッシュ時にタスクが残り、
@@ -777,6 +791,35 @@ mod tests {
             classify_due(&task, now, None, Duration::from_secs(120)),
             Disposition::Run { delay_ms: 0 }
         );
+    }
+
+    // ---- 名指しの解除 (#58) ----
+
+    // 解除は再起動を待たずに予定を消す。孤児掃除と違い、他のトリガーには一切触らない。
+    #[test]
+    fn purge_trigger_removes_tasks_and_boundary() {
+        let now = base();
+        let mut store = TaskStore::default();
+        store.insert(schedule_task("gone", now + HOUR));
+        store.insert(adhoc_task(Some("gone"), now));
+        store.insert(schedule_task("alive", now + HOUR));
+        for id in ["gone", "alive"] {
+            store.expansion.insert(
+                id.into(),
+                ExpansionState {
+                    expanded_until: now + 2 * DAY,
+                    schedule: "@hourly".into(),
+                    tz: None,
+                },
+            );
+        }
+
+        assert_eq!(store.purge_trigger("gone"), 2);
+
+        assert_eq!(store.tasks.len(), 1);
+        assert_eq!(store.tasks[0].trigger_id.as_deref(), Some("alive"));
+        assert!(!store.expansion.contains_key("gone"));
+        assert!(store.expansion.contains_key("alive"));
     }
 
     // ---- 起動時突き合わせ ----

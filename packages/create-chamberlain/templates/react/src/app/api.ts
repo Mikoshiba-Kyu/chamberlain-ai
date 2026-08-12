@@ -26,6 +26,16 @@ export interface ActivityEvent {
   scheduledAt?: number;
 }
 
+/**
+ * トリガーの出どころ (#58)。
+ *
+ * `"bundled"` = アプリに焼き込まれたもの (エージェント開発者のもの)。
+ * `"registered"` = 実行時に `<app_data>/triggers/` へ登録されたもの。
+ *
+ * エンドユーザーが外せるのは後者だけ。「アプリの形」と「秘書にさせる仕事」の線引き。
+ */
+export type TriggerSource = "bundled" | "registered";
+
 export interface TriggerListItem {
   id: string;
   name: string;
@@ -62,6 +72,31 @@ export interface TriggerListItem {
    * 実行時登録 (#55) の同意画面はこの 2 つを見せる。
    */
   allowedHosts: string[];
+  /** 焼き込みか実行時登録か (#58)。解除できるのは `"registered"` だけ。 */
+  source: TriggerSource;
+}
+
+/**
+ * 登録しようとしているトリガーの下見 (#58)。**同意画面に出す内容そのもの。**
+ *
+ * `requiredSecrets` / `allowedHosts` は core が実際に強制している宣言なので (#56 / #57)、
+ * ここに出た以上のことはそのトリガーにはできない。
+ */
+export interface TriggerCandidate {
+  /** 選ばれたフォルダの絶対パス。`registerTrigger()` にそのまま渡す。 */
+  path: string;
+  id: string;
+  name: string;
+  description: string | null;
+  schedule: string;
+  tz: string | null;
+  requiredSecrets: string[];
+  allowedHosts: string[];
+  /**
+   * 同じ id が既にある場合の相手。`"bundled"` は登録できない (同梱トリガーは
+   * 乗っ取らせない)、`"registered"` は置き換え = 配布物の更新になる。
+   */
+  conflict: TriggerSource | null;
 }
 
 /**
@@ -127,6 +162,29 @@ export const chamberlainApi = {
    * 復活することはない (#26 決定事項 3)。
    */
   deleteTask: (id: string) => invoke<void>("delete_task", { id }),
+
+  /**
+   * フォルダを選ばせて中身を下見する (#58)。**この時点では何も入らない。**
+   *
+   * ダイアログは core が Rust 側で開く (フロントに dialog プラグインを足さないため)。
+   * キャンセルは `null`、トリガーとして読めないフォルダは reject。
+   */
+  pickTriggerFolder: () => invoke<TriggerCandidate | null>("pick_trigger_folder"),
+  /**
+   * 下見したフォルダを実際に取り込む。**反映は再起動から** (#58)。
+   *
+   * 同じ id の登録済みトリガーがあれば置き換わる。同梱トリガーと衝突する場合は失敗する。
+   */
+  registerTrigger: (path: string) =>
+    invoke<TriggerCandidate>("register_trigger", { path }),
+  /**
+   * 登録されたトリガーを外す。**こちらは再起動を待たずに効く。**
+   *
+   * 積まれていた予定も同時に消える。同梱トリガーは外せない (停止はできる)。
+   */
+  unregisterTrigger: (id: string) => invoke<void>("unregister_trigger", { id }),
+  /** アプリを再起動する。登録を反映させるための口 (#58)。 */
+  restartApp: () => invoke<void>("restart_app"),
 
   listDeclaredSecrets: () => invoke<DeclaredSecretItem[]>("list_declared_secrets"),
   hasSecret: (name: string) => invoke<boolean>("has_secret", { name }),

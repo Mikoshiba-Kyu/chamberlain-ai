@@ -18,7 +18,7 @@ Chamberlain には常に 3 種類の役割が登場する。「ユーザー」�
 
 - **フレームワーク開発者** — Chamberlain 本体を作る人。現時点では我々。`packages/core` を触る
 - **エージェント開発者** — Chamberlain を使って秘書エージェントアプリを作る人。create-chamberlain (予定) のユーザー。`examples/react` を雛形として自分のアプリを組み立てる
-- **エンドユーザー** — エージェント開発者が配布した秘書アプリを使う人。UI やロジックは変えられない
+- **エンドユーザー** — エージェント開発者が配布した秘書アプリを使う人。**UI は変えられない。仕事は増やせる** — トリガーを実行時に入れ外しできる (#55 / #58)。「アプリの形」はエージェント開発者のもの、「秘書にさせる仕事」はエンドユーザーのもの、という線引き
 
 以降のドキュメントと Issue ではこの 3 語で明示的に呼び分ける。
 
@@ -252,7 +252,9 @@ discovery でのバリデーション:
 
 突き合わせには **discovery で見えている全トリガー**を渡す (ロードに失敗したものも含む)。ロード失敗は一時的なこともあり、それだけで展開済み境界や積まれたタスクを破棄すると「1 回のビルド事故でスケジュールの記憶が消える」ことになる。
 
-猶予窓は設けない。Mastra の `missesBeforeDelete` は「デプロイ順序でスケジューラがワークフロー登録より先に回る」レース対策だが、Chamberlain の `discover_triggers()` は起動時 1 回で確定するのでこのレースが存在しない。
+猶予窓は設けない。Mastra の `missesBeforeDelete` は「デプロイ順序でスケジューラがワークフロー登録より先に回る」レース対策だが、Chamberlain のトリガー集合は**起動時 1 回で確定する**のでこのレースが存在しない。
+
+実行時登録 (#58) が入ってもこの前提は保たれる。**登録の反映は再起動から**であり、走っているプロセスにトリガーが増えることはない。逆向き (解除) は再起動を待たずに効くが、そちらは「消えたトリガーの予定を捨てる」方向なので、猶予窓が守ろうとしている「まだ登録されていないトリガーの予定を捨ててしまう」レースには当たらない。しかも解除は予定を名指しで片付ける (`TaskStore::purge_trigger`) ので、孤児掃除に拾わせてすらいない。
 
 ### 猶予超過の掃除 (#50 / #53)
 
@@ -315,11 +317,53 @@ dev モードは compile-time feature ではなく env-var 単独判定。「本
 
 起動時に `triggers/*/manifest.json` を走査し、各パッケージから `id`, `entry` を得る。同一の rustyscript Runtime に N モジュールをロードして保持する (V8 isolate は 1 つだけ)。
 
-トリガーディレクトリの位置は Tauri の resource dir 経由で解決する (#19)。エージェント開発者の `tauri.conf.json` に `bundle.resources: { "../triggers/": "triggers/" }` を宣言してもらうと、`tauri-build` (build.rs) が dev では `target/{debug,release}/triggers/` に、shipped では platform ごとの resource dir (Windows: exe と同居 / Linux: `/usr/lib/{name}/` or `${APPDIR}/usr/lib/{name}/` / macOS: `{name}.app/Contents/Resources/`) にコピーする。core は `app.path().resolve("triggers", BaseDirectory::Resource)` で常に統一的に解決する。エージェント開発者の app crate 側には dev/shipped の分岐コードが要らない。
+走査元は **2 つある** (#58)。
+
+| ソース | 位置 | 誰のものか |
+|---|---|---|
+| 焼き込み | resource dir (`bundle.resources` 経由) | エージェント開発者。エンドユーザーは外せない |
+| 実行時登録 | `<app_data>/triggers/` | エンドユーザー。UI から入れ外しできる |
+
+**discovery から先は出どころで区別しない。** manifest の検証も、`requiredSecrets` / `allowedHosts` の強制 (#56 / #57) も同じ経路を通る。「焼き込みなら何でもできる」という例外を作ると、焼き込みを偽装する経路が価値を持ってしまう。
+
+`id` が衝突したら**焼き込みが勝つ**。アプリに同梱された「そのアプリらしさ」を後から乗っ取られないため。負けた側は黙って消さず `[config error]` として観測面に残す。登録の入口が同じ衝突を先に弾くので、ここに落ちてくるのは「アプリの更新で同じ id の焼き込みが後から増えた」場合が主になる。
+
+焼き込みトリガーディレクトリの位置は Tauri の resource dir 経由で解決する (#19)。エージェント開発者の `tauri.conf.json` に `bundle.resources: { "../triggers/": "triggers/" }` を宣言してもらうと、`tauri-build` (build.rs) が dev では `target/{debug,release}/triggers/` に、shipped では platform ごとの resource dir (Windows: exe と同居 / Linux: `/usr/lib/{name}/` or `${APPDIR}/usr/lib/{name}/` / macOS: `{name}.app/Contents/Resources/`) にコピーする。core は `app.path().resolve("triggers", BaseDirectory::Resource)` で常に統一的に解決する。エージェント開発者の app crate 側には dev/shipped の分岐コードが要らない。
 
 Runtime は V8 の thread affinity を守るため、専用の `std::thread` に閉じ込める。tokio 側からは `std::sync::mpsc` で tick 信号を送るだけ。JS 実行は常にこの 1 スレッド上で直列に行われる。
 
 失敗は隔離される: 1トリガーの load / instantiate / tick() が失敗しても、そのトリガーだけスキップされ、他は続行する。エラーは activity ストリームに `[error]` / `[load error]` / `[instantiate error]` プレフィックス付きで emit される。
+
+### トリガーの実行時登録 (#58 / #55)
+
+エンドユーザーが秘書に仕事を増やせるようにするための機構。**受け取り口は「UI からフォルダを選ぶ」1 本**にした。フォルダを直接置くだけ (実装ゼロ) では配布のたびに手順の説明が要り、zip は検証すべきものが増える割に、社内配布なら共有ドライブのフォルダを指させれば足りる。口を 1 本に絞ってあるので、zip は必要になってから同じ入口の手前に足せる。
+
+```
+[選ぶ] pick_trigger_folder ──▶ [見せる] 同意画面 ──▶ [入れる] register_trigger ──▶ [再起動]
+        manifest を検証して            宣言をそのまま         <app_data>/triggers/<id>/
+        宣言を返すだけ (副作用なし)      表示して確認をとる      へコピー
+```
+
+**同意画面に出すのは manifest の宣言そのもの** (`requiredSecrets` / `allowedHosts`)。#56 / #57 で宣言が強制力を持っているので、ここに出た文字列と実際の制限は一致する。順序が逆 (強制の無い宣言を見せるだけ) だとセキュリティシアターになるため、#58 は #56 / #57 の後に置いた。何も宣言していないトリガーは「鍵もネットワークも使いません」と明示する — 空欄だと「制限なし」と逆に読まれる。
+
+登録側の門番 (`crate::registry`) は 3 つ。**フォルダの中身は「他人が書いたもの」でありうる**ことが前提にある ((a) 外部の生成 AI / (b) 配布元 / (c) 秘書自身)。
+
+- **id** — コピー先のディレクトリ名になるので ASCII 英数と `-` `_` だけに絞る。予約語 (`__meta__` / `__task__`) も弾く
+- **entry** — V8 が読むファイルのパスになるので、トリガーのディレクトリ内の相対パスに限る。こちらは**焼き込みにも適用する** (例外を作れば偽装が価値を持つ)
+- **コピー** — ファイル数 / 総バイト数 / 深さに上限。シンボリックリンクは拒否 (追えば `<app_data>` の外を巻き込む)。ドット始まりは読み飛ばす (リポジトリのフォルダをそのまま選んでも `.git` を持ち込まない)
+
+コピーは staging ディレクトリ (`.staging-<id>`) へ書いてから rename で入れ替える。途中でプロセスが落ちても半端な中身が `<id>` の名前で見えることはなく、残骸は discovery がドット始まりとして読み飛ばす。
+
+**登録と解除は非対称である。**
+
+| | 反映 | 理由 |
+|---|---|---|
+| 登録 | **再起動から** | discovery が起動時 1 回で確定する前提を守る (上記[起動時の突き合わせ](#起動時の突き合わせ-26-決定事項-7--追加決定-9))。ホットリロードは V8 の再初期化と state 継続性を巻き込むので分ける |
+| 解除 | **即時** | 「外したのにまだ動く」は「入れたのにまだ動かない」より実害が大きい |
+
+解除は in-memory のトリガーに `unregistered` フラグを立てて、心拍・一覧・手動実行の全経路から外す。あわせて積まれていた予定 (`TaskStore::purge_trigger`) とトリガー state を捨て、ディレクトリを消す。JS モジュールは V8 にロードされたまま残るが、そこへ到達する経路が無くなる。**同梱トリガーは外せない** (停止はできる)。
+
+フォルダ選択のダイアログは Rust 側 (`tauri-plugin-dialog`) から開く。フロントに dialog プラグインを足さずに済み、エージェント開発者の capability 宣言も増えない — UI が持つのは invoke だけ、という既存の形を崩さない。
 
 ### Task store
 
@@ -354,6 +398,13 @@ Tauri の `TrayIconBuilder`。メニュー: Open Chamberlain / Send test notific
 - `list_triggers() -> Vec<TriggerListItem>` — 起動時に discover したトリガーを UI 表示用に返す。`nextFireAt` は**タスクリストの投影**であり、framework が別に持っている「次回発火予定」ではない
 - `pause_trigger(id: String)` / `resume_trigger(id: String)`
 - `run_trigger_now(id: String)` — 今すぐ 1 回実行する (#20 を #26 Phase 1 に吸収)。実装は「即 due な ad-hoc タスクを 1 件積んで心拍を起こす」。ad-hoc タスクは展開済み境界を触らないので、手動実行が定期スケジュールを乱すことはない
+
+実行時登録 (#58):
+
+- `pick_trigger_folder() -> Option<TriggerCandidate>` — フォルダを選ばせて manifest を検証し、宣言を返す。**副作用なし** (キャンセルは `None`)
+- `register_trigger(path: String) -> TriggerCandidate` — 同意が取れたフォルダを `<app_data>/triggers/<id>/` へ取り込む。**反映は再起動から**。UI の言うことは信じず検証をやり直す
+- `unregister_trigger(id: String)` — 登録されたトリガーを外す。**即時**に効き、積まれていた予定と state も消える。同梱トリガーには使えない
+- `restart_app()` — 登録を反映させるための再起動。常駐アプリは「閉じても終わらない」ので、手で落とし直させない
 
 タスクリスト (#26):
 
@@ -404,10 +455,10 @@ Chrome 拡張 / VS Code 拡張 / npm package と同じ mental model。単一フ�
 
 Rust 側で `serde_json` によりパース。unknown フィールドは silently 無視される (serde デフォルト)。
 
-- `id` (必須) — namespace キー、activity source、UI 表示に使う。alphabetical で execution order が決まる。重複した場合は先勝ちで後発をスキップ + stderr log。予約語 `__meta__` は使えない (framework 内部用)
+- `id` (必須) — namespace キー、activity source、UI 表示に使う。alphabetical で execution order が決まる。重複した場合は先勝ちで後発をスキップ + stderr log (焼き込みと実行時登録で重複した場合は焼き込みが勝つ、#58)。予約語 `__meta__` は使えない (framework 内部用)。**実行時に登録するトリガー**はディレクトリ名になるため更に厳しく、ASCII 英数と `-` `_` のみ・`__task__` も予約語
 - `name` (必須) — UI に表示する人間可読名
 - `description` (任意) — UI 詳細表示用
-- `entry` (必須) — パッケージ dir 相対のエントリスクリプトパス。通常は `"index.ts"`
+- `entry` (必須) — パッケージ dir 相対のエントリスクリプトパス。通常は `"index.ts"`。**パッケージ dir の外を指すものは構成エラー**として実行対象から外れる (#58)。V8 に読ませるファイルを決める値なので、焼き込みにも同じ検証がかかる
 - `schedule` (必須) — 発火時刻の生成規則。`@` 始まりのみ。`"@hourly"` / `"@hourly :45"` / `"@every 10m"` / `"@daily 09:00"` / `"@weekly MON 09:00"` / `"@monthly 15 09:00"` / `"@at 2026-08-01T18:30"` (詳細は [schedule DSL](#schedule-dsl-26-決定事項-4--5) 節)。**0.2.0 で interval 形式 (`"5m"` / `"1h"`) は廃止された**
 - `tz` (任意) — IANA TZ 名 (例: `"Asia/Tokyo"`)。省略時は OS の user local を [`iana_time_zone`] で解決 (#18)
 - `requiredSecrets` (任意) — このトリガーが `chamberlain.getSecret(name)` で読む secret 名一覧。Settings UI が「未設定です」の表示に使う (#13) と同時に、**実行時にこの宣言の外の名前を拒否する** (#56、[トリガーの権限](#トリガーの権限-56--57) 節)
@@ -618,7 +669,7 @@ schedule 由来タスクの id は `{trigger_id}@{scheduled_at}` で決定的に
 - Windows: `%APPDATA%\<identifier>\`
 - macOS: `~/Library/Application Support/<identifier>/`
 
-`<identifier>` は `tauri.conf.json` の `identifier` (現状 `dev.chamberlain.interval-notifier`)。同じ場所に実行履歴の `history.db` (SQLite) も置かれる。
+`<identifier>` は `tauri.conf.json` の `identifier` (現状 `dev.chamberlain.interval-notifier`)。同じ場所に実行履歴の `history.db` (SQLite) と、実行時登録されたトリガーの `triggers/` (#58) も置かれる。`triggers/` は起動時に必ず作られる — 空でもそこにあること自体が「フォルダに直接置く」経路になる。
 
 ## 観測面 (Observability Plane)
 
@@ -745,6 +796,12 @@ AI 駆動トリガーは prompt / MD / スキーマ等のアセットを持ち�
 ### トリガーの配置とパス解決 — Tauri resource dir に統一 (#19)
 
 `tauri.conf.json` の `bundle.resources` で `../triggers/` を宣言し、runtime は `app.path().resolve("triggers", BaseDirectory::Resource)` で解決。dev/shipped の分岐が消え、エージェント開発者の main.rs から `env!("CARGO_MANIFEST_DIR")` ハックが消えた。0.x publish 前に API 表面を薄くするため `ChamberlainConfig` を撤去し、`builder()` は引数なしに単純化した。
+
+### 実行時登録 — 受け取り口はフォルダ選択 1 本、反映は再起動 (#58)
+
+トリガーの供給元を 3 つ (自分で書く / 誰かのものを入れる / 秘書に頼む) 同時に開く機構として、discovery を 2 ソースにした。難しいのは配管ではなく安全側で、そちらは #56 / #57 で先に片付いている — この Issue が足したのは受け取り口と同意画面だけである。
+
+「登録したら再起動」で割り切ったのは、ホットリロードを同時に解こうとすると V8 の再初期化と state 継続性を巻き込むため。おかげで「`discover_triggers()` は起動時 1 回で確定する」という前提が保たれ、猶予窓を採らない判断 (#26) がそのまま生き残った。
 
 ### 既知の gotcha
 

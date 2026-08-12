@@ -129,6 +129,7 @@ export function App() {
             triggers={triggers}
             onToggle={toggleTrigger}
             onRunNow={runTriggerNow}
+            onChanged={refresh}
           />
         )}
         {active === "tasks" && (
