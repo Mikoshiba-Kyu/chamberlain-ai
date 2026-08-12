@@ -12,6 +12,7 @@ mod worker;
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -881,7 +882,10 @@ struct TauriHost {
     app: AppHandle,
     runtime: rustyscript::Runtime,
     /// ロードに成功したトリガーのモジュール。起動時に 1 回作られ、以後変わらない。
-    loaded: BTreeMap<String, rustyscript::ModuleHandle>,
+    ///
+    /// `Rc` なのは [`Self::run_js`] が `runtime` だけを貸すため。ハンドルを先に手元へ
+    /// 取り出す必要があり、`ModuleHandle` の実体はモジュールのソースを抱えている。
+    loaded: BTreeMap<String, Rc<rustyscript::ModuleHandle>>,
     history: HistoryRef,
     /// JS 実行 1 回の予算を見張る番犬 (#59)。`runtime` の isolate を外から止めるので、
     /// この構造体と寿命を揃える。
@@ -906,7 +910,10 @@ impl TauriHost {
 
     /// トリガーの JS を「そのトリガーとして」動かす (#56)。**JS を動かす経路は必ずここを
     /// 通す** — 通さない経路は実行文脈の外になり、その JS からは何も読めなくなる。
-    /// 実際に JS を回すのは内側の [`Watchdog::guard`] で、こちらは誰として動かすかを持つ。
+    ///
+    /// 閉包に貸すのが `&mut Self` ではなく Runtime だけなのはそのため。`Self` を貸すと
+    /// 中から `self.runtime.call_function()` が書けてしまい、実行文脈にも番犬 (#59) にも
+    /// 掛からない経路が型の上で作れる。ここを通ることは doc の約束ではなく借用の帰結にする。
     ///
     /// 呼び出し元の識別を JS 側に名乗らせると自己申告になるので、Rust 側が実行の前後で
     /// 現在のトリガーを立てる。op はこれを見て manifest の宣言と突き合わせる。
@@ -915,9 +922,18 @@ impl TauriHost {
     /// ここで回収して観測面に流す (`[denied]` / `[ai]`)。帰属先を持たない記録
     /// (= run_js を通らない経路から来たもの) は、今動かしているトリガーのせいにせず
     /// framework 側 (`__meta__`) に付ける。誤った帰属は観測面としては無いより悪い。
-    fn run_js<R>(&mut self, trigger_id: &str, f: impl FnOnce(&mut Self) -> R) -> R {
+    fn run_js<T>(
+        &mut self,
+        trigger_id: &str,
+        f: impl FnOnce(&mut rustyscript::Runtime) -> Result<T, rustyscript::Error>,
+    ) -> Result<T, String> {
         self.with_permissions(|p| p.enter(trigger_id));
-        let result = f(self);
+        let result = {
+            let Self {
+                runtime, watchdog, ..
+            } = self;
+            watchdog.guard(runtime, f)
+        };
         for op_activity in self.with_permissions(|p| p.leave()) {
             let source = op_activity
                 .trigger_id
@@ -947,23 +963,11 @@ impl WorkerHost for TauriHost {
     ) -> Result<Option<TickResult>, String> {
         // 未ロードの判定は run_js の外で済ませる。中で早期 return すると
         // enter したまま leave されない経路ができる。
-        if !self.is_loaded(trigger_id) {
+        let Some(handle) = self.loaded.get(trigger_id).cloned() else {
             return Err(format!("trigger '{trigger_id}' is not loaded"));
-        }
-        self.run_js(trigger_id, |host| {
-            // runtime (可変借用) と loaded / watchdog (不変借用) を同時に使うため
-            // フィールドを分解する。
-            let Self {
-                runtime,
-                loaded,
-                watchdog,
-                ..
-            } = host;
-            // 直前の is_loaded で存在を確認済み。
-            let handle = &loaded[trigger_id];
-            watchdog.guard(runtime, |rt| {
-                rt.call_function(Some(handle), "tick", rustyscript::json_args!(ctx))
-            })
+        };
+        self.run_js(trigger_id, |rt| {
+            rt.call_function(Some(&handle), "tick", rustyscript::json_args!(ctx))
         })
     }
 
@@ -1019,14 +1023,15 @@ fn spawn_trigger_worker(
     let schedule_grace = tick_interval * SCHEDULE_GRACE_TICKS;
 
     std::thread::spawn(move || {
-        let mut runtime = match rustyscript::Runtime::new(rustyscript::RuntimeOptions {
-            extensions: vec![secrets::chamberlain_ops::init()],
-            // 非同期の待ち (解決しない Promise / 返らない fetch) を切る側 (#59)。
-            // 同期の無限ループはこれでは切れないので、番犬を別に立てる。
-            timeout: JS_BUDGET,
-            ..Default::default()
-        }) {
-            Ok(r) => r,
+        // 予算 (#59) 付きで立てる。止め方 2 通りが一組で入ることは guarding 側の責任。
+        let (mut runtime, watchdog) = match Watchdog::guarding(
+            JS_BUDGET,
+            rustyscript::RuntimeOptions {
+                extensions: vec![secrets::chamberlain_ops::init()],
+                ..Default::default()
+            },
+        ) {
+            Ok(pair) => pair,
             Err(e) => {
                 eprintln!("failed to init JS runtime: {e}");
                 return;
@@ -1043,13 +1048,6 @@ fn spawn_trigger_worker(
             op_state.put(secrets_service);
             op_state.put(TriggerPermissions::new(build_grants(&triggers)));
         }
-
-        // 番犬は Runtime を host に渡す前に isolate の handle を取る (#59)。handle は
-        // Send なので、番犬スレッドから同期の無限ループを外して止められる。
-        let watchdog = Watchdog::spawn(
-            JS_BUDGET,
-            runtime.deno_runtime().v8_isolate().thread_safe_handle(),
-        );
 
         let mut host = TauriHost {
             app: app_for_worker,
@@ -1085,16 +1083,9 @@ fn spawn_trigger_worker(
             // load_module はモジュールのトップレベルを実行する = JS が動く。宣言を正しく
             // 書いたトリガーが初期化時に自分の secret を読めるよう、ここも実行文脈に含める。
             // 含めなくても既定拒否で安全側には倒れるが、正しいトリガーが理由の分かりにくい
-            // [denied] を踏むことになる。
-            let loaded = host.run_js(&t.manifest.id, |host| {
-                let TauriHost {
-                    runtime, watchdog, ..
-                } = host;
-                // トップレベルにも予算をかける (#59)。ここで回らないと、無限ループを
-                // 書いたトリガー 1 つで**起動そのもの**が返ってこなくなる。
-                watchdog.guard(runtime, |rt| rt.load_module(&module))
-            });
-            let handle = match loaded {
+            // [denied] を踏むことになる。予算 (#59) が掛かるのも同じ理由で、ここを外すと
+            // 無限ループを書いたトリガー 1 つで**起動そのもの**が返ってこなくなる。
+            let handle = match host.run_js(&t.manifest.id, |rt| rt.load_module(&module)) {
                 Ok(h) => h,
                 Err(e) => {
                     eprintln!("failed to instantiate trigger '{}': {e}", t.manifest.id);
@@ -1106,7 +1097,7 @@ fn spawn_trigger_worker(
                     continue;
                 }
             };
-            host.loaded.insert(t.manifest.id.clone(), handle);
+            host.loaded.insert(t.manifest.id.clone(), Rc::new(handle));
         }
 
         // 古い state の残骸を掃除してから、永続タスクリストを現在の manifest と突き合わせる。
