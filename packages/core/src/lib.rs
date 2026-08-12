@@ -7,10 +7,12 @@ mod registry;
 mod schedule;
 mod secrets;
 mod tasks;
+mod watchdog;
 mod worker;
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -35,6 +37,7 @@ use crate::registry::{
 use crate::schedule::{parse_schedule, resolve_tz, Schedule};
 use crate::secrets::SecretsService;
 use crate::tasks::{Task, TaskOrigin, TaskStore};
+use crate::watchdog::Watchdog;
 use crate::worker::{
     heartbeat, lock_tasks, reconcile_at_startup, TickResult, TriggerSpec, WorkerHost, WorkerState,
 };
@@ -59,8 +62,29 @@ const TICK_INTERVAL_DEV: Duration = Duration::from_secs(10);
 /// トレードオフ: 1 つのトリガーの `tick()` が猶予より長くブロックすると、その間に due に
 /// なった別タスクが次の心拍で破棄される。JS は単一スレッドで直列実行されるためこれは
 /// 構造的な帰属で、猶予を伸ばして誤魔化すより「トリガーを長時間ブロックさせない」で
-/// 対処すべき問題として扱う (同一心拍内のバッチは `now` を共有するので影響しない)。
+/// 対処する (同一心拍内のバッチは `now` を共有するので影響しない)。その「させない」の
+/// 実体が [`JS_BUDGET`] で、猶予より短く取ってあるので暴走 1 件では破棄まで至らない。
 const SCHEDULE_GRACE_TICKS: u32 = 2;
+
+/// JS 実行 1 回に与える予算 (#59)。超えたトリガーは中断され、心拍は次へ進む。
+/// 止め方が 2 通り要る理由は [`crate::watchdog`] のモジュール doc にある。
+///
+/// **値は 2 つの制約に挟まれた狭い窓から選んでいる。**
+///
+/// - 下限は `chamberlain.ai.complete` の上限 (90s)。これを下回ると、op 自身が許して
+///   いる長さの応答待ちを framework が横から殺すことになり、正常系を壊す
+/// - 上限は schedule 猶予 (prod で 120s = 心拍 1 分 × [`SCHEDULE_GRACE_TICKS`])。
+///   これを上回ると、1 つのトリガーが暴走している間に due になった**他のトリガーの
+///   予定が猶予超過で破棄される**。予算が猶予未満なら、他は遅れるだけで実行される
+///
+/// この上下関係は `the_js_budget_sits_between_its_two_constraints` で固定してある。
+/// どちらかの定数を動かすと窓が閉じてそこで気づく。
+///
+/// 窓が狭いことは、そもそも 1 tick に AI 呼び出しを何度も積むトリガーが構造的に
+/// 苦しいことを意味する。上の保証も暴走 1 件まで — 同一心拍で複数が暴走すれば
+/// 予算 × 件数まで伸びる。dev (心拍 10 秒 = 猶予 20 秒) でも成り立たないが、
+/// dev で予定が流れることは実害として扱わない。
+const JS_BUDGET: Duration = Duration::from_secs(110);
 
 const STATE_STORE_FILE: &str = "triggers-state.json";
 
@@ -858,8 +882,14 @@ struct TauriHost {
     app: AppHandle,
     runtime: rustyscript::Runtime,
     /// ロードに成功したトリガーのモジュール。起動時に 1 回作られ、以後変わらない。
-    loaded: BTreeMap<String, rustyscript::ModuleHandle>,
+    ///
+    /// `Rc` なのは [`Self::run_js`] が `runtime` だけを貸すため。ハンドルを先に手元へ
+    /// 取り出す必要があり、`ModuleHandle` の実体はモジュールのソースを抱えている。
+    loaded: BTreeMap<String, Rc<rustyscript::ModuleHandle>>,
     history: HistoryRef,
+    /// JS 実行 1 回の予算を見張る番犬 (#59)。`runtime` の isolate を外から止めるので、
+    /// この構造体と寿命を揃える。
+    watchdog: Watchdog,
 }
 
 impl TauriHost {
@@ -881,6 +911,10 @@ impl TauriHost {
     /// トリガーの JS を「そのトリガーとして」動かす (#56)。**JS を動かす経路は必ずここを
     /// 通す** — 通さない経路は実行文脈の外になり、その JS からは何も読めなくなる。
     ///
+    /// 閉包に貸すのが `&mut Self` ではなく Runtime だけなのはそのため。`Self` を貸すと
+    /// 中から `self.runtime.call_function()` が書けてしまい、実行文脈にも番犬 (#59) にも
+    /// 掛からない経路が型の上で作れる。ここを通ることは doc の約束ではなく借用の帰結にする。
+    ///
     /// 呼び出し元の識別を JS 側に名乗らせると自己申告になるので、Rust 側が実行の前後で
     /// 現在のトリガーを立てる。op はこれを見て manifest の宣言と突き合わせる。
     ///
@@ -888,9 +922,18 @@ impl TauriHost {
     /// ここで回収して観測面に流す (`[denied]` / `[ai]`)。帰属先を持たない記録
     /// (= run_js を通らない経路から来たもの) は、今動かしているトリガーのせいにせず
     /// framework 側 (`__meta__`) に付ける。誤った帰属は観測面としては無いより悪い。
-    fn run_js<R>(&mut self, trigger_id: &str, f: impl FnOnce(&mut Self) -> R) -> R {
+    fn run_js<T>(
+        &mut self,
+        trigger_id: &str,
+        f: impl FnOnce(&mut rustyscript::Runtime) -> Result<T, rustyscript::Error>,
+    ) -> Result<T, String> {
         self.with_permissions(|p| p.enter(trigger_id));
-        let result = f(self);
+        let result = {
+            let Self {
+                runtime, watchdog, ..
+            } = self;
+            watchdog.guard(runtime, f)
+        };
         for op_activity in self.with_permissions(|p| p.leave()) {
             let source = op_activity
                 .trigger_id
@@ -920,19 +963,11 @@ impl WorkerHost for TauriHost {
     ) -> Result<Option<TickResult>, String> {
         // 未ロードの判定は run_js の外で済ませる。中で早期 return すると
         // enter したまま leave されない経路ができる。
-        if !self.is_loaded(trigger_id) {
+        let Some(handle) = self.loaded.get(trigger_id).cloned() else {
             return Err(format!("trigger '{trigger_id}' is not loaded"));
-        }
-        self.run_js(trigger_id, |host| {
-            // runtime (可変借用) と loaded (不変借用) を同時に使うためフィールドを分解する。
-            let Self {
-                runtime, loaded, ..
-            } = host;
-            // 直前の is_loaded で存在を確認済み。
-            let handle = &loaded[trigger_id];
-            runtime
-                .call_function(Some(handle), "tick", rustyscript::json_args!(ctx))
-                .map_err(|e| e.to_string())
+        };
+        self.run_js(trigger_id, |rt| {
+            rt.call_function(Some(&handle), "tick", rustyscript::json_args!(ctx))
         })
     }
 
@@ -988,11 +1023,15 @@ fn spawn_trigger_worker(
     let schedule_grace = tick_interval * SCHEDULE_GRACE_TICKS;
 
     std::thread::spawn(move || {
-        let mut runtime = match rustyscript::Runtime::new(rustyscript::RuntimeOptions {
-            extensions: vec![secrets::chamberlain_ops::init()],
-            ..Default::default()
-        }) {
-            Ok(r) => r,
+        // 予算 (#59) 付きで立てる。止め方 2 通りが一組で入ることは guarding 側の責任。
+        let (mut runtime, watchdog) = match Watchdog::guarding(
+            JS_BUDGET,
+            rustyscript::RuntimeOptions {
+                extensions: vec![secrets::chamberlain_ops::init()],
+                ..Default::default()
+            },
+        ) {
+            Ok(pair) => pair,
             Err(e) => {
                 eprintln!("failed to init JS runtime: {e}");
                 return;
@@ -1015,6 +1054,7 @@ fn spawn_trigger_worker(
             runtime,
             loaded: BTreeMap::new(),
             history,
+            watchdog,
         };
 
         // 起動時に全モジュールをロード。ロード失敗したものはスキップ (他トリガーは動く)。
@@ -1043,21 +1083,21 @@ fn spawn_trigger_worker(
             // load_module はモジュールのトップレベルを実行する = JS が動く。宣言を正しく
             // 書いたトリガーが初期化時に自分の secret を読めるよう、ここも実行文脈に含める。
             // 含めなくても既定拒否で安全側には倒れるが、正しいトリガーが理由の分かりにくい
-            // [denied] を踏むことになる。
-            let loaded = host.run_js(&t.manifest.id, |host| host.runtime.load_module(&module));
-            let handle = match loaded {
+            // [denied] を踏むことになる。予算 (#59) が掛かるのも同じ理由で、ここを外すと
+            // 無限ループを書いたトリガー 1 つで**起動そのもの**が返ってこなくなる。
+            let handle = match host.run_js(&t.manifest.id, |rt| rt.load_module(&module)) {
                 Ok(h) => h,
                 Err(e) => {
                     eprintln!("failed to instantiate trigger '{}': {e}", t.manifest.id);
                     host.activity(Activity::new(
                         &t.manifest.id,
                         ActivityKind::InstantiateError,
-                        e.to_string(),
+                        e,
                     ));
                     continue;
                 }
             };
-            host.loaded.insert(t.manifest.id.clone(), handle);
+            host.loaded.insert(t.manifest.id.clone(), Rc::new(handle));
         }
 
         // 古い state の残骸を掃除してから、永続タスクリストを現在の manifest と突き合わせる。
@@ -1756,6 +1796,21 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// JS の予算は 2 つの定数に挟まれている (#59)。どちらかを動かして窓が閉じたら
+    /// ここで気づく — 気づかないと「正常な AI 応答を殺す」か「暴走 1 件が他トリガーの
+    /// 予定を落とす」のどちらかが静かに戻る。根拠は [`JS_BUDGET`] の doc。
+    #[test]
+    fn the_js_budget_sits_between_its_two_constraints() {
+        assert!(
+            JS_BUDGET > Duration::from_secs(ai::ANTHROPIC_TIMEOUT_SECS),
+            "予算が ai.complete の上限以下: op 自身が許す長さの応答待ちを横から殺す"
+        );
+        assert!(
+            JS_BUDGET < TICK_INTERVAL_PROD * SCHEDULE_GRACE_TICKS,
+            "予算が schedule 猶予以上: 暴走 1 件で他トリガーの予定が破棄される"
+        );
+    }
 
     /// discovery を通した後の [`TriggerInfo`] 相当。ファイルシステムも Tauri も要らない
     /// 部分 (取捨と可視性) だけをここで固定する。

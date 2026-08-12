@@ -25,7 +25,7 @@ pub const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// Anthropic Messages API 呼び出しの timeout。sonnet 系は通常 5–30s だが、
 /// max_tokens=4096 で長い応答を吐くと 60s 近くまで伸びるので 90s を上限にする。
 /// これが無いと API 側の hang で worker の tick 全体が引きずられる (Issue #21 #2)。
-const ANTHROPIC_TIMEOUT_SECS: u64 = 90;
+pub(crate) const ANTHROPIC_TIMEOUT_SECS: u64 = 90;
 
 /// Anthropic 用の reqwest Client を 1 個だけ持ち、connection pool と TLS session を
 /// 使い回す (呼び出しごとに作ると TLS handshake が毎回走る)。build 失敗は初回参照時に
