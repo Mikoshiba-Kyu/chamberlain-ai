@@ -10,8 +10,16 @@ interface Props {
   triggers: TriggerListItem[];
   onToggle: (id: string) => void;
   onRunNow: (id: string) => void;
-  /** 登録・解除でトリガー一覧が変わったときに呼ぶ (App が取り直す)。 */
+  /** 解除でトリガー一覧が変わったときに呼ぶ (App が取り直す)。 */
   onChanged: () => void;
+  /**
+   * 登録済みだがまだ反映されていないものがあるか (#58)。
+   *
+   * **このパネルの state ではなく App が持つ。** タブを切り替えるとパネルは unmount
+   * されるので、ここに置くと「入れたのに一覧に出ず、案内も消えた」状態が作れてしまう。
+   */
+  restartPending: boolean;
+  onRegistered: () => void;
 }
 
 /** 次の予定時刻をローカル時刻で表示する。null は「積まれていない」。 */
@@ -47,7 +55,7 @@ export function formatPermissions(
 }
 
 /** トリガーの出どころのラベル (#58)。 */
-export function sourceLabel(source: TriggerSource | undefined): string {
+export function sourceLabel(source: TriggerSource): string {
   return source === "registered" ? "登録" : "同梱";
 }
 
@@ -66,9 +74,7 @@ export function formatConsentPermissions(
 }
 
 /** id が既存とぶつかっているときの注意書き。ぶつかっていなければ null。 */
-export function describeConflict(
-  conflict: TriggerSource | null | undefined,
-): string | null {
+export function describeConflict(conflict: TriggerSource | null): string | null {
   if (conflict === "bundled") {
     return "同じ id のトリガーがアプリに同梱されています。同梱された方が優先されるため、登録できません。";
   }
@@ -83,68 +89,59 @@ export function TriggersPanel({
   onToggle,
   onRunNow,
   onChanged,
+  restartPending,
+  onRegistered,
 }: Props) {
   // 下見が終わって同意待ちのトリガー。null の間は登録の口が閉じている。
   const [candidate, setCandidate] = useState<TriggerCandidate | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  // 登録は再起動で反映される (#58)。反映前の状態を画面に出しておかないと
-  // 「登録したのに一覧に出ない」と読める。
-  const [restartNeeded, setRestartNeeded] = useState(false);
   const [confirmingUnregister, setConfirmingUnregister] = useState<string | null>(
     null,
   );
 
-  const pickFolder = async () => {
+  /** 登録系の操作はどれも「二重に押させない・失敗を画面に出す」が要る。 */
+  const run = async (action: () => Promise<void>) => {
     setBusy(true);
     setError(null);
     setNotice(null);
     try {
+      await action();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const pickFolder = () =>
+    run(async () => {
       const picked = await chamberlainApi.pickTriggerFolder();
       // null = キャンセル。画面は何も変えない。
       if (picked) setCandidate(picked);
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setBusy(false);
-    }
-  };
+    });
 
-  const confirmRegister = async () => {
-    if (!candidate) return;
-    setBusy(true);
-    setError(null);
-    try {
+  const confirmRegister = () =>
+    run(async () => {
+      if (!candidate) return;
       const registered = await chamberlainApi.registerTrigger(candidate.path);
       setCandidate(null);
-      setRestartNeeded(true);
+      // 一覧は取り直さない。反映は再起動からなので、今 list_triggers を読んでも
+      // 同じものが返る (#58)。代わりに「再起動待ち」を App に預ける。
+      onRegistered();
       setNotice(`${registered.name} (${registered.id}) を登録しました。`);
-      onChanged();
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setBusy(false);
-    }
-  };
+    });
 
-  const unregister = async (id: string) => {
-    setBusy(true);
-    setError(null);
-    setNotice(null);
-    setConfirmingUnregister(null);
-    try {
+  const unregister = (id: string) =>
+    run(async () => {
+      setConfirmingUnregister(null);
       await chamberlainApi.unregisterTrigger(id);
       setNotice(`${id} を解除しました。積まれていた予定も消えています。`);
       onChanged();
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setBusy(false);
-    }
-  };
+    });
 
-  const conflictNote = describeConflict(candidate?.conflict);
+  const conflictNote = candidate ? describeConflict(candidate.conflict) : null;
 
   return (
     <section className="panel">
@@ -167,7 +164,7 @@ export function TriggersPanel({
 
       {error && <p className="error">エラー: {error}</p>}
       {notice && <p className="notice">{notice}</p>}
-      {restartNeeded && (
+      {restartPending && (
         <div className="notice notice-action">
           <span>
             登録したトリガーは再起動後に動き始めます (解除は再起動を待ちません)。
@@ -258,58 +255,15 @@ export function TriggersPanel({
                   ) : null}
                 </div>
                 <div className="trigger-status">
-                  {confirmingUnregister === t.id ? (
-                    <>
-                      <span className="status status-error">解除しますか？</span>
-                      <button
-                        className="btn"
-                        onClick={() => unregister(t.id)}
-                        disabled={busy}
-                      >
-                        解除する
-                      </button>
-                      <button
-                        className="btn"
-                        onClick={() => setConfirmingUnregister(null)}
-                      >
-                        やめる
-                      </button>
-                    </>
-                  ) : (
-                    <>
-                      {t.error ? (
-                        <span className="status status-error">構成エラー</span>
-                      ) : (
-                        <>
-                          <span
-                            className={
-                              t.paused
-                                ? "status status-paused"
-                                : "status status-running"
-                            }
-                          >
-                            {t.paused ? "停止中" : "実行中"}
-                          </span>
-                          <button className="btn" onClick={() => onRunNow(t.id)}>
-                            今すぐ実行
-                          </button>
-                          <button className="btn" onClick={() => onToggle(t.id)}>
-                            {t.paused ? "再開" : "停止"}
-                          </button>
-                        </>
-                      )}
-                      {/* 外せるのは登録したものだけ。同梱は「アプリの形」の一部 (#55)。 */}
-                      {t.source === "registered" && (
-                        <button
-                          className="btn"
-                          onClick={() => setConfirmingUnregister(t.id)}
-                          disabled={busy}
-                        >
-                          解除
-                        </button>
-                      )}
-                    </>
-                  )}
+                  <TriggerActions
+                    trigger={t}
+                    busy={busy}
+                    confirming={confirmingUnregister === t.id}
+                    onToggle={onToggle}
+                    onRunNow={onRunNow}
+                    onAskUnregister={setConfirmingUnregister}
+                    onUnregister={unregister}
+                  />
                 </div>
               </li>
             );
@@ -317,5 +271,81 @@ export function TriggersPanel({
         </ul>
       )}
     </section>
+  );
+}
+
+interface ActionsProps {
+  trigger: TriggerListItem;
+  busy: boolean;
+  /** 解除の確認待ちか。確認中は他の操作を出さない (押し間違いを防ぐ)。 */
+  confirming: boolean;
+  onToggle: (id: string) => void;
+  onRunNow: (id: string) => void;
+  onAskUnregister: (id: string | null) => void;
+  onUnregister: (id: string) => void;
+}
+
+/**
+ * 行の右側。状態は「解除の確認中 / 構成エラー / 通常」の 3 つで、互いに排他なので
+ * 早期 return で並べる (入れ子の三項演算子にすると 4 つ目を足せなくなる)。
+ */
+function TriggerActions({
+  trigger: t,
+  busy,
+  confirming,
+  onToggle,
+  onRunNow,
+  onAskUnregister,
+  onUnregister,
+}: ActionsProps) {
+  if (confirming) {
+    return (
+      <>
+        <span className="status status-error">解除しますか？</span>
+        <button className="btn" onClick={() => onUnregister(t.id)} disabled={busy}>
+          解除する
+        </button>
+        <button className="btn" onClick={() => onAskUnregister(null)}>
+          やめる
+        </button>
+      </>
+    );
+  }
+
+  // 外せるのは登録したものだけ。同梱は「アプリの形」の一部 (#55)。
+  const unregisterButton = t.source === "registered" && (
+    <button
+      className="btn"
+      onClick={() => onAskUnregister(t.id)}
+      disabled={busy}
+    >
+      解除
+    </button>
+  );
+
+  if (t.error) {
+    return (
+      <>
+        <span className="status status-error">構成エラー</span>
+        {unregisterButton}
+      </>
+    );
+  }
+
+  return (
+    <>
+      <span
+        className={t.paused ? "status status-paused" : "status status-running"}
+      >
+        {t.paused ? "停止中" : "実行中"}
+      </span>
+      <button className="btn" onClick={() => onRunNow(t.id)}>
+        今すぐ実行
+      </button>
+      <button className="btn" onClick={() => onToggle(t.id)}>
+        {t.paused ? "再開" : "停止"}
+      </button>
+      {unregisterButton}
+    </>
   );
 }

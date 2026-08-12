@@ -29,7 +29,8 @@ use tauri_plugin_store::StoreExt;
 use crate::history::{origin_str, Activity, ActivityKind, HistoryStore, MAX_ROWS, RETENTION};
 use crate::permissions::{parse_host_pattern, HostPattern, TriggerGrants, TriggerPermissions};
 use crate::registry::{
-    install_trigger, uninstall_trigger, validate_entry_path, validate_trigger_id, TriggerSource,
+    install_trigger, installed_path, is_reserved_id, uninstall_trigger, validate_entry_path,
+    validate_trigger_id, TriggerSource,
 };
 use crate::schedule::{parse_schedule, resolve_tz, Schedule};
 use crate::secrets::SecretsService;
@@ -246,7 +247,7 @@ struct TriggerListItem {
     ///
     /// エンドユーザーが外せるのは後者だけ。「アプリの形」と「秘書にさせる仕事」の
     /// 線引きがここに現れる。
-    source: &'static str,
+    source: TriggerSource,
 }
 
 /// 登録しようとしているトリガーの下見 (#58)。**同意画面に出す内容そのもの。**
@@ -271,7 +272,7 @@ struct TriggerCandidate {
     ///
     /// `"bundled"` は登録を拒否する — アプリに同梱された「そのアプリらしさ」を後から
     /// 乗っ取られないため。`"registered"` は置き換え (配布物の更新) として通す。
-    conflict: Option<&'static str>,
+    conflict: Option<TriggerSource>,
 }
 
 /// UI が受け取るタスクリストの要素。「秘書がこれから何をするつもりか」を 1 画面で見せ、
@@ -427,19 +428,39 @@ fn remove_trigger_state(app: &AppHandle, trigger_id: &str) {
     }
 }
 
-/// 実行時登録の置き場 (`<app_data>/triggers/`) を解決して作る (#58)。
+/// 実行時登録の置き場 (`<app_data>/triggers/`)。**起動時に 1 回だけ解決して作る** (#58)。
 ///
-/// 起動時にも作る。**空でも存在していること**に意味があり、「フォルダを開いて直接置く」
-/// 経路 (#55 の受け取り口の最小形) がそこにあるだけで成立する。
-fn registered_triggers_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    let dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("app data dir を解決できません: {e}"))?
-        .join(REGISTERED_TRIGGERS_DIR);
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("{} を作成できません: {e}", dir.display()))?;
-    Ok(dir)
+/// 空でも作るのは、「フォルダを開いて直接置く」経路 (#55 の受け取り口の最小形) が
+/// そこにあるだけで成立するため。解決に失敗した環境では登録機能だけが使えなくなる
+/// (焼き込みトリガーはそのまま動く)。
+struct RegisteredDir(Option<PathBuf>);
+
+impl RegisteredDir {
+    fn resolve(app: &AppHandle) -> Self {
+        Self(match app.path().app_data_dir() {
+            Ok(base) => {
+                let dir = base.join(REGISTERED_TRIGGERS_DIR);
+                match std::fs::create_dir_all(&dir) {
+                    Ok(()) => Some(dir),
+                    Err(e) => {
+                        eprintln!("failed to create {}: {e}", dir.display());
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("failed to resolve app data dir for registered triggers: {e}");
+                None
+            }
+        })
+    }
+
+    /// 登録系コマンドから使う。解決できていない環境では理由を返して断る。
+    fn get(&self) -> Result<&Path, String> {
+        self.0
+            .as_deref()
+            .ok_or_else(|| "トリガーの置き場を用意できませんでした".to_string())
+    }
 }
 
 /// 古い state ファイルに残った `__meta__.fire_times` を掃除する。
@@ -662,9 +683,12 @@ fn discover_triggers(
             }
         };
 
-        if manifest.id == META_NAMESPACE {
+        // 予約語の一覧は [`crate::registry`] が持つ。焼き込みと実行時登録で違う名前が
+        // 通ると、片方の経路からだけ framework の記録に紛れ込める。
+        if is_reserved_id(&manifest.id) {
             eprintln!(
-                "trigger id '{META_NAMESPACE}' is reserved by framework, skipping {manifest_path:?}"
+                "trigger id '{}' is reserved by framework, skipping {manifest_path:?}",
+                manifest.id
             );
             continue;
         }
@@ -699,21 +723,11 @@ fn discover_triggers(
         });
     }
 
-    // sort → dedup の順にしないと、id 重複時にどちらが生き残るかが read_dir 順
-    // (filesystem 順) 依存で非決定になる (Issue #21 #6)。id 昇順にしてから先勝ちにすれば、
-    // 少なくとも同じ input からは同じ結果が出る。
-    result.sort_by(|a, b| a.manifest.id.cmp(&b.manifest.id));
-
-    let mut seen = HashSet::new();
-    let mut deduped: Vec<TriggerInfo> = Vec::new();
-    for t in result {
-        if seen.insert(t.manifest.id.clone()) {
-            deduped.push(t);
-        } else {
-            eprintln!("duplicate trigger id '{}', skipping", t.manifest.id);
-        }
+    let (kept, dropped) = dedupe_by_id(result);
+    for t in dropped {
+        eprintln!("duplicate trigger id '{}', skipping", t.manifest.id);
     }
-    deduped
+    kept
 }
 
 /// 2 つのソースを走査して 1 本のトリガー一覧にする (#58)。
@@ -737,7 +751,9 @@ fn discover_all(
     };
     let registered = discover_triggers(app, history, registered_dir, TriggerSource::Registered);
 
-    let (merged, shadowed) = merge_sources(bundled, registered);
+    // 焼き込みを先に並べてから同じ dedup にかける。取捨の規則 (先勝ち + id 昇順) は
+    // 1 箇所にしかない。
+    let (merged, shadowed) = dedupe_by_id(bundled.into_iter().chain(registered).collect());
     for t in shadowed {
         let message = format!(
             "同じ id の同梱トリガーがあるため、登録された方を無視しました ({})",
@@ -753,27 +769,28 @@ fn discover_all(
     merged
 }
 
-/// 2 ソースの取捨 (#58)。戻り値は (採用したもの, 焼き込みに負けたもの)。
+/// id の取捨。戻り値は (採用したもの, 落としたもの)。
 ///
-/// **焼き込みが勝つ。** discovery より後は出どころで区別しないので、ここが「同梱された
-/// トリガーは後から差し替えられない」を担保する唯一の場所になる。
-fn merge_sources(
-    bundled: Vec<TriggerInfo>,
-    registered: Vec<TriggerInfo>,
-) -> (Vec<TriggerInfo>, Vec<TriggerInfo>) {
-    let bundled_ids: HashSet<String> = bundled.iter().map(|t| t.manifest.id.clone()).collect();
-    let mut merged = bundled;
-    let mut shadowed = Vec::new();
+/// **入力の並び順が優先順位である。** 呼び出し側が先に置いたものが勝つので、2 ソースの
+/// merge では焼き込みを先に並べる (#58) — これが「同梱されたトリガーは後から差し替え
+/// られない」を担保する唯一の場所になる。
+///
+/// sort → dedup の順でないと、id 重複時にどちらが生き残るかが read_dir 順 (filesystem 順)
+/// 依存で非決定になる (Issue #21 #6)。安定ソートなので、同じ id の中では入力順が保たれる。
+fn dedupe_by_id(mut triggers: Vec<TriggerInfo>) -> (Vec<TriggerInfo>, Vec<TriggerInfo>) {
+    triggers.sort_by(|a, b| a.manifest.id.cmp(&b.manifest.id));
 
-    for t in registered {
-        if bundled_ids.contains(&t.manifest.id) {
-            shadowed.push(t);
+    let mut seen = HashSet::new();
+    let mut kept = Vec::with_capacity(triggers.len());
+    let mut dropped = Vec::new();
+    for t in triggers {
+        if seen.insert(t.manifest.id.clone()) {
+            kept.push(t);
         } else {
-            merged.push(t);
+            dropped.push(t);
         }
     }
-    merged.sort_by(|a, b| a.manifest.id.cmp(&b.manifest.id));
-    (merged, shadowed)
+    (kept, dropped)
 }
 
 /// 解除されていないトリガーだけを見る (#58)。
@@ -1136,7 +1153,7 @@ fn list_triggers(
             // 大文字や前後の空白の差で「UI に見えている文字列」と「実際に効く宣言」が
             // ずれる。ここで見せるものは強制力を持つ側と同一でなければならない。
             allowed_hosts: t.hosts.iter().map(|h| h.as_declared()).collect(),
-            source: t.source.as_str(),
+            source: t.source,
         })
         .collect()
 }
@@ -1312,10 +1329,10 @@ fn inspect_candidate(
     // 衝突判定は in-memory の一覧だけでは足りない。登録直後 (再起動前) のトリガーは
     // ディスクにあって一覧に無いので、両方見る。
     let conflict = match find_trigger(triggers, &manifest.id) {
-        Some(t) => Some(t.source.as_str()),
+        Some(t) => Some(t.source),
         None => registered_dir
-            .filter(|d| d.join(&manifest.id).is_dir())
-            .map(|_| TriggerSource::Registered.as_str()),
+            .filter(|d| installed_path(d, &manifest.id).is_dir())
+            .map(|_| TriggerSource::Registered),
     };
 
     Ok(TriggerCandidate {
@@ -1338,28 +1355,36 @@ fn inspect_candidate(
 /// ダイアログを Rust 側で開くのは、フロントに `@tauri-apps/plugin-dialog` を足さずに
 /// 済ませるため。UI が持つのは invoke だけという既存の形を崩さない。
 ///
-/// `command(async)` なのは [`blocking_pick_folder`] を main thread で呼べないため
-/// (呼ぶと固まる)。
-#[tauri::command(async)]
-fn pick_trigger_folder(
+/// ダイアログが開いている間は**そのスレッドが返らない**。ユーザーが選び終わるまで待つ
+/// 時間に上限は無いので、async runtime の worker ではなく blocking pool に逃がす
+/// (`blocking_pick_folder` は main thread からも呼べない)。
+#[tauri::command]
+async fn pick_trigger_folder(
     app: AppHandle,
     triggers: State<'_, TriggersRef>,
+    registered: State<'_, RegisteredDir>,
 ) -> Result<Option<TriggerCandidate>, String> {
-    let Some(picked) = app
-        .dialog()
-        .file()
-        .set_title("トリガーのフォルダを選ぶ")
-        .blocking_pick_folder()
-    else {
-        return Ok(None);
-    };
-    let dir = picked
-        .into_path()
-        .map_err(|e| format!("選ばれた場所を解決できません: {e}"))?;
+    let triggers = Arc::clone(&triggers);
     // 置き場が解決できない環境では衝突判定が in-memory の一覧だけになる。下見を
-    // 止めるほどではない (登録側で改めて解決し、そこで失敗する)。
-    let registered_dir = registered_triggers_dir(&app).ok();
-    inspect_candidate(&triggers, registered_dir.as_deref(), &dir).map(Some)
+    // 止めるほどではない (登録側で改めて解決し、そこで断る)。
+    let registered_dir = registered.0.clone();
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(picked) = app
+            .dialog()
+            .file()
+            .set_title("トリガーのフォルダを選ぶ")
+            .blocking_pick_folder()
+        else {
+            return Ok(None);
+        };
+        let dir = picked
+            .into_path()
+            .map_err(|e| format!("選ばれた場所を解決できません: {e}"))?;
+        inspect_candidate(&triggers, registered_dir.as_deref(), &dir).map(Some)
+    })
+    .await
+    .map_err(|e| format!("フォルダの選択に失敗しました: {e}"))?
 }
 
 /// トリガーを `<app_data>/triggers/<id>/` に取り込む (#58)。
@@ -1374,23 +1399,32 @@ fn register_trigger(
     app: AppHandle,
     path: String,
     triggers: State<'_, TriggersRef>,
+    registered: State<'_, RegisteredDir>,
     history: State<'_, HistoryRef>,
 ) -> Result<TriggerCandidate, String> {
     let src = PathBuf::from(&path);
-    let dir = registered_triggers_dir(&app)?;
-    // UI が渡してきたパスは信じず、下見と同じ検証をやり直す。
-    let candidate = inspect_candidate(&triggers, Some(&dir), &src)?;
+    let dir = registered.get()?;
+    // 下見の結果は UI が持って戻ってくるだけなので、manifest を読み直して同じ検証を
+    // やり直す (フォルダは下見の後に書き換わりうる)。**選ばれたフォルダそのものは
+    // 信じる** — 同意とパスを機構で結ぶには、core 側で発行したトークンを介す必要がある。
+    let candidate = inspect_candidate(&triggers, Some(dir), &src)?;
 
-    if candidate.conflict == Some(TriggerSource::Bundled.as_str()) {
+    if candidate.conflict == Some(TriggerSource::Bundled) {
         return Err(format!(
             "'{}' はアプリに同梱されたトリガーと同じ id です。別の id にしてください",
             candidate.id
         ));
     }
 
-    let stats = install_trigger(&src, &dir, &candidate.id)?;
+    let stats = install_trigger(&src, dir, &candidate.id)?;
 
     let replaced = candidate.conflict.is_some();
+    // 読み飛ばした数も書く。`.git` ごと選んだときに「入っていないもの」が分かる。
+    let skipped = if stats.skipped > 0 {
+        format!(" / 読み飛ばし {} 件", stats.skipped)
+    } else {
+        String::new()
+    };
     record_activity(
         &app,
         &history,
@@ -1398,7 +1432,7 @@ fn register_trigger(
             &candidate.id,
             ActivityKind::Registered,
             format!(
-                "{} ({} 個のファイル)。鍵: {} / 宛先: {}",
+                "{} ({} 個のファイル{skipped})。鍵: {} / 宛先: {}",
                 if replaced {
                     "トリガーを置き換えました"
                 } else {
@@ -1424,28 +1458,35 @@ fn unregister_trigger(
     app: AppHandle,
     id: String,
     triggers: State<'_, TriggersRef>,
+    registered: State<'_, RegisteredDir>,
     task_store: State<'_, TaskStoreRef>,
     history: State<'_, HistoryRef>,
 ) -> Result<(), String> {
     validate_trigger_id(&id)?;
-    let dir = registered_triggers_dir(&app)?;
+    let dir = registered.get()?;
 
-    // in-memory に居ないが実体はある = 登録した後まだ再起動していないもの。
-    // 「やっぱりやめる」が効かないと、間違って入れたものを再起動するまで外せない。
     let known = find_trigger(&triggers, &id);
-    match known {
-        Some(t) if t.source == TriggerSource::Bundled => {
+    if let Some(t) = known {
+        if t.source == TriggerSource::Bundled {
             return Err(format!(
                 "'{id}' はアプリに同梱されたトリガーなので外せません (停止はできます)"
-            ))
+            ));
         }
-        None if !dir.join(&id).is_dir() => return Err(format!("unknown trigger: {id}")),
-        _ => {}
     }
+
+    // 消す先は discovery が見つけた実体そのもの。id から組み立て直すと、手で置いた
+    // フォルダ (名前が id と違いうる) を「外したつもりで何も消していない」が起きる。
+    // in-memory に居ないものは登録直後 (再起動前) なので、そちらは規定の位置にある。
+    let target = known
+        .map(|t| t.dir.clone())
+        .unwrap_or_else(|| installed_path(dir, &id));
 
     // ファイルを消してから止める。逆にすると、削除に失敗したときに「一覧から消えたのに
     // 再起動で戻ってくる」状態が残る。
-    uninstall_trigger(&dir, &id)?;
+    let existed = uninstall_trigger(&target)?;
+    if known.is_none() && !existed {
+        return Err(format!("unknown trigger: {id}"));
+    }
     if let Some(t) = known {
         t.unregistered.store(true, Ordering::Relaxed);
     }
@@ -1641,20 +1682,16 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
 
             // 2 つ目の走査元: エンドユーザーが実行時に登録したトリガー (#58)。
             // 空でも作っておく — フォルダがそこにあること自体が「直接置く」経路になる。
-            let registered_dir = match registered_triggers_dir(app.handle()) {
-                Ok(d) => Some(d),
-                Err(e) => {
-                    eprintln!("registered triggers dir unavailable: {e}");
-                    None
-                }
-            };
+            // 登録系コマンドも同じ値を使い回す (解決と mkdir を毎回やり直さない)。
+            let registered_dir = RegisteredDir::resolve(app.handle());
 
             let triggers: TriggersRef = Arc::new(discover_all(
                 app.handle(),
                 &history,
                 &triggers_dir,
-                registered_dir.as_deref(),
+                registered_dir.0.as_deref(),
             ));
+            app.manage(registered_dir);
             for t in triggers.iter() {
                 eprintln!(
                     "discovered trigger: {} ({}) [{}] — entry {}, schedule '{}' tz={:?}",
@@ -1728,48 +1765,35 @@ mod tests {
     /// 衝突が無ければ両方採用され、id 昇順に並ぶ (実行順序を安定させるため)。
     #[test]
     fn both_sources_are_merged_in_id_order() {
-        let (merged, shadowed) = merge_sources(
-            vec![info("bravo", TriggerSource::Bundled)],
-            vec![
-                info("charlie", TriggerSource::Registered),
-                info("alpha", TriggerSource::Registered),
-            ],
-        );
+        let (merged, shadowed) = dedupe_by_id(vec![
+            info("bravo", TriggerSource::Bundled),
+            info("charlie", TriggerSource::Registered),
+            info("alpha", TriggerSource::Registered),
+        ]);
 
         assert_eq!(ids(&merged), vec!["alpha", "bravo", "charlie"]);
         assert!(shadowed.is_empty());
     }
 
-    /// id が衝突したら焼き込みが勝つ。アプリに同梱された「そのアプリらしさ」を後から
-    /// 乗っ取られないため (#58)。
+    /// id が衝突したら**先に並べた方**が勝つ。discover_all が焼き込みを先に置くので、
+    /// アプリに同梱された「そのアプリらしさ」は後から乗っ取られない (#58)。
     #[test]
-    fn bundled_wins_id_collisions() {
-        let (merged, shadowed) = merge_sources(
-            vec![info("greeter", TriggerSource::Bundled)],
-            vec![info("greeter", TriggerSource::Registered)],
-        );
+    fn the_first_source_wins_id_collisions() {
+        let (merged, shadowed) = dedupe_by_id(vec![
+            info("greeter", TriggerSource::Bundled),
+            info("greeter", TriggerSource::Registered),
+        ]);
 
         assert_eq!(ids(&merged), vec!["greeter"]);
         assert_eq!(merged[0].source, TriggerSource::Bundled);
         // 黙って消さない。呼び出し側が観測面に残せるよう返す。
         assert_eq!(ids(&shadowed), vec!["greeter"]);
+        assert_eq!(shadowed[0].source, TriggerSource::Registered);
     }
 
     // ---- 登録前の下見 (#58) ----------------------------------------------
 
-    /// テスト用の一時ディレクトリ (registry のテストと同じ理由で tempfile は入れない)。
-    fn temp_dir(label: &str) -> PathBuf {
-        use std::sync::atomic::AtomicU32;
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "chamberlain-inspect-{}-{label}-{n}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
+    use crate::registry::temp_dir;
 
     /// トリガーのフォルダを 1 つ作る。`manifest` はそのまま manifest.json に書く。
     fn candidate_dir(root: &Path, manifest: &str) -> PathBuf {
@@ -1872,13 +1896,13 @@ mod tests {
         let bundled = vec![info("probe", TriggerSource::Bundled)];
         assert_eq!(
             inspect_candidate(&bundled, None, &dir).unwrap().conflict,
-            Some("bundled")
+            Some(TriggerSource::Bundled)
         );
         assert_eq!(
             inspect_candidate(&[], Some(&registered), &dir)
                 .unwrap()
                 .conflict,
-            Some("registered")
+            Some(TriggerSource::Registered)
         );
         let _ = std::fs::remove_dir_all(&root);
     }

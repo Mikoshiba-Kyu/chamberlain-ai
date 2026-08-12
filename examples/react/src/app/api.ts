@@ -69,7 +69,7 @@ export interface TriggerListItem {
    * `"*.example.com"` (サブドメインのみ)。空なら一切ネットワークに出られない。
    *
    * requiredSecrets と合わせて「このトリガーは何を読み、どこへ出るのか」になる。
-   * 実行時登録 (#55) の同意画面はこの 2 つを見せる。
+   * 実行時登録 (#58) の同意画面はこの 2 つを見せる。
    */
   allowedHosts: string[];
   /** 焼き込みか実行時登録か (#58)。解除できるのは `"registered"` だけ。 */

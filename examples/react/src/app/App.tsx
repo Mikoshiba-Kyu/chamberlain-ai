@@ -45,6 +45,9 @@ export function App() {
   const [events, setEvents] = useState<ActivityEvent[]>([]);
   const [triggers, setTriggers] = useState<TriggerListItem[]>([]);
   const [tasks, setTasks] = useState<TaskListItem[]>([]);
+  // 登録したトリガーは再起動まで一覧に出ない (#58)。パネルは非表示タブで unmount
+  // されるので、「反映待ちがある」ことはパネルの外で覚えておく。
+  const [restartPending, setRestartPending] = useState(false);
 
   // トリガーの nextFireAt は予定リストの投影なので、常に両方まとめて取り直す。
   const refresh = useCallback(() => {
@@ -130,6 +133,8 @@ export function App() {
             onToggle={toggleTrigger}
             onRunNow={runTriggerNow}
             onChanged={refresh}
+            restartPending={restartPending}
+            onRegistered={() => setRestartPending(true)}
           />
         )}
         {active === "tasks" && (

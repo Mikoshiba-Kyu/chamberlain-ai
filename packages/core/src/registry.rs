@@ -19,8 +19,14 @@
 use std::fs;
 use std::path::{Component, Path};
 
+use serde::Serialize;
+
 /// トリガーの出どころ。UI に見せる (#58) ほか、解除できるかの判断に使う。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// UI に渡すときも文字列に潰さずこの型のまま送る。潰すと「同梱と衝突したら登録を断る」
+/// のような判断が文字列比較になり、種類が増えたときに漏れてもコンパイラが教えてくれない。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub(crate) enum TriggerSource {
     /// `bundle.resources` でアプリに焼き込まれたもの。エージェント開発者のもので、
     /// エンドユーザーは外せない (「アプリの形」の一部)。
@@ -30,7 +36,7 @@ pub(crate) enum TriggerSource {
 }
 
 impl TriggerSource {
-    /// UI に渡す安定した識別子。
+    /// ログ用の短い識別子 (JSON 側は Serialize が同じ文字列を出す)。
     pub(crate) fn as_str(&self) -> &'static str {
         match self {
             Self::Bundled => "bundled",
@@ -44,6 +50,14 @@ impl TriggerSource {
 /// `__meta__` は state store の予約 namespace、`__task__` はトリガーに帰属しない
 /// activity の source。どちらも名乗られると「framework 自身の記録」と混ざる。
 const RESERVED_IDS: [&str; 2] = ["__meta__", "__task__"];
+
+/// framework が予約している ID か。**discovery と登録の両方から見る。**
+///
+/// 予約語の一覧が出どころごとに分かれていると、片方の経路 (`<app_data>/triggers/` に
+/// 直接置く) からだけ `__task__` を名乗れてしまう。
+pub(crate) fn is_reserved_id(id: &str) -> bool {
+    RESERVED_IDS.contains(&id)
+}
 
 /// ID の最大長。コピー先のディレクトリ名になるので、パス長の上限を踏まない範囲に抑える。
 const MAX_ID_LEN: usize = 64;
@@ -90,7 +104,7 @@ pub(crate) fn validate_trigger_id(id: &str) -> Result<(), String> {
     if id.len() > MAX_ID_LEN {
         return Err(format!("トリガー ID が長すぎます (最大 {MAX_ID_LEN} 文字)"));
     }
-    if RESERVED_IDS.contains(&id) {
+    if is_reserved_id(id) {
         return Err(format!("トリガー ID '{id}' は framework の予約語です"));
     }
     if id.starts_with('.') {
@@ -216,7 +230,7 @@ pub(crate) fn install_trigger(
     id: &str,
 ) -> Result<CopyStats, String> {
     validate_trigger_id(id)?;
-    let dest = registered_dir.join(id);
+    let dest = installed_path(registered_dir, id);
     let staging = registered_dir.join(format!("{STAGING_PREFIX}{id}"));
     let backup = registered_dir.join(format!("{BACKUP_PREFIX}{id}"));
 
@@ -248,36 +262,43 @@ pub(crate) fn install_trigger(
 
 /// 登録されたトリガーの実体を消す (#58)。戻り値は「実際にあったか」。
 ///
-/// 実体が無いこと自体はエラーにしない。登録したまま再起動していない状態や、手で消された
-/// 状態からでも「解除」は完了させたい (呼び出し側は予定と state の後始末を続ける)。
-pub(crate) fn uninstall_trigger(registered_dir: &Path, id: &str) -> Result<bool, String> {
-    validate_trigger_id(id)?;
-    let dest = registered_dir.join(id);
-    if !dest.is_dir() {
+/// 受け取るのは id ではなく**解決済みのディレクトリ**。discovery はディレクトリ名と
+/// manifest の id が一致することを要求していないので、id から組み立て直すと
+/// 「手で置いたフォルダを外したつもりで何も消えていない」が起こる。
+///
+/// 実体が無いこと自体はエラーにしない (`Ok(false)`)。登録したまま再起動していない状態や
+/// 手で消された状態からでも解除は完了させたい。**ただし戻り値は呼び出し側が見ること** —
+/// 何も消せなかったのに「解除しました」と言うと、再起動で戻ってくる。
+pub(crate) fn uninstall_trigger(dir: &Path) -> Result<bool, String> {
+    if !dir.is_dir() {
         return Ok(false);
     }
-    fs::remove_dir_all(&dest).map_err(|e| format!("{} を削除できません: {e}", dest.display()))?;
+    fs::remove_dir_all(dir).map_err(|e| format!("{} を削除できません: {e}", dir.display()))?;
     Ok(true)
+}
+
+/// 登録済みトリガーの既定の置き場所。[`install_trigger`] が据える先であり、
+/// 「同じ id が既に入っているか」の判定もここを見る。
+pub(crate) fn installed_path(registered_dir: &Path, id: &str) -> std::path::PathBuf {
+    registered_dir.join(id)
+}
+
+/// テスト用の一時ディレクトリ。tempfile クレートを足すほどの用事ではないので、
+/// プロセス ID と連番で衝突を避ける。ファイルを触るテストはここを起点にする。
+#[cfg(test)]
+pub(crate) fn temp_dir(label: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("chamberlain-{label}-{}-{n}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    dir
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering};
-
-    /// テスト用の一時ディレクトリ。tempfile を足すほどの用事ではないので、
-    /// プロセス ID と連番で衝突を避ける。
-    fn temp_dir(label: &str) -> std::path::PathBuf {
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "chamberlain-registry-{}-{label}-{n}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
 
     fn write(path: &Path, contents: &str) {
         if let Some(parent) = path.parent() {
@@ -456,9 +477,9 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// id の検証は入口と出口の両方でかかる (パスを組み立てる材料になるため)。
+    /// id の検証は据える側でかかる (パスを組み立てる材料になるため)。
     #[test]
-    fn install_and_uninstall_reject_unsafe_ids() {
+    fn install_rejects_unsafe_ids() {
         let root = temp_dir("unsafe");
         let registered = root.join("triggers");
         fs::create_dir_all(&registered).unwrap();
@@ -466,20 +487,20 @@ mod tests {
         write(&src.join("manifest.json"), "{}");
 
         assert!(install_trigger(&src, &registered, "../escape").is_err());
-        assert!(uninstall_trigger(&registered, "../escape").is_err());
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// 解除は実体を消す。実体が無くてもエラーにはしない (呼び出し側は後始末を続ける)。
+    /// 解除は実体を消す。実体が無くてもエラーにはしない (呼び出し側は後始末を続ける) が、
+    /// 「あったか」は戻り値で分かる。
     #[test]
     fn uninstall_removes_the_directory() {
         let root = temp_dir("uninstall");
         let registered = root.join("triggers");
         write(&registered.join("probe/index.ts"), "x");
 
-        assert!(uninstall_trigger(&registered, "probe").unwrap());
+        assert!(uninstall_trigger(&installed_path(&registered, "probe")).unwrap());
         assert!(!registered.join("probe").exists());
-        assert!(!uninstall_trigger(&registered, "probe").unwrap());
+        assert!(!uninstall_trigger(&installed_path(&registered, "probe")).unwrap());
         let _ = fs::remove_dir_all(&root);
     }
 }

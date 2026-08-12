@@ -69,12 +69,6 @@ describe("sourceLabel", () => {
     expect(sourceLabel("registered")).toBe("登録");
     expect(sourceLabel("bundled")).toBe("同梱");
   });
-
-  it("source を返さない古い core では同梱として扱う", () => {
-    // 実行時登録が無かった頃のトリガーはすべて焼き込み。「解除」ボタンを誤って
-    // 出さない側に倒す。
-    expect(sourceLabel(undefined)).toBe("同梱");
-  });
 });
 
 describe("formatConsentPermissions", () => {
