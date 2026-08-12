@@ -15,10 +15,19 @@
 - `http.fetch` のリダイレクト追跡を reqwest から core に移した。**ホップごとに `allowedHosts` と照合する** (宣言済みホストが 302 を返すだけで制限が抜けるのを防ぐ)。上限は 5 ホップで、超えたら 3xx をそのまま返す
 - **BREAKING**: `http.fetch` の 30s タイムアウトは**リダイレクトを含む全体**の上限になった (従来は 1 リクエスト単位)。自前追跡では放置すると 30s × ホップ数まで伸び、その間ほかのトリガーの tick が止まる
 - 別ホストへリダイレクトするとき `Authorization` / `Cookie` / `Proxy-Authorization` 等を落とす。reqwest の redirect policy を切った代わりに core 側で行う。両方のホストが宣言済みでも、片方向けの認証情報をもう片方に渡す理由は無い
+- **BREAKING**: `manifest.json` の `entry` はトリガーのフォルダ内を指していなければならなくなった (#58)。`"../x.ts"` のようにフォルダの外を指すものは構成エラーとして実行対象から外れる。V8 に読ませるファイルを決める値なので、焼き込みにも同じ検証をかける
 - `[denied]` と `[ai]` は 1 実行につき種類ごとに 1 行にまとめ、回数を添える (`... (×1000)`)。種類数も 32 で頭打ちにし、本文は 200 文字で切る。ループ内の呼び出しが履歴を埋め尽くして本物のイベントを押し流すのを防ぐ
 
 ### Added
 
+- **トリガーを実行時に登録・解除できるようになった (#58 / #55)。** エンドユーザーが秘書に仕事を増やせる。焼き込み (resource dir) に加えて `<app_data>/triggers/` が 2 つ目の走査元になり、**discovery から先は出どころで区別しない** (権限の宣言も同じように強制される)
+  - 受け取り口は「UI からフォルダを選ぶ」1 本。`manifest.json` があるフォルダを選ぶと、そのトリガーの `requiredSecrets` / `allowedHosts` を見せて確認をとってからコピーする。#56 / #57 で宣言が強制力を持っているので、同意画面に出る文字列と実際の制限は一致する
+  - **登録の反映は再起動から。** 走っているプロセスにトリガーが増えないので、「`discover_triggers()` は起動時 1 回で確定する」前提 (#26) が保たれる
+  - **解除は即時。** 積まれていた予定とトリガー state も同時に消える。同梱トリガーは外せない (停止はできる)
+  - id が衝突したら焼き込みが勝つ。アプリに同梱された「そのアプリらしさ」を後から乗っ取らせない
+- invoke command に `pick_trigger_folder` / `register_trigger` / `unregister_trigger` / `restart_app` を追加 (#58)。フォルダ選択のダイアログは core が Rust 側で開くので、エージェント開発者側に capability の宣言もフロントの依存も増えない
+- `TriggerListItem` に `source` (`"bundled"` | `"registered"`) を追加。UI がバッジで出し分け、登録したものにだけ「解除」を出す
+- 活動ログの kind に `registered` / `unregistered` を追加。「誰かが後から仕事を増やした」も履歴に残る
 - 活動ログの kind に `denied` を追加。manifest の宣言の外に出ようとして止められたことを表す
 - 活動ログの kind に `ai_call` (`[ai]`) を追加。トリガーの `chamberlain.ai.complete` 呼び出しを記録する — framework の API キーの持ち出しにあたるため。model と回数のみで、**prompt は残さない**
 - 活動ログの kind に `config_error` (`[config error]`) を追加。`allowedHosts` の書式不正など、manifest が壊れているトリガーは実行対象から外れる。**`schedule` / `tz` の失敗もこの kind に統合された** (`schedule_error` は保存済みの行を読むためだけに残る) — UI から見て意味があるのは「manifest が壊れていて動かせない」という 1 つの概念で、どの項目かは message が持つ

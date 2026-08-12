@@ -85,6 +85,13 @@ pub(crate) enum ActivityKind {
     Manual,
     /// 予定が削除された。
     Deleted,
+    /// トリガーが実行時に登録された (#58)。
+    ///
+    /// 「誰かが後から仕事を増やした」は、トリガー自身の実行と同じくらい後から追える
+    /// 必要がある。同意画面で見せた宣言をそのまま本文に載せる。
+    Registered,
+    /// 登録されたトリガーが解除された (#58)。
+    Unregistered,
     /// manifest の宣言に無い権限をトリガーが要求したので拒否した (#56 / #57)。
     ///
     /// secret と宛先ホストで kind を分けない。UI から見て意味があるのは「宣言の外に
@@ -127,6 +134,8 @@ impl ActivityKind {
             Self::Unsupported => "unsupported",
             Self::Manual => "manual",
             Self::Deleted => "deleted",
+            Self::Registered => "registered",
+            Self::Unregistered => "unregistered",
             Self::Denied => "denied",
             Self::AiCall => "ai_call",
             Self::ConfigError => "config_error",
@@ -153,6 +162,8 @@ impl ActivityKind {
             Self::Unsupported => Some("[unsupported]"),
             Self::Manual => Some("[manual]"),
             Self::Deleted => Some("[deleted]"),
+            Self::Registered => Some("[registered]"),
+            Self::Unregistered => Some("[unregistered]"),
             Self::Denied => Some("[denied]"),
             Self::AiCall => Some("[ai]"),
             Self::ConfigError => Some("[config error]"),
@@ -275,6 +286,8 @@ fn parse_kind(s: &str) -> Option<ActivityKind> {
         Unsupported,
         Manual,
         Deleted,
+        Registered,
+        Unregistered,
         Denied,
         AiCall,
         ConfigError,
@@ -712,6 +725,8 @@ mod tests {
             ActivityKind::Unsupported,
             ActivityKind::Manual,
             ActivityKind::Deleted,
+            ActivityKind::Registered,
+            ActivityKind::Unregistered,
         ] {
             assert_eq!(parse_kind(kind.as_str()), Some(kind));
         }

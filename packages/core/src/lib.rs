@@ -3,6 +3,7 @@ mod chat;
 mod history;
 mod http;
 mod permissions;
+mod registry;
 mod schedule;
 mod secrets;
 mod tasks;
@@ -21,11 +22,16 @@ use tauri::{
     tray::TrayIconBuilder,
     AppHandle, Emitter, Manager, State, WindowEvent,
 };
+use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_notification::{NotificationExt, PermissionState};
 use tauri_plugin_store::StoreExt;
 
 use crate::history::{origin_str, Activity, ActivityKind, HistoryStore, MAX_ROWS, RETENTION};
 use crate::permissions::{parse_host_pattern, HostPattern, TriggerGrants, TriggerPermissions};
+use crate::registry::{
+    install_trigger, installed_path, is_reserved_id, uninstall_trigger, validate_entry_path,
+    validate_registered_entry, validate_trigger_id, TriggerSource,
+};
 use crate::schedule::{parse_schedule, resolve_tz, Schedule};
 use crate::secrets::SecretsService;
 use crate::tasks::{Task, TaskOrigin, TaskStore};
@@ -57,6 +63,15 @@ const TICK_INTERVAL_DEV: Duration = Duration::from_secs(10);
 const SCHEDULE_GRACE_TICKS: u32 = 2;
 
 const STATE_STORE_FILE: &str = "triggers-state.json";
+
+/// トリガー 1 個の宣言ファイル。焼き込みでも実行時登録でもこの名前で探す。
+const MANIFEST_FILE: &str = "manifest.json";
+
+/// 実行時に登録されたトリガーの置き場 (`<app_data>/triggers/`) (#58)。
+///
+/// 焼き込み (resource dir) と**同じ形のフォルダ**をここに置く。discovery から先は
+/// 出どころで区別しない — 権限の宣言も同じように強制される (#56 / #57)。
+const REGISTERED_TRIGGERS_DIR: &str = "triggers";
 
 /// タスクリストと展開状態の永続先。トリガーの state (`triggers-state.json`) とは別ファイルに
 /// する。`tauri-plugin-store` は `save()` でファイル全体を書くため、同居させると
@@ -146,7 +161,16 @@ struct TriggerManifest {
 struct TriggerInfo {
     manifest: TriggerManifest,
     dir: PathBuf,
+    /// 焼き込みか、実行時登録か (#58)。UI に出すほか、「解除できるか」の判断に使う。
+    source: TriggerSource,
     paused: Arc<AtomicBool>,
+    /// 実行時に解除された (#58)。**解除は再起動を待たずに効く。**
+    ///
+    /// discovery は起動時 1 回で確定するので、解除したトリガーはこのプロセスの
+    /// in-memory の一覧には残り続ける。フラグを立てて心拍・UI・手動実行の全経路から
+    /// 外すことで、「外したのにまだ動く」を再起動まで引きずらない。JS モジュールは
+    /// ロードされたままだが、そこへ到達する経路が無くなる。
+    unregistered: Arc<AtomicBool>,
     /// パース済み schedule。**展開器の生成規則**として使う (実行時の発火判定には使わない)。
     /// config_error があるトリガーではダミー値 (`@hourly` 相当)。worker は error を先に見て
     /// 展開対象から外すので値は参照されない。
@@ -219,6 +243,36 @@ struct TriggerListItem {
     required_secrets: Vec<String>,
     #[serde(rename = "allowedHosts")]
     allowed_hosts: Vec<String>,
+    /// `"bundled"` (アプリに焼き込まれた) | `"registered"` (実行時に登録された) (#58)。
+    ///
+    /// エンドユーザーが外せるのは後者だけ。「アプリの形」と「秘書にさせる仕事」の
+    /// 線引きがここに現れる。
+    source: TriggerSource,
+}
+
+/// 登録しようとしているトリガーの下見 (#58)。**同意画面に出す内容そのもの。**
+///
+/// `requiredSecrets` / `allowedHosts` は core が実際に強制している宣言なので (#56 / #57)、
+/// ここに出た以上のことはそのトリガーにはできない。宣言が強制力を持つ状態で初めて、
+/// 入れる前に見せる意味がある。
+#[derive(Clone, Debug, Serialize)]
+struct TriggerCandidate {
+    /// 選ばれたフォルダの絶対パス。UI はこれをそのまま `register_trigger` に返す。
+    path: String,
+    id: String,
+    name: String,
+    description: Option<String>,
+    schedule: String,
+    tz: Option<String>,
+    #[serde(rename = "requiredSecrets")]
+    required_secrets: Vec<String>,
+    #[serde(rename = "allowedHosts")]
+    allowed_hosts: Vec<String>,
+    /// 同じ id が既にある場合の相手 (`"bundled"` | `"registered"`)。
+    ///
+    /// `"bundled"` は登録を拒否する — アプリに同梱された「そのアプリらしさ」を後から
+    /// 乗っ取られないため。`"registered"` は置き換え (配布物の更新) として通す。
+    conflict: Option<TriggerSource>,
 }
 
 /// UI が受け取るタスクリストの要素。「秘書がこれから何をするつもりか」を 1 画面で見せ、
@@ -357,6 +411,58 @@ fn write_trigger_state(app: &AppHandle, trigger_id: &str, state: serde_json::Val
     }
 }
 
+/// トリガーの永続 state を捨てる (#58 の解除)。
+///
+/// 残しておくと、同じ id を入れ直したときに前の住人の state を引き継ぐ。外したものの
+/// 痕跡が別のトリガーの初期状態になるのは説明できないので、解除と一緒に消す。
+fn remove_trigger_state(app: &AppHandle, trigger_id: &str) {
+    match app.store(STATE_STORE_FILE) {
+        Ok(store) => {
+            if store.delete(trigger_id) {
+                if let Err(e) = store.save() {
+                    eprintln!("failed to persist state removal for {trigger_id}: {e}");
+                }
+            }
+        }
+        Err(e) => eprintln!("failed to open state store for removal: {e}"),
+    }
+}
+
+/// 実行時登録の置き場 (`<app_data>/triggers/`)。**起動時に 1 回だけ解決して作る** (#58)。
+///
+/// 空でも作るのは、「フォルダを開いて直接置く」経路 (#55 の受け取り口の最小形) が
+/// そこにあるだけで成立するため。解決に失敗した環境では登録機能だけが使えなくなる
+/// (焼き込みトリガーはそのまま動く)。
+struct RegisteredDir(Option<PathBuf>);
+
+impl RegisteredDir {
+    fn resolve(app: &AppHandle) -> Self {
+        Self(match app.path().app_data_dir() {
+            Ok(base) => {
+                let dir = base.join(REGISTERED_TRIGGERS_DIR);
+                match std::fs::create_dir_all(&dir) {
+                    Ok(()) => Some(dir),
+                    Err(e) => {
+                        eprintln!("failed to create {}: {e}", dir.display());
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("failed to resolve app data dir for registered triggers: {e}");
+                None
+            }
+        })
+    }
+
+    /// 登録系コマンドから使う。解決できていない環境では理由を返して断る。
+    fn get(&self) -> Result<&Path, String> {
+        self.0
+            .as_deref()
+            .ok_or_else(|| "トリガーの置き場を用意できませんでした".to_string())
+    }
+}
+
 /// 古い state ファイルに残った `__meta__.fire_times` を掃除する。
 ///
 /// 残しておいても実害は無いが、`triggers-state.json` を開いた開発者が「どちらが真実か」で
@@ -452,11 +558,83 @@ fn open_history(app: &AppHandle) -> Option<HistoryStore> {
     }
 }
 
-/// `triggers/*/manifest.json` を走査して有効なトリガーだけを拾う。
+/// manifest の意味を検証した結果。
+///
+/// **焼き込みと実行時登録で同じものを使う** (#55)。例外を作ると「焼き込みなら何でもできる」
+/// 抜け道になり、焼き込みを偽装する経路が価値を持つ。
+struct ValidatedManifest {
+    /// パース済み schedule。エラーがあるときはダミー (worker が参照しない)。
+    schedule: Schedule,
+    /// 解決済み TZ。同上。
+    tz: chrono_tz::Tz,
+    /// 検証済みの `allowedHosts` (#57)。エラーがあるときは空。
+    hosts: Vec<HostPattern>,
+    /// 見つかった構成エラー。1 件ずつ観測面に流せるよう配列で持つ。
+    errors: Vec<String>,
+}
+
+impl ValidatedManifest {
+    /// UI に見せる 1 本の文字列。複数壊れているときは `; ` で連ねる。
+    fn config_error(&self) -> Option<String> {
+        (!self.errors.is_empty()).then(|| self.errors.join("; "))
+    }
+}
+
+/// manifest を検証する。**壊れた宣言はトリガーごと実行対象から外す** (#57)。
+///
+/// 悪い書き方を黙って捨てて残りで動かすと、登録時の同意画面 (#58) に出す文字列と実際の
+/// 制限がずれる。宣言が強制力を持たない状態で同意だけ取るのはシアターなので、宣言が
+/// 読めないうちは走らせない方を採る。
+fn validate_manifest(manifest: &TriggerManifest) -> ValidatedManifest {
+    let mut errors: Vec<String> = Vec::new();
+
+    // ダミー値を置くのは、config_error がある間 worker が展開しないため (参照されない)。
+    let schedule = match parse_schedule(&manifest.schedule) {
+        Ok(spec) => spec,
+        Err(e) => {
+            errors.push(e);
+            Schedule::Hourly { minutes: vec![0] }
+        }
+    };
+    // tz 解決は schedule のパースに失敗していても走らせ、両方壊れていれば連ねて出す。
+    let tz = match resolve_tz(manifest.tz.as_deref()) {
+        Ok(t) => t,
+        Err(e) => {
+            errors.push(e);
+            chrono_tz::UTC
+        }
+    };
+    let hosts = match manifest
+        .allowed_hosts
+        .iter()
+        .map(|h| parse_host_pattern(h))
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(hosts) => hosts,
+        Err(e) => {
+            errors.push(e);
+            Vec::new()
+        }
+    };
+    // entry がトリガーのディレクトリ内を指していること (#58)。V8 に外のファイルを
+    // 読ませる経路になるので、焼き込みにも同じ検証をかける。
+    if let Err(e) = validate_entry_path(&manifest.entry) {
+        errors.push(e);
+    }
+
+    ValidatedManifest {
+        schedule,
+        tz,
+        hosts,
+        errors,
+    }
+}
+
+/// 1 つのディレクトリを走査して有効なトリガーだけを拾う。
 /// - manifest 読み取り失敗 / JSON 不正 → その 1 個をスキップ、他は続行
 /// - id 重複 → 先勝ち、後発をスキップして log
 /// - id が予約語 `__meta__` → reject
-/// - schedule 不正 / tz 解決失敗 → reject し activity にも `[config error]` で流す
+/// - schedule 不正 / tz 解決失敗 / 宣言不正 → reject し activity にも `[config error]` で流す
 /// - 実行順序を安定させるため id 昇順にソート
 ///
 /// 発火間隔の下限チェックはここには無い。下限は DSL パーサ側 (`@every` の許可値が
@@ -465,6 +643,7 @@ fn discover_triggers(
     app: &AppHandle,
     history: &HistoryRef,
     triggers_dir: &Path,
+    source: TriggerSource,
 ) -> Vec<TriggerInfo> {
     let entries = match std::fs::read_dir(triggers_dir) {
         Ok(e) => e,
@@ -480,7 +659,12 @@ fn discover_triggers(
         if !path.is_dir() {
             continue;
         }
-        let manifest_path = path.join("manifest.json");
+        // ドット始まりは framework の作業領域 (登録中の `.staging-*`)。トリガーとして
+        // 拾うと、コピー途中の半端なフォルダが本物と同じ id で競合しうる。
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let manifest_path = path.join(MANIFEST_FILE);
         if !manifest_path.exists() {
             continue;
         }
@@ -499,9 +683,12 @@ fn discover_triggers(
             }
         };
 
-        if manifest.id == META_NAMESPACE {
+        // 予約語の一覧は [`crate::registry`] が持つ。焼き込みと実行時登録で違う名前が
+        // 通ると、片方の経路からだけ framework の記録に紛れ込める。
+        if is_reserved_id(&manifest.id) {
             eprintln!(
-                "trigger id '{META_NAMESPACE}' is reserved by framework, skipping {manifest_path:?}"
+                "trigger id '{}' is reserved by framework, skipping {manifest_path:?}",
+                manifest.id
             );
             continue;
         }
@@ -509,89 +696,115 @@ fn discover_triggers(
         // 構成エラーはトリガーを捨てずに TriggerInfo に持たせ、UI から「壊れてる」と
         // 見えるようにする。stderr + activity にも流す (discovery は .setup() 内で走るので
         // UI リスナーには届かないが、履歴に残るので起動後に list_activity で読める)。
-        let (schedule, config_error) = match parse_schedule(&manifest.schedule) {
-            Ok(spec) => (spec, None),
-            Err(e) => {
-                eprintln!(
-                    "invalid schedule for trigger '{}': {e} ({manifest_path:?})",
-                    manifest.id
-                );
-                record_activity(
-                    app,
-                    history,
-                    &Activity::new(&manifest.id, ActivityKind::ConfigError, e.clone()),
-                );
-                // ダミー値。config_error が Some の間 worker は展開しないので参照されない。
-                (Schedule::Hourly { minutes: vec![0] }, Some(e))
-            }
-        };
+        let validated = validate_manifest(&manifest);
+        for e in &validated.errors {
+            eprintln!(
+                "trigger '{}' config error: {e} ({manifest_path:?})",
+                manifest.id
+            );
+            record_activity(
+                app,
+                history,
+                &Activity::new(&manifest.id, ActivityKind::ConfigError, e.clone()),
+            );
+        }
 
-        // tz 解決は schedule のパースに失敗していても走らせ、両方壊れていれば連ねて出す。
-        let (tz, config_error) = match resolve_tz(manifest.tz.as_deref()) {
-            Ok(t) => (t, config_error),
-            Err(e) => {
-                eprintln!("trigger '{}' tz error: {e}", manifest.id);
-                record_activity(
-                    app,
-                    history,
-                    &Activity::new(&manifest.id, ActivityKind::ConfigError, e.clone()),
-                );
-                (chrono_tz::UTC, append_config_error(config_error, &e))
-            }
-        };
-
-        // allowedHosts の検証 (#57)。**壊れた宣言はトリガーごと実行対象から外す。**
-        // 悪い書き方 (`"*"` 等) を黙って捨てて残りで動かすと、#55 の同意画面が出す文字列と
-        // 実際の制限がずれる。宣言が強制力を持たない状態で同意だけ取るのはシアターなので、
-        // 宣言が読めないうちは走らせない方を採る。
-        let (hosts, config_error) = match manifest
-            .allowed_hosts
-            .iter()
-            .map(|h| parse_host_pattern(h))
-            .collect::<Result<Vec<_>, _>>()
-        {
-            Ok(hosts) => (hosts, config_error),
-            Err(e) => {
-                eprintln!("trigger '{}' allowedHosts error: {e}", manifest.id);
-                record_activity(
-                    app,
-                    history,
-                    &Activity::new(&manifest.id, ActivityKind::ConfigError, e.clone()),
-                );
-                (Vec::new(), append_config_error(config_error, &e))
-            }
-        };
-
+        let config_error = validated.config_error();
         result.push(TriggerInfo {
             manifest,
             dir: path,
+            source,
             paused: Arc::new(AtomicBool::new(false)),
-            schedule,
-            tz,
+            unregistered: Arc::new(AtomicBool::new(false)),
+            schedule: validated.schedule,
+            tz: validated.tz,
             config_error,
-            hosts,
+            hosts: validated.hosts,
         });
     }
 
-    // sort → dedup の順にしないと、id 重複時にどちらが生き残るかが read_dir 順
-    // (filesystem 順) 依存で非決定になる (Issue #21 #6)。id 昇順にしてから先勝ちにすれば、
-    // 少なくとも同じ input からは同じ結果が出る。
-    result.sort_by(|a, b| a.manifest.id.cmp(&b.manifest.id));
+    let (kept, dropped) = dedupe_by_id(result);
+    for t in dropped {
+        eprintln!("duplicate trigger id '{}', skipping", t.manifest.id);
+    }
+    kept
+}
+
+/// 2 つのソースを走査して 1 本のトリガー一覧にする (#58)。
+///
+/// - 焼き込み (resource dir) — エージェント開発者が同梱したもの
+/// - 実行時登録 (`<app_data>/triggers/`) — エンドユーザーが後から入れたもの
+///
+/// **id が衝突したら焼き込み側を優先する。** アプリに同梱された「そのアプリらしさ」を
+/// 後から乗っ取られないため。登録の入口 ([`register_trigger`]) が同じ衝突を先に弾くので、
+/// ここに落ちてくるのは「アプリの更新で同じ id の焼き込みが後から増えた」場合が主になる。
+/// 黙って消すと理由が分からないので観測面に残す。
+fn discover_all(
+    app: &AppHandle,
+    history: &HistoryRef,
+    bundled_dir: &Path,
+    registered_dir: Option<&Path>,
+) -> Vec<TriggerInfo> {
+    let bundled = discover_triggers(app, history, bundled_dir, TriggerSource::Bundled);
+    let Some(registered_dir) = registered_dir else {
+        return bundled;
+    };
+    let registered = discover_triggers(app, history, registered_dir, TriggerSource::Registered);
+
+    // 焼き込みを先に並べてから同じ dedup にかける。取捨の規則 (先勝ち + id 昇順) は
+    // 1 箇所にしかない。
+    let (merged, shadowed) = dedupe_by_id(bundled.into_iter().chain(registered).collect());
+    for t in shadowed {
+        let message = format!(
+            "同じ id の同梱トリガーがあるため、登録された方を無視しました ({})",
+            t.dir.display()
+        );
+        eprintln!("trigger '{}': {message}", t.manifest.id);
+        record_activity(
+            app,
+            history,
+            &Activity::new(&t.manifest.id, ActivityKind::ConfigError, message),
+        );
+    }
+    merged
+}
+
+/// id の取捨。戻り値は (採用したもの, 落としたもの)。
+///
+/// **入力の並び順が優先順位である。** 呼び出し側が先に置いたものが勝つので、2 ソースの
+/// merge では焼き込みを先に並べる (#58) — これが「同梱されたトリガーは後から差し替え
+/// られない」を担保する唯一の場所になる。
+///
+/// sort → dedup の順でないと、id 重複時にどちらが生き残るかが read_dir 順 (filesystem 順)
+/// 依存で非決定になる (Issue #21 #6)。安定ソートなので、同じ id の中では入力順が保たれる。
+fn dedupe_by_id(mut triggers: Vec<TriggerInfo>) -> (Vec<TriggerInfo>, Vec<TriggerInfo>) {
+    triggers.sort_by(|a, b| a.manifest.id.cmp(&b.manifest.id));
 
     let mut seen = HashSet::new();
-    let mut deduped: Vec<TriggerInfo> = Vec::new();
-    for t in result {
+    let mut kept = Vec::with_capacity(triggers.len());
+    let mut dropped = Vec::new();
+    for t in triggers {
         if seen.insert(t.manifest.id.clone()) {
-            deduped.push(t);
+            kept.push(t);
         } else {
-            eprintln!("duplicate trigger id '{}', skipping", t.manifest.id);
+            dropped.push(t);
         }
     }
-    deduped
+    (kept, dropped)
+}
+
+/// 解除されていないトリガーだけを見る (#58)。
+///
+/// 解除は再起動を待たずに効くので、「今このプロセスが仕事として持っているもの」は
+/// このフィルタを通った側である。心拍・UI・手動実行はすべてここを経由する。
+fn active_triggers(triggers: &[TriggerInfo]) -> impl Iterator<Item = &TriggerInfo> {
+    triggers
+        .iter()
+        .filter(|t| !t.unregistered.load(Ordering::Relaxed))
 }
 
 fn find_trigger<'a>(triggers: &'a [TriggerInfo], id: &str) -> Option<&'a TriggerInfo> {
-    triggers.iter().find(|t| t.manifest.id == id)
+    active_triggers(triggers).find(|t| t.manifest.id == id)
 }
 
 /// 心拍から見えるトリガーの写像を作る。`paused` は心拍ごとに読み直す値なので、
@@ -600,9 +813,11 @@ fn find_trigger<'a>(triggers: &'a [TriggerInfo], id: &str) -> Option<&'a Trigger
 ///
 /// `runnable` は「構成エラーが無く、かつ JS がロード済み」。どちらを欠いても展開されず、
 /// 既に積まれたタスクは due 時に `[unavailable]` で破棄される。
+///
+/// 解除されたトリガー (#58) はここに現れない。心拍から見れば「manifest から消えた」のと
+/// 同じ扱いになり、残っている予定は孤児として片付く。
 fn build_specs(triggers: &[TriggerInfo], host: &TauriHost) -> Vec<TriggerSpec> {
-    triggers
-        .iter()
+    active_triggers(triggers)
         .map(|t| TriggerSpec {
             id: t.manifest.id.clone(),
             name: t.manifest.name.clone(),
@@ -614,15 +829,6 @@ fn build_specs(triggers: &[TriggerInfo], host: &TauriHost) -> Vec<TriggerSpec> {
             runnable: t.config_error.is_none() && host.is_loaded(&t.manifest.id),
         })
         .collect()
-}
-
-/// discovery で見つかった構成エラーを積む。同じトリガーが複数の項目で壊れていることは
-/// あるので、`; ` で連ねて 1 本の文字列にする。
-fn append_config_error(prev: Option<String>, e: &str) -> Option<String> {
-    Some(match prev {
-        Some(prev) => format!("{prev}; {e}"),
-        None => e.to_string(),
-    })
 }
 
 /// manifest の宣言を実行時の権限の形に写す (#56)。
@@ -933,8 +1139,7 @@ fn list_triggers(
     task_store: State<'_, TaskStoreRef>,
 ) -> Vec<TriggerListItem> {
     let store = lock_tasks(&task_store);
-    triggers
-        .iter()
+    active_triggers(&triggers)
         .map(|t| TriggerListItem {
             id: t.manifest.id.clone(),
             name: t.manifest.name.clone(),
@@ -948,6 +1153,7 @@ fn list_triggers(
             // 大文字や前後の空白の差で「UI に見えている文字列」と「実際に効く宣言」が
             // ずれる。ここで見せるものは強制力を持つ側と同一でなければならない。
             allowed_hosts: t.hosts.iter().map(|h| h.as_declared()).collect(),
+            source: t.source,
         })
         .collect()
 }
@@ -1061,7 +1267,7 @@ fn run_trigger_now(
 
 #[tauri::command]
 fn pause_trigger(id: String, triggers: State<'_, TriggersRef>) -> Result<(), String> {
-    match triggers.iter().find(|t| t.manifest.id == id) {
+    match find_trigger(&triggers, &id) {
         Some(t) => {
             t.paused.store(true, Ordering::Relaxed);
             Ok(())
@@ -1072,12 +1278,280 @@ fn pause_trigger(id: String, triggers: State<'_, TriggersRef>) -> Result<(), Str
 
 #[tauri::command]
 fn resume_trigger(id: String, triggers: State<'_, TriggersRef>) -> Result<(), String> {
-    match triggers.iter().find(|t| t.manifest.id == id) {
+    match find_trigger(&triggers, &id) {
         Some(t) => {
             t.paused.store(false, Ordering::Relaxed);
             Ok(())
         }
         None => Err(format!("unknown trigger: {id}")),
+    }
+}
+
+/// 登録しようとしているフォルダを下見する (#58)。
+///
+/// **副作用は無い。** ここで返した宣言を UI が同意画面に出し、確認が取れてから
+/// [`register_trigger`] がコピーする。読むだけと入れるので 2 つに分かれているが、検証は
+/// 同じ関数を通る (登録側は UI の言うことを信じない)。
+fn inspect_candidate(
+    triggers: &[TriggerInfo],
+    registered_dir: Option<&Path>,
+    dir: &Path,
+) -> Result<TriggerCandidate, String> {
+    let manifest_path = dir.join(MANIFEST_FILE);
+    if !manifest_path.is_file() {
+        return Err(format!(
+            "{MANIFEST_FILE} が見つかりません。トリガーのフォルダ ({MANIFEST_FILE} がある階層) を選んでください"
+        ));
+    }
+    let text = std::fs::read_to_string(&manifest_path)
+        .map_err(|e| format!("{MANIFEST_FILE} を読めません: {e}"))?;
+    let manifest: TriggerManifest = serde_json::from_str(&text)
+        .map_err(|e| format!("{MANIFEST_FILE} の形式が不正です: {e}"))?;
+
+    // id はコピー先のディレクトリ名になる。焼き込みには無い検証がここだけにあるのは
+    // そのため (詳細は [`crate::registry`])。
+    validate_trigger_id(&manifest.id)?;
+
+    // 壊れた宣言は登録させない。焼き込みなら「壊れたトリガー」として一覧に残す価値が
+    // あるが (タイポしたものが影も形も無くなる方が困る)、まだ入れていないものは
+    // 入口で止めた方が直しやすい。
+    let validated = validate_manifest(&manifest);
+    if let Some(e) = validated.config_error() {
+        return Err(e);
+    }
+    if !dir.join(&manifest.entry).is_file() {
+        return Err(format!(
+            "entry '{}' がフォルダの中に見つかりません",
+            manifest.entry
+        ));
+    }
+    // 「今この場所にある」だけでは足りない。コピーを生き延びない置き方 (ドット始まりの
+    // 下) は、入れた後に load error として現れるので入口で断る。
+    validate_registered_entry(&manifest.entry)?;
+
+    // 衝突判定は in-memory の一覧だけでは足りない。登録直後 (再起動前) のトリガーは
+    // ディスクにあって一覧に無いので、両方見る。
+    let conflict = match find_trigger(triggers, &manifest.id) {
+        Some(t) => Some(t.source),
+        None => registered_dir
+            .filter(|d| installed_path(d, &manifest.id).is_dir())
+            .map(|_| TriggerSource::Registered),
+    };
+
+    Ok(TriggerCandidate {
+        path: dir.to_string_lossy().into_owned(),
+        id: manifest.id,
+        name: manifest.name,
+        description: manifest.description,
+        schedule: manifest.schedule,
+        tz: manifest.tz,
+        required_secrets: manifest.required_secrets,
+        // 検証済みのパターンから組み立て直す (list_triggers と同じ理由)。同意画面に
+        // 出る文字列は、実際に効く宣言と 1 文字も違ってはいけない。
+        allowed_hosts: validated.hosts.iter().map(|h| h.as_declared()).collect(),
+        conflict,
+    })
+}
+
+/// フォルダを選ばせて下見する (#58)。キャンセルは `Ok(None)`。
+///
+/// ダイアログを Rust 側で開くのは、フロントに `@tauri-apps/plugin-dialog` を足さずに
+/// 済ませるため。UI が持つのは invoke だけという既存の形を崩さない。
+///
+/// ダイアログが開いている間は**そのスレッドが返らない**。ユーザーが選び終わるまで待つ
+/// 時間に上限は無いので、async runtime の worker ではなく blocking pool に逃がす
+/// (`blocking_pick_folder` は main thread からも呼べない)。
+#[tauri::command]
+async fn pick_trigger_folder(
+    app: AppHandle,
+    triggers: State<'_, TriggersRef>,
+    registered: State<'_, RegisteredDir>,
+) -> Result<Option<TriggerCandidate>, String> {
+    let triggers = Arc::clone(&triggers);
+    // 置き場が解決できない環境では衝突判定が in-memory の一覧だけになる。下見を
+    // 止めるほどではない (登録側で改めて解決し、そこで断る)。
+    let registered_dir = registered.0.clone();
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(picked) = app
+            .dialog()
+            .file()
+            .set_title("トリガーのフォルダを選ぶ")
+            .blocking_pick_folder()
+        else {
+            return Ok(None);
+        };
+        let dir = picked
+            .into_path()
+            .map_err(|e| format!("選ばれた場所を解決できません: {e}"))?;
+        inspect_candidate(&triggers, registered_dir.as_deref(), &dir).map(Some)
+    })
+    .await
+    .map_err(|e| format!("フォルダの選択に失敗しました: {e}"))?
+}
+
+/// トリガーを `<app_data>/triggers/<id>/` に取り込む (#58)。
+///
+/// **反映は再起動から。** discovery が起動時 1 回で確定することを前提に猶予窓を採って
+/// いない (#26) ので、ここで一覧を差し替えるとその前提が崩れる。ホットリロードは V8 の
+/// 再初期化と state 継続性を巻き込むので分ける (#55)。
+///
+/// ファイルの据え方 (staging → 入れ替え) は [`crate::registry::install_trigger`]。
+#[tauri::command(async)]
+fn register_trigger(
+    app: AppHandle,
+    path: String,
+    triggers: State<'_, TriggersRef>,
+    registered: State<'_, RegisteredDir>,
+    history: State<'_, HistoryRef>,
+) -> Result<TriggerCandidate, String> {
+    let src = PathBuf::from(&path);
+    let dir = registered.get()?;
+    // 下見の結果は UI が持って戻ってくるだけなので、manifest を読み直して同じ検証を
+    // やり直す (フォルダは下見の後に書き換わりうる)。**選ばれたフォルダそのものは
+    // 信じる** — 同意とパスを機構で結ぶには、core 側で発行したトークンを介す必要がある。
+    let candidate = inspect_candidate(&triggers, Some(dir), &src)?;
+
+    if candidate.conflict == Some(TriggerSource::Bundled) {
+        return Err(format!(
+            "'{}' はアプリに同梱されたトリガーと同じ id です。別の id にしてください",
+            candidate.id
+        ));
+    }
+
+    // 置き換え先は id で決まるが、既に居る実体のディレクトリ名は id と違いうる
+    // (`<app_data>/triggers/` に手で置く経路)。畳まずに据えると同じ id の実体が 2 つ残り、
+    // 次の起動でどちらが勝つかが read_dir 順に落ちる (#21 / #6 で消したはずの非決定性)。
+    // 「置き換えました」と言う以上、古い方はここで消す。
+    let superseded = find_trigger(&triggers, &candidate.id)
+        .filter(|t| t.source == TriggerSource::Registered)
+        .map(|t| t.dir.clone())
+        .filter(|prev| prev != &installed_path(dir, &candidate.id));
+
+    let stats = install_trigger(&src, dir, &candidate.id)?;
+
+    if let Some(prev) = superseded {
+        // 据え置きは終わっているので、ここで失敗しても新しい方は入っている。
+        // 黙って残すと次の起動で衝突するため、観測面には残す。
+        if let Err(e) = uninstall_trigger(&prev) {
+            eprintln!(
+                "failed to remove the superseded registration of '{}' at {}: {e}",
+                candidate.id,
+                prev.display()
+            );
+        }
+    }
+
+    let replaced = candidate.conflict.is_some();
+    // 読み飛ばした数も書く。`.git` ごと選んだときに「入っていないもの」が分かる。
+    let skipped = if stats.skipped > 0 {
+        format!(" / 読み飛ばし {} 件", stats.skipped)
+    } else {
+        String::new()
+    };
+    record_activity(
+        &app,
+        &history,
+        &Activity::new(
+            &candidate.id,
+            ActivityKind::Registered,
+            format!(
+                "{} ({} 個のファイル{skipped})。鍵: {} / 宛先: {}",
+                if replaced {
+                    "トリガーを置き換えました"
+                } else {
+                    "トリガーを登録しました"
+                },
+                stats.files,
+                describe_declaration(&candidate.required_secrets),
+                describe_declaration(&candidate.allowed_hosts),
+            ),
+        ),
+    );
+    Ok(candidate)
+}
+
+/// 登録されたトリガーを外す (#58)。
+///
+/// **こちらは再起動を待たない。** 登録と非対称なのは意図的で、「外したのにまだ動く」は
+/// 「入れたのにまだ動かない」より実害が大きい。in-memory の一覧からは
+/// [`TriggerInfo::unregistered`] で外れ、積まれていた予定はその場で捨てる。
+/// JS モジュールはロードされたまま残るが、到達する経路が無くなる。
+#[tauri::command]
+fn unregister_trigger(
+    app: AppHandle,
+    id: String,
+    triggers: State<'_, TriggersRef>,
+    registered: State<'_, RegisteredDir>,
+    task_store: State<'_, TaskStoreRef>,
+    history: State<'_, HistoryRef>,
+) -> Result<(), String> {
+    validate_trigger_id(&id)?;
+    let dir = registered.get()?;
+
+    let known = find_trigger(&triggers, &id);
+    if let Some(t) = known {
+        if t.source == TriggerSource::Bundled {
+            return Err(format!(
+                "'{id}' はアプリに同梱されたトリガーなので外せません (停止はできます)"
+            ));
+        }
+    }
+
+    // 消す先は discovery が見つけた実体そのもの。id から組み立て直すと、手で置いた
+    // フォルダ (名前が id と違いうる) を「外したつもりで何も消していない」が起きる。
+    // in-memory に居ないものは登録直後 (再起動前) なので、そちらは規定の位置にある。
+    let target = known
+        .map(|t| t.dir.clone())
+        .unwrap_or_else(|| installed_path(dir, &id));
+
+    // ファイルを消してから止める。逆にすると、削除に失敗したときに「一覧から消えたのに
+    // 再起動で戻ってくる」状態が残る。
+    let existed = uninstall_trigger(&target)?;
+    if known.is_none() && !existed {
+        return Err(format!("unknown trigger: {id}"));
+    }
+    if let Some(t) = known {
+        t.unregistered.store(true, Ordering::Relaxed);
+    }
+
+    let removed = {
+        let mut store = lock_tasks(&task_store);
+        let removed = store.purge_trigger(&id);
+        save_task_store(&app, &store);
+        removed
+    };
+    remove_trigger_state(&app, &id);
+
+    record_activity(
+        &app,
+        &history,
+        &Activity::new(
+            &id,
+            ActivityKind::Unregistered,
+            format!("トリガーを解除しました (未実行の予定 {removed} 件を破棄)"),
+        ),
+    );
+    Ok(())
+}
+
+/// アプリを再起動する (#58)。
+///
+/// 登録の反映に再起動が要る以上、UI から踏める場所に置く。「再起動してください」とだけ
+/// 言われて手で落とし直させるのは、常駐アプリでは案外難しい (ウィンドウを閉じても
+/// トレイに残る)。
+#[tauri::command]
+fn restart_app(app: AppHandle) {
+    app.restart()
+}
+
+/// 宣言の一覧を観測面の 1 行に収める。空は「無し」と書く — 空文字だと「記録し忘れ」と
+/// 区別がつかない。
+fn describe_declaration(values: &[String]) -> String {
+    if values.is_empty() {
+        "無し".to_string()
+    } else {
+        values.join(", ")
     }
 }
 
@@ -1094,7 +1568,7 @@ fn list_declared_secrets(triggers: State<'_, TriggersRef>) -> Vec<DeclaredSecret
         .or_default()
         .push("Chamberlain".to_string());
 
-    for t in triggers.iter() {
+    for t in active_triggers(&triggers) {
         for name in &t.manifest.required_secrets {
             map.entry(name.clone())
                 .or_default()
@@ -1125,6 +1599,9 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_store::Builder::default().build())
+        // フォルダ選択は Rust 側から開く (#58)。JS からは呼ばせないので capability の
+        // 宣言は要らず、エージェント開発者のアプリ側に足す設定も無い。
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             list_triggers,
             pause_trigger,
@@ -1134,6 +1611,10 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
             delete_task,
             list_activity,
             list_declared_secrets,
+            pick_trigger_folder,
+            register_trigger,
+            unregister_trigger,
+            restart_app,
             secrets::set_secret,
             secrets::has_secret,
             secrets::delete_secret,
@@ -1223,12 +1704,27 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
             let history: HistoryRef = Arc::new(Mutex::new(open_history(app.handle())));
             app.manage(history.clone());
 
-            let triggers: TriggersRef =
-                Arc::new(discover_triggers(app.handle(), &history, &triggers_dir));
+            // 2 つ目の走査元: エンドユーザーが実行時に登録したトリガー (#58)。
+            // 空でも作っておく — フォルダがそこにあること自体が「直接置く」経路になる。
+            // 登録系コマンドも同じ値を使い回す (解決と mkdir を毎回やり直さない)。
+            let registered_dir = RegisteredDir::resolve(app.handle());
+
+            let triggers: TriggersRef = Arc::new(discover_all(
+                app.handle(),
+                &history,
+                &triggers_dir,
+                registered_dir.0.as_deref(),
+            ));
+            app.manage(registered_dir);
             for t in triggers.iter() {
                 eprintln!(
-                    "discovered trigger: {} ({}) — entry {}, schedule '{}' tz={:?}",
-                    t.manifest.id, t.manifest.name, t.manifest.entry, t.manifest.schedule, t.tz
+                    "discovered trigger: {} ({}) [{}] — entry {}, schedule '{}' tz={:?}",
+                    t.manifest.id,
+                    t.manifest.name,
+                    t.source.as_str(),
+                    t.manifest.entry,
+                    t.manifest.schedule,
+                    t.tz
                 );
             }
 
@@ -1255,4 +1751,202 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
 
             Ok(())
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// discovery を通した後の [`TriggerInfo`] 相当。ファイルシステムも Tauri も要らない
+    /// 部分 (取捨と可視性) だけをここで固定する。
+    fn info(id: &str, source: TriggerSource) -> TriggerInfo {
+        TriggerInfo {
+            manifest: TriggerManifest {
+                id: id.to_string(),
+                name: format!("{id} trigger"),
+                description: None,
+                entry: "index.ts".to_string(),
+                required_secrets: Vec::new(),
+                allowed_hosts: Vec::new(),
+                schedule: "@hourly".to_string(),
+                tz: None,
+            },
+            dir: PathBuf::from(format!("/tmp/{id}")),
+            source,
+            paused: Arc::new(AtomicBool::new(false)),
+            unregistered: Arc::new(AtomicBool::new(false)),
+            schedule: Schedule::Hourly { minutes: vec![0] },
+            tz: chrono_tz::UTC,
+            config_error: None,
+            hosts: Vec::new(),
+        }
+    }
+
+    fn ids(triggers: &[TriggerInfo]) -> Vec<&str> {
+        triggers.iter().map(|t| t.manifest.id.as_str()).collect()
+    }
+
+    /// 衝突が無ければ両方採用され、id 昇順に並ぶ (実行順序を安定させるため)。
+    #[test]
+    fn both_sources_are_merged_in_id_order() {
+        let (merged, shadowed) = dedupe_by_id(vec![
+            info("bravo", TriggerSource::Bundled),
+            info("charlie", TriggerSource::Registered),
+            info("alpha", TriggerSource::Registered),
+        ]);
+
+        assert_eq!(ids(&merged), vec!["alpha", "bravo", "charlie"]);
+        assert!(shadowed.is_empty());
+    }
+
+    /// id が衝突したら**先に並べた方**が勝つ。discover_all が焼き込みを先に置くので、
+    /// アプリに同梱された「そのアプリらしさ」は後から乗っ取られない (#58)。
+    #[test]
+    fn the_first_source_wins_id_collisions() {
+        let (merged, shadowed) = dedupe_by_id(vec![
+            info("greeter", TriggerSource::Bundled),
+            info("greeter", TriggerSource::Registered),
+        ]);
+
+        assert_eq!(ids(&merged), vec!["greeter"]);
+        assert_eq!(merged[0].source, TriggerSource::Bundled);
+        // 黙って消さない。呼び出し側が観測面に残せるよう返す。
+        assert_eq!(ids(&shadowed), vec!["greeter"]);
+        assert_eq!(shadowed[0].source, TriggerSource::Registered);
+    }
+
+    // ---- 登録前の下見 (#58) ----------------------------------------------
+
+    use crate::registry::temp_dir;
+
+    /// トリガーのフォルダを 1 つ作る。`manifest` はそのまま manifest.json に書く。
+    fn candidate_dir(root: &Path, manifest: &str) -> PathBuf {
+        let dir = root.join("incoming");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(MANIFEST_FILE), manifest).unwrap();
+        std::fs::write(dir.join("index.ts"), "export function tick() {}").unwrap();
+        dir
+    }
+
+    const VALID_MANIFEST: &str = r#"{
+        "id": "probe",
+        "name": "下見テスト",
+        "entry": "index.ts",
+        "schedule": "@daily 09:00",
+        "tz": "Asia/Tokyo",
+        "requiredSecrets": ["github_token"],
+        "allowedHosts": ["API.GitHub.com"]
+    }"#;
+
+    /// 同意画面に出す宣言は**検証済みの側**から組み立てる。manifest の生文字列をそのまま
+    /// 出すと、大文字の差で「画面に見えている宣言」と「実際に効く宣言」がずれる。
+    #[test]
+    fn inspect_returns_the_declarations_that_will_be_enforced() {
+        let root = temp_dir("valid");
+        let dir = candidate_dir(&root, VALID_MANIFEST);
+
+        let c = inspect_candidate(&[], None, &dir).unwrap();
+
+        assert_eq!(c.id, "probe");
+        assert_eq!(c.name, "下見テスト");
+        assert_eq!(c.schedule, "@daily 09:00");
+        assert_eq!(c.required_secrets, vec!["github_token"]);
+        assert_eq!(c.allowed_hosts, vec!["api.github.com"]);
+        assert_eq!(c.conflict, None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 入口で止める条件。壊れたものを入れてから「壊れています」と表示するより、
+    /// 入る前に断る方が直しやすい。
+    #[test]
+    fn inspect_rejects_folders_that_should_not_be_registered() {
+        let cases: [(&str, &str); 5] = [
+            (
+                "bad-id",
+                r#"{"id":"../evil","name":"n","entry":"index.ts","schedule":"@hourly"}"#,
+            ),
+            (
+                "reserved-id",
+                r#"{"id":"__meta__","name":"n","entry":"index.ts","schedule":"@hourly"}"#,
+            ),
+            (
+                "bad-schedule",
+                r#"{"id":"probe","name":"n","entry":"index.ts","schedule":"毎日"}"#,
+            ),
+            (
+                "bad-hosts",
+                r#"{"id":"probe","name":"n","entry":"index.ts","schedule":"@hourly","allowedHosts":["*"]}"#,
+            ),
+            (
+                "escaping-entry",
+                r#"{"id":"probe","name":"n","entry":"../index.ts","schedule":"@hourly"}"#,
+            ),
+        ];
+        for (label, manifest) in cases {
+            let root = temp_dir(label);
+            let dir = candidate_dir(&root, manifest);
+            assert!(
+                inspect_candidate(&[], None, &dir).is_err(),
+                "{label} は弾くはず"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    /// manifest が無いフォルダ / entry が実在しないフォルダも入口で断る。
+    #[test]
+    fn inspect_requires_a_manifest_and_a_real_entry() {
+        let root = temp_dir("missing");
+        let empty = root.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(inspect_candidate(&[], None, &empty).is_err());
+
+        let dir = candidate_dir(&root, VALID_MANIFEST);
+        std::fs::remove_file(dir.join("index.ts")).unwrap();
+        let err = inspect_candidate(&[], None, &dir).unwrap_err();
+        assert!(err.contains("entry"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 衝突は 2 箇所から拾う: 起動時から居るトリガーと、登録済みだがまだ再起動して
+    /// いないもの (ディスクにしか居ない)。
+    #[test]
+    fn inspect_reports_conflicts_from_memory_and_from_disk() {
+        let root = temp_dir("conflict");
+        let dir = candidate_dir(&root, VALID_MANIFEST);
+        let registered = root.join("registered");
+        std::fs::create_dir_all(registered.join("probe")).unwrap();
+
+        let bundled = vec![info("probe", TriggerSource::Bundled)];
+        assert_eq!(
+            inspect_candidate(&bundled, None, &dir).unwrap().conflict,
+            Some(TriggerSource::Bundled)
+        );
+        assert_eq!(
+            inspect_candidate(&[], Some(&registered), &dir)
+                .unwrap()
+                .conflict,
+            Some(TriggerSource::Registered)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 解除は再起動を待たない。in-memory の一覧には残るが、そこを見る全経路から外れる。
+    #[test]
+    fn unregistered_triggers_disappear_from_every_lookup() {
+        let triggers = vec![
+            info("kept", TriggerSource::Registered),
+            info("gone", TriggerSource::Registered),
+        ];
+        triggers[1].unregistered.store(true, Ordering::Relaxed);
+
+        assert_eq!(
+            active_triggers(&triggers)
+                .map(|t| t.manifest.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["kept"]
+        );
+        assert!(find_trigger(&triggers, "gone").is_none());
+        assert!(find_trigger(&triggers, "kept").is_some());
+    }
 }

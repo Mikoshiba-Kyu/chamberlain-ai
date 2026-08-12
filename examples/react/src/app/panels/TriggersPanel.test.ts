@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 
-import { formatNextFireAt, formatPermissions } from "./TriggersPanel";
+import {
+  describeConflict,
+  formatConsentPermissions,
+  formatNextFireAt,
+  formatPermissions,
+  sourceLabel,
+} from "./TriggersPanel";
 
 // TZ は Asia/Tokyo に固定してある (vite.config.ts の `test.env`)。
 describe("formatNextFireAt", () => {
@@ -53,5 +59,46 @@ describe("formatPermissions", () => {
     expect(
       formatPermissions({ requiredSecrets: ["token"], allowedHosts: [] }),
     ).toBe("鍵 token");
+  });
+});
+
+// 実行時登録 (#58)。エンドユーザーが「入れる前に」読む唯一の画面なので、宣言の見せ方と
+// 衝突の言い方だけは固定しておく。
+describe("sourceLabel", () => {
+  it("登録と同梱を区別する", () => {
+    expect(sourceLabel("registered")).toBe("登録");
+    expect(sourceLabel("bundled")).toBe("同梱");
+  });
+});
+
+describe("formatConsentPermissions", () => {
+  it("宣言があればそのまま出す", () => {
+    expect(
+      formatConsentPermissions({
+        requiredSecrets: ["github_token"],
+        allowedHosts: ["api.github.com"],
+      }),
+    ).toBe("鍵 github_token · 宛先 api.github.com");
+  });
+
+  it("宣言が無いことを空欄にしない", () => {
+    // 「宣言なし」は「制限なし」ではなく「何もできない」。空欄だと逆に読める。
+    expect(
+      formatConsentPermissions({ requiredSecrets: [], allowedHosts: [] }),
+    ).toBe("鍵もネットワークも使いません (宣言なし)");
+  });
+});
+
+describe("describeConflict", () => {
+  it("同梱との衝突は登録できないと言う", () => {
+    expect(describeConflict("bundled")).toContain("登録できません");
+  });
+
+  it("登録済みとの衝突は置き換えになると言う", () => {
+    expect(describeConflict("registered")).toContain("置き換わります");
+  });
+
+  it("衝突が無ければ何も出さない", () => {
+    expect(describeConflict(null)).toBeNull();
   });
 });
