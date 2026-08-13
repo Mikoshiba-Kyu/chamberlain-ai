@@ -182,6 +182,21 @@ struct TriggerManifest {
     tz: Option<String>,
 }
 
+/// [`TriggerManifest`] が読むキーの全部。**serde は未知のキーを黙って無視する**ので、
+/// 配布する仕様書 (#60) の例に綴り違い (`required_secrets` 等) が混ざっていないかを
+/// テストで見るために名前を並べておく。構造体にフィールドを足したらここにも足す。
+#[cfg(test)]
+const MANIFEST_FIELDS: [&str; 8] = [
+    "id",
+    "name",
+    "description",
+    "entry",
+    "requiredSecrets",
+    "allowedHosts",
+    "schedule",
+    "tz",
+];
+
 struct TriggerInfo {
     manifest: TriggerManifest,
     dir: PathBuf,
@@ -997,6 +1012,18 @@ impl WorkerHost for TauriHost {
     }
 }
 
+/// トリガーの JS を動かす Runtime の構成。
+///
+/// **1 箇所にまとめてあるのは、仕様書 (#60) の「できないこと」がここに依存するため。**
+/// 拡張を足せば `fetch` や `TextEncoder` の有無が変わり、配布している仕様書が嘘になる。
+/// 裏取りのテストが本番と同じ構成を見ていることを、型の上で担保しておく。
+fn trigger_runtime_options() -> rustyscript::RuntimeOptions {
+    rustyscript::RuntimeOptions {
+        extensions: vec![secrets::chamberlain_ops::init()],
+        ..Default::default()
+    }
+}
+
 /// JS ワーカー: 単一の rustyscript Runtime に N モジュールを載せ、心拍ごとに
 /// 「due なタスクを取り出して実行する」。V8 の thread affinity を守るため、Runtime は
 /// この std::thread に閉じ込め、tokio 側と UI 側からは mpsc で心拍を送るだけ。
@@ -1024,13 +1051,8 @@ fn spawn_trigger_worker(
 
     std::thread::spawn(move || {
         // 予算 (#59) 付きで立てる。止め方 2 通りが一組で入ることは guarding 側の責任。
-        let (mut runtime, watchdog) = match Watchdog::guarding(
-            JS_BUDGET,
-            rustyscript::RuntimeOptions {
-                extensions: vec![secrets::chamberlain_ops::init()],
-                ..Default::default()
-            },
-        ) {
+        let (mut runtime, watchdog) = match Watchdog::guarding(JS_BUDGET, trigger_runtime_options())
+        {
             Ok(pair) => pair,
             Err(e) => {
                 eprintln!("failed to init JS runtime: {e}");
@@ -1393,14 +1415,25 @@ fn inspect_candidate(
     })
 }
 
-/// フォルダを選ばせて下見する (#58)。キャンセルは `Ok(None)`。
+/// フォルダ選択ダイアログを開く。キャンセルは `Ok(None)`。
 ///
 /// ダイアログを Rust 側で開くのは、フロントに `@tauri-apps/plugin-dialog` を足さずに
-/// 済ませるため。UI が持つのは invoke だけという既存の形を崩さない。
+/// 済ませるため (#58)。UI が持つのは invoke だけという既存の形を崩さない。
 ///
-/// ダイアログが開いている間は**そのスレッドが返らない**。ユーザーが選び終わるまで待つ
-/// 時間に上限は無いので、async runtime の worker ではなく blocking pool に逃がす
-/// (`blocking_pick_folder` は main thread からも呼べない)。
+/// **blocking pool の中から呼ぶこと。** ダイアログが開いている間そのスレッドは返らず、
+/// ユーザーが選び終わるまでの時間に上限は無い。`blocking_pick_folder` 自体、main thread
+/// からは呼べない。
+fn pick_folder(app: &AppHandle, title: &str) -> Result<Option<PathBuf>, String> {
+    let Some(picked) = app.dialog().file().set_title(title).blocking_pick_folder() else {
+        return Ok(None);
+    };
+    picked
+        .into_path()
+        .map(Some)
+        .map_err(|e| format!("選ばれた場所を解決できません: {e}"))
+}
+
+/// フォルダを選ばせてトリガーを下見する (#58)。キャンセルは `Ok(None)`。
 #[tauri::command]
 async fn pick_trigger_folder(
     app: AppHandle,
@@ -1413,17 +1446,9 @@ async fn pick_trigger_folder(
     let registered_dir = registered.0.clone();
 
     tauri::async_runtime::spawn_blocking(move || {
-        let Some(picked) = app
-            .dialog()
-            .file()
-            .set_title("トリガーのフォルダを選ぶ")
-            .blocking_pick_folder()
-        else {
+        let Some(dir) = pick_folder(&app, "トリガーのフォルダを選ぶ")? else {
             return Ok(None);
         };
-        let dir = picked
-            .into_path()
-            .map_err(|e| format!("選ばれた場所を解決できません: {e}"))?;
         inspect_candidate(&triggers, registered_dir.as_deref(), &dir).map(Some)
     })
     .await
@@ -1595,6 +1620,59 @@ fn describe_declaration(values: &[String]) -> String {
     }
 }
 
+/// 仕様書を skill として書き出すときのフォルダ名 (#60)。
+///
+/// Claude Code / Claude Desktop は `<skills root>/<name>/SKILL.md` を探すので、この形で
+/// 書き出せば、選んだ先が skills ディレクトリでありさえすればそのまま載る。**仕様書の
+/// frontmatter の `name` と一致していなければならない** (テストで固定してある)。
+const TRIGGER_SKILL_DIR: &str = "chamberlain-triggers";
+
+/// トリガーの書き方を 1 ファイルで説明した仕様書 (#60)。**core に焼き込む。**
+///
+/// 実行時登録 (#58) でトリガーの供給元が 3 つ (エンドユーザー自身 / 配布元 / 秘書) に
+/// 開いた以上、「仕様を知らない書き手」が最も多い経路は**エンドユーザーが外部の生成 AI に
+/// 書かせる**ところになる。渡すものが `docs/architecture.md` しか無ければ、framework 本体の
+/// 実装の話に埋もれた仕様を食わせることになり、まともなトリガーは出てこない。
+///
+/// バイナリに焼くのは、**仕様書と実装のバージョンを機械的に一致させる**ため。resource dir に
+/// 置くとエージェント開発者の `bundle.resources` の書き方に依存し、core を上げても手元の
+/// 仕様書が古いまま、という乖離が起きる。同じ実体が `create-chamberlain` の
+/// scaffold 出力にも skill として配られる (同期は `scripts/sync-template.mjs`)。
+const TRIGGER_SPEC: &str = include_str!("trigger-spec.md");
+
+/// 仕様書を skill として書き出す (#60)。キャンセルは `Ok(None)`、成功は書いた場所。
+///
+/// **配るのは「本文をコピーさせる」形ではなく skill の形にした。** 貼り付けさせると、
+/// AI が返した 2 ファイルをエンドユーザーが手で作って保存することになり、TS を書けない
+/// 人向けの経路としてそこだけ人力で残る。skill として載れば AI がフォルダごと書き出せる
+/// ので、ユーザーの操作は「[フォルダから追加…] でそれを指す」だけになる。
+///
+/// チャット窓しか持たない相手向けの口はアプリに持たない。そちらは将来、AI が
+/// Chamberlain の公開ドキュメントを自分で参照する形に寄せる。
+///
+/// ダイアログを待つので [`pick_folder`] と同じく blocking pool の中で動かす。
+#[tauri::command]
+async fn save_trigger_skill(app: AppHandle) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(root) = pick_folder(
+            &app,
+            "skill の置き場所を選ぶ (Claude Code なら .claude/skills)",
+        )?
+        else {
+            return Ok(None);
+        };
+        let dir = root.join(TRIGGER_SKILL_DIR);
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("{} を作れません: {e}", dir.display()))?;
+        let file = dir.join("SKILL.md");
+        std::fs::write(&file, TRIGGER_SPEC)
+            .map_err(|e| format!("{} に書けません: {e}", file.display()))?;
+        Ok(Some(file.display().to_string()))
+    })
+    .await
+    .map_err(|e| format!("skill の保存に失敗しました: {e}"))?
+}
+
 /// 「今 UI が集める必要がある secret 名」を返す。framework 由来 (Chamberlain 本体が
 /// 必ず要求するもの、例: anthropic_api_key) と、各トリガー manifest の
 /// `requiredSecrets` を合流させる。名前の重複は 1 要素にまとめ、`required_by` に
@@ -1651,6 +1729,7 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
             delete_task,
             list_activity,
             list_declared_secrets,
+            save_trigger_skill,
             pick_trigger_folder,
             register_trigger,
             unregister_trigger,
@@ -2003,5 +2082,233 @@ mod tests {
         );
         assert!(find_trigger(&triggers, "gone").is_none());
         assert!(find_trigger(&triggers, "kept").is_some());
+    }
+
+    /// 仕様書 ([`TRIGGER_SPEC`]) が実装と食い違っていないことを固定する (#60)。
+    ///
+    /// **これは配布物である。** 中身がずれると、エンドユーザーが外部の生成 AI に渡した
+    /// 指示書がそのまま「動かないトリガーを書かせる指示書」になり、しかも間違いに
+    /// 気づくのは登録して再起動した後になる。人が読み比べて保つ約束にはできない。
+    mod trigger_spec_doc {
+        use super::*;
+
+        /// 仕様書中の ```json ブロック。
+        ///
+        /// 閉じフェンスが見つからないブロックは飛ばさず panic する。飛ばすと「例を 1 つ
+        /// 足して、それが検査されていなかった」が下の件数チェックをすり抜ける。
+        fn json_blocks() -> Vec<&'static str> {
+            TRIGGER_SPEC
+                .split("```json\n")
+                .skip(1)
+                .map(|rest| {
+                    rest.split_once("\n```")
+                        .unwrap_or_else(|| panic!("閉じていない json ブロックがある:\n{rest}"))
+                        .0
+                })
+                .collect()
+        }
+
+        /// `<!-- spec-test: NAME -->` の後に来る表から、**1 列目**のインラインコードを拾う。
+        ///
+        /// 1 列目に閉じるので、「代わりにこう書く」の列に正しい記法が入っていても拾わない
+        /// (行全体から最初のコードを探すと、1 列目が地の文の行でその列を掴んでしまう)。
+        /// マーカーで括るのは、仕様書に表を足したときにこのテストが黙って素通りしない
+        /// ようにするため。
+        fn marked_table_codes(marker: &str) -> Vec<&'static str> {
+            let anchor = format!("<!-- spec-test: {marker} -->");
+            let rest = TRIGGER_SPEC
+                .split_once(&anchor)
+                .unwrap_or_else(|| panic!("仕様書にマーカー '{anchor}' がない"))
+                .1;
+            rest.lines()
+                .map(str::trim)
+                .skip_while(|line| !line.starts_with('|'))
+                .take_while(|line| line.starts_with('|'))
+                // 行頭の `|` で split すると先頭が空文字になるので、1 列目は nth(1)。
+                .filter_map(|line| line.split('|').nth(1))
+                .filter_map(|cell| {
+                    let (_, after) = cell.split_once('`')?;
+                    after.split_once('`').map(|(code, _)| code)
+                })
+                .collect()
+        }
+
+        /// skill として書き出す以上、frontmatter が要る (#60)。**name は書き出し先の
+        /// フォルダ名と一致していなければならない** — ずれると Claude 側が skill として
+        /// 認識しない。`description` は「いつ読むか」の判断材料なので空を許さない。
+        #[test]
+        fn skill_frontmatter_matches_the_output_path() {
+            let body = TRIGGER_SPEC
+                .strip_prefix("---\n")
+                .expect("仕様書は frontmatter で始まる");
+            let (front, _) = body
+                .split_once("\n---\n")
+                .expect("frontmatter が閉じていない");
+            let field = |key: &str| {
+                front
+                    .lines()
+                    .find_map(|l| l.strip_prefix(&format!("{key}: ")))
+                    .unwrap_or_else(|| panic!("frontmatter に {key} がない"))
+                    .trim()
+            };
+            assert_eq!(field("name"), TRIGGER_SKILL_DIR);
+            assert!(field("description").len() > 30, "description が短すぎる");
+        }
+
+        /// 仕様書に載せた manifest がそのまま discovery を通ること。
+        ///
+        /// **断片を許さない** — 読めないブロックは黙って飛ばさず落とす。飛ばすようにすると
+        /// 「例を 1 つ足して、それが壊れていた」がテストの外に出る。それはこのテストが
+        /// 守ろうとしているものそのものである。
+        #[test]
+        fn manifest_samples_pass_validation() {
+            let blocks = json_blocks();
+            // 例を減らしたときに「0 件検査して成功」にならないよう下限を置く。
+            assert!(
+                blocks.len() >= 4,
+                "manifest の例が {} 件しかない",
+                blocks.len()
+            );
+            for block in blocks {
+                let manifest = serde_json::from_str::<TriggerManifest>(block).unwrap_or_else(|e| {
+                    panic!("仕様書の json が manifest として読めない: {e}\n{block}")
+                });
+                // 綴り違いは serde が黙って無視するので、キーの側も見る。`required_secrets`
+                // と書いた例を配ると「宣言したのに読めないトリガー」を教えることになる。
+                let raw: BTreeMap<String, serde_json::Value> =
+                    serde_json::from_str(block).expect("json object");
+                for key in raw.keys() {
+                    assert!(
+                        MANIFEST_FIELDS.contains(&key.as_str()),
+                        "仕様書の manifest に未知のキー '{key}' がある (綴り違い?)"
+                    );
+                }
+                let validated = validate_manifest(&manifest);
+                assert!(
+                    validated.config_error().is_none(),
+                    "仕様書の manifest '{}' が構成エラー: {:?}",
+                    manifest.id,
+                    validated.config_error()
+                );
+                // 仕様書は「フォルダ名 = id」「entry は index.ts」と指示している。
+                assert_eq!(manifest.entry, "index.ts");
+                assert!(
+                    registry::validate_trigger_id(&manifest.id).is_ok(),
+                    "仕様書の id '{}' は実行時登録の検証を通らない",
+                    manifest.id
+                );
+            }
+        }
+
+        /// 「使える記法」の表が全部パースを通ること。
+        #[test]
+        fn documented_schedules_parse() {
+            let codes = marked_table_codes("schedule-ok");
+            assert!(codes.len() >= 10, "表が短すぎる: {codes:?}");
+            for code in codes {
+                assert!(
+                    parse_schedule(code).is_ok(),
+                    "仕様書が使えると書いている '{code}' がパースを通らない"
+                );
+            }
+        }
+
+        /// 「使えない記法」の表が全部弾かれること。**こちらが本体**である。
+        /// 生成 AI は放っておくと cron 式や `@every 7m` を書くので、
+        /// 採らない記法を名指しで挙げているのが仕様書の効きどころになる。
+        #[test]
+        fn rejected_schedules_are_really_rejected() {
+            let codes = marked_table_codes("schedule-reject");
+            assert!(codes.len() >= 6, "表が短すぎる: {codes:?}");
+            for code in codes {
+                assert!(
+                    parse_schedule(code).is_err(),
+                    "仕様書が使えないと書いている '{code}' がパースを通ってしまう"
+                );
+            }
+        }
+
+        /// 仕様書の「できないこと」(§6) が実際の JS 環境と一致していること。
+        ///
+        /// **ここは推測で書けない。** rustyscript が引く deno 拡張が増減すれば
+        /// `fetch` や `TextEncoder` の有無は変わる。仕様書が「存在しません」と断言する
+        /// 以上、断言の裏取りは実物の isolate に対して行う。
+        ///
+        /// V8 isolate を 1 つ立てるので、**このモジュールで Runtime を作るテストは
+        /// これ 1 つに保つこと** (同一スレッドで 2 つ目を作ると V8 が abort する)。
+        #[test]
+        fn spec_matches_the_real_js_environment() {
+            // 本番の worker (spawn_trigger_worker) と同じ構成で立てる。ここが分かれると
+            // 「実物に対する裏取り」という前提が崩れ、別の isolate に対して合格し続ける。
+            let mut runtime =
+                rustyscript::Runtime::new(trigger_runtime_options()).expect("JS runtime");
+
+            let absent = [
+                "fetch",
+                "TextEncoder",
+                "TextDecoder",
+                "structuredClone",
+                "AbortController",
+                "process",
+                "require",
+                "localStorage",
+                "window",
+                "document",
+            ];
+            let present = [
+                "console",
+                "crypto",
+                "URL",
+                "URLSearchParams",
+                "atob",
+                "btoa",
+                "setTimeout",
+                "setInterval",
+                "Intl",
+                "chamberlain",
+                // 使えると勧めているわけではないが、**見えている**ので仕様書が黙って
+                // いると「ここに書いていない機能は存在しません」が嘘になる (§6)。
+                "Deno",
+            ];
+            // eval 1 回にまとめる。1 名前ごとに呼ぶと、その都度スクリプトのコンパイルと
+            // イベントループの完走が走る (isolate を 1 つに抑えた意味が薄れる)。
+            let names: Vec<&str> = absent.iter().chain(present.iter()).copied().collect();
+            let script = format!(
+                "{}.map((n) => typeof globalThis[n])",
+                serde_json::to_string(&names).expect("json")
+            );
+            let kinds: Vec<String> = runtime.eval(script).expect("typeof を引けない");
+            for (name, kind) in names.iter().zip(&kinds) {
+                if absent.contains(name) {
+                    assert_eq!(kind, "undefined", "仕様書は {name} を無いと書いている");
+                } else {
+                    assert_ne!(kind, "undefined", "仕様書は {name} を使えると書いている");
+                }
+                // 名前は仕様書 §6 から拾えないので (表の書式に乗らない)、両者が同じものを
+                // 指していることだけは固定する。片方から消えたらここで気づく。
+                assert!(
+                    TRIGGER_SPEC.contains(name),
+                    "仕様書に出てこない名前を検査している: {name}"
+                );
+            }
+
+            // 相対 import が通らないこと (仕様書は「1 ファイルに全部書く」と指示している)。
+            let dir = temp_dir("spec-import");
+            std::fs::write(
+                dir.join("helper.ts"),
+                "export const hello = () => \"hi\";\n",
+            )
+            .expect("helper");
+            std::fs::write(
+                dir.join("index.ts"),
+                "import { hello } from \"./helper.ts\";\nexport function tick() { return { notify: { body: hello() } }; }\n",
+            )
+            .expect("entry");
+            let module = rustyscript::Module::load(dir.join("index.ts")).expect("load");
+            assert!(
+                runtime.load_module(&module).is_err(),
+                "相対 import が通るなら仕様書 §6 を書き換えること"
+            );
+        }
     }
 }

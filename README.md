@@ -39,6 +39,7 @@ See [`docs/getting-started.md`](docs/getting-started.md) for the full walkthroug
 - [`docs/architecture.md`](docs/architecture.md) — current skeleton (responsibilities, contracts, decisions)
 - [`docs/getting-started.md`](docs/getting-started.md) — setup and first run (for agent developers)
 - [`docs/versioning.md`](docs/versioning.md) — versioning, release, tag and branch policy
+- [`packages/core/src/trigger-spec.md`](packages/core/src/trigger-spec.md) — self-contained spec for writing a single trigger (hand this to a generative AI as-is)
 
 > [!NOTE]
 > Documentation is currently Japanese-only.
