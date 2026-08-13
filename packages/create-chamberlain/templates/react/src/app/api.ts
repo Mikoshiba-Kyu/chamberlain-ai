@@ -185,6 +185,11 @@ export const chamberlainApi = {
   unregisterTrigger: (id: string) => invoke<void>("unregister_trigger", { id }),
   /** アプリを再起動する。登録を反映させるための口 (#58)。 */
   restartApp: () => invoke<void>("restart_app"),
+  /**
+   * トリガーの書き方を skill として書き出す (#60)。フォルダを選ばせ、書いた場所を返す
+   * (キャンセルは `null`)。本文を返す口はない — 理由は core の `save_trigger_skill`。
+   */
+  saveTriggerSkill: () => invoke<string | null>("save_trigger_skill"),
 
   listDeclaredSecrets: () => invoke<DeclaredSecretItem[]>("list_declared_secrets"),
   hasSecret: (name: string) => invoke<boolean>("has_secret", { name }),

@@ -45,6 +45,14 @@ CHAMBERLAIN_SECRET_GITHUB_TOKEN=ghp_...
 
 env-var が設定されていれば keyring より優先されます。設定されていなければ従来通り keyring を使います。`.env` / `.env.local` / `.env.*.local` はテンプレートの `.gitignore` に含まれています。
 
+## トリガーの書き方 (仕様書)
+
+生成先の `.claude/skills/chamberlain-triggers/SKILL.md` が、トリガー 1 個を書くのに必要なことを 1 ファイルにまとめた仕様書です (manifest の全項目 / `schedule` の全記法と**採らない記法** / `tick(ctx)` の契約 / `chamberlain.*` でできること・できないこと / 動く例)。
+
+**skill として同梱してあるので、Claude Code に「トリガーを 1 つ足して」と頼めばこれを読んで書きます。** 他の生成 AI に書かせるときはファイルごと渡してください。以下はここでは繰り返さない要点だけです。
+
+配布したアプリからも同じものが取り出せます (「トリガー」画面の [書き方を skill として保存…] で、選んだフォルダに書き出す)。実体は `chamberlain-core` に焼き込まれているので、エンドユーザーの手元でも「今動いている core と同じバージョンの仕様」が出てきます。
+
 ## トリガーから使える API
 
 トリガー (`triggers/*/index.ts`) は ambient global `chamberlain.*` を通じて Rust 側と対話します。

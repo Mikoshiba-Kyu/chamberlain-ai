@@ -39,6 +39,16 @@ pnpm sync:template:check    # 差分があれば非 0 (CI が実行する)
 
 `package.json` は同期対象外なので、**依存やスクリプトを足すときは 2 箇所に手で入れる**必要があります (片方だけだと CI では気づけません)。
 
+### 例外: core が実体を持つファイル
+
+**template の中に 1 つだけ「編集してはいけないもの」があります。**
+
+| template 側の場所 | 実体 |
+|---|---|
+| `_claude/skills/chamberlain-triggers/SKILL.md` | `packages/core/src/trigger-spec.md` (#60) |
+
+トリガー仕様書は core のバイナリに焼き込まれていて (`include_str!`)、配布されたアプリからも同じものが skill として書き出されます。実装と同じバージョンの仕様が出てこなければ意味が無いので、**ここだけ真実は core 側**です。template のコピーを編集しても `pnpm sync:template` で黙って上書きされます。
+
 ### フロントエンドのテスト
 
 テストファイルも template 側が真実です (`src/**/*.test.{ts,tsx}`)。scaffold されたプロジェクトに同梱されることを意図しています。

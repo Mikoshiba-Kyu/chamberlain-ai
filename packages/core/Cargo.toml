@@ -14,9 +14,12 @@ categories = ["gui", "development-tools"]
 # NOTE: 明示 include。deno_core の `extension!` マクロが `src/bootstrap.js` を
 # コンパイル時に取り込むため、デフォルトの Cargo publish include (src/**/*.rs) には
 # 載らない .js を明示的に含める必要がある。LICENSE-* も同様。
+# `src/**/*.md` はトリガー仕様書 (#60) — `include_str!` で焼き込むので、外すと
+# publish された crate がコンパイルできない。
 include = [
     "src/**/*.rs",
     "src/**/*.js",
+    "src/**/*.md",
     "Cargo.toml",
     "README.md",
     "LICENSE-MIT",

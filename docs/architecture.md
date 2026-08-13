@@ -379,6 +379,25 @@ JS 実行 1 回に **110 秒**の予算をかける。止め方は**同期のル
 
 フォルダ選択のダイアログは Rust 側 (`tauri-plugin-dialog`) から開く。フロントに dialog プラグインを足さずに済み、エージェント開発者の capability 宣言も増えない — UI が持つのは invoke だけ、という既存の形を崩さない。
 
+### トリガー仕様書の配布 (#60 / #55)
+
+実行時登録が開いた供給元 (a)「エンドユーザーが自分で書く」は、**実際には「外部の生成 AI に書かせる」**になる。したがってこの経路の質は、生成 AI に渡せる自己完結した仕様書があるかどうかで決まる。`docs/architecture.md` は framework 実装の話と混ざっているので、丸ごと食わせてまともなトリガーは出てこない。
+
+実体は **`packages/core/src/trigger-spec.md` 1 つ**で、そこから 2 方向に配る。**どちらも skill の形** (`<name>/SKILL.md` + frontmatter) で、中身は byte 単位で同じ。
+
+| 配り先 | 経路 | 読者 |
+|---|---|---|
+| 配布されたアプリ | `include_str!` → `save_trigger_skill()` → 選んだフォルダに `chamberlain-triggers/SKILL.md` | エンドユーザー |
+| scaffold されたプロジェクト | `scripts/sync-template.mjs` → `templates/react/_claude/skills/…` → scaffold 時に `.claude/skills/…` | エージェント開発者 |
+
+**本文をコピーさせる形は採らない。** 貼り付け経路では、AI が返した 2 ファイルをエンドユーザーが手で作って保存することになり、「TS が書けない人でも秘書に仕事を増やせる」という #55 の狙いのうち、最後の一手だけが人力で残る。skill として載れば AI がフォルダごと書き出せるので、ユーザーの操作は [フォルダから追加…] でそれを指すだけになる。ただの md を置くのと違い、「読め」と言わなくても「トリガーを作って」で載るのも skill 形式の効きどころ。
+
+チャット窓しか持たない相手向けの口はアプリに持たない。そちらは将来、AI が Chamberlain の公開ドキュメントを自分で参照する形に寄せる (アプリが配る必要が無くなる方向)。
+
+**バイナリに焼くのは、仕様書と実装のバージョンを機械的に一致させるため。** resource dir に置くとエージェント開発者の `bundle.resources` の書き方に依存し、core を上げたのに手元の仕様書は古い、という乖離が起こる。同期規律 (`AGENTS.md`) の「真実は template 側」に対する唯一の例外がこれで、同期は core → template → examples の 2 段になる。
+
+**仕様書は実装とテストで結ばれている** (`lib.rs` の `trigger_spec_doc`)。載せた manifest はそのまま `validate_manifest` を通し、「使える記法」の表は `parse_schedule` を通り、「使えない記法」の表は通らないことを確認する。「できないこと」(素の `fetch` が無い / 相対 import が解決できない 等) は**実物の isolate を立てて確かめる** — rustyscript が引く deno 拡張が増減すれば答えが変わる種類の記述であり、人が読み比べて保てる約束ではない。配布物が間違っていると、エンドユーザーが AI に渡した指示書がそのまま「動かないトリガーを書かせる指示書」になり、しかも気づくのは登録して再起動した後になる。
+
 ### Task store
 
 `tauri-plugin-store` の JSON ファイル (`<app_data>/tasks.json`)。pending なタスクリストと、トリガーごとの展開状態 (`expanded_until` + 前回の schedule 文字列) を持つ。
@@ -419,6 +438,7 @@ Tauri の `TrayIconBuilder`。メニュー: Open Chamberlain / Send test notific
 - `register_trigger(path: String) -> TriggerCandidate` — 同意が取れたフォルダを `<app_data>/triggers/<id>/` へ取り込む。**反映は再起動から**。UI の言うことは信じず検証をやり直す
 - `unregister_trigger(id: String)` — 登録されたトリガーを外す。**即時**に効き、積まれていた予定と state も消える。同梱トリガーには使えない
 - `restart_app()` — 登録を反映させるための再起動。常駐アプリは「閉じても終わらない」ので、手で落とし直させない
+- `save_trigger_skill() -> Option<String>` — トリガーの書き方を skill として書き出す (#60)。フォルダを選ばせて `chamberlain-triggers/SKILL.md` を書き、その場所を返す (キャンセルは `None`)
 
 タスクリスト (#26):
 
@@ -451,6 +471,8 @@ triggers/
 ```
 
 Chrome 拡張 / VS Code 拡張 / npm package と同じ mental model。単一ファイル形式との併存は取らない (「.ts が正か? ディレクトリが正か?」の混乱を避けるため)。決定の経緯は #8。
+
+**ただし現状、エントリから他のファイルを `import` することはできない。** core は各トリガーのエントリを `Module::load` + `load_module` で 1 本ずつ載せており、モジュールローダに解決先を与えていないため、`./helper.ts` は "module ... is not loaded" で instantiate に失敗する。アセットも同じ理由で読めない (`chamberlain.readAsset` は[未確定の論点](#アセット読み込み-api)のまま)。したがってトリガーは**実質 1 ファイル**であり、配布物のトリガー仕様書 (#60) もそう指示している。ディレクトリ形式であること自体はアセットを持ち込む余地として保つ。
 
 ### manifest.json スキーマ
 
@@ -524,8 +546,7 @@ chamberlain.ai.complete(opts: {
   prompt: string;
   system?: string;
   model?: string;    // 省略時は claude-sonnet-5
-  maxTokens?: number;
-}): Promise<string>
+}): Promise<string>  // max_tokens は core 固定 (4096)
 chamberlain.http.fetch(url: string, opts?: {
   method?: string;                   // 省略時 GET
   headers?: Record<string, string>;

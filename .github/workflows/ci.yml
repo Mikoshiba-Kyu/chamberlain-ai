@@ -92,7 +92,12 @@ jobs:
       # npm に上げる tarball の中身を検証する。templates/ の同梱漏れや
       # _gitignore の扱いはここでしか見えない
       - name: npm pack --dry-run
-        run: npm pack --dry-run
+        run: |
+          npm pack --dry-run 2>&1 | tee /tmp/pack.txt
+          # トリガー仕様書の skill (#60)。`files` を絞ったときにここで落ちる —
+          # 下の smoke test は working tree の bin/create.js を叩くので、tarball に
+          # 入っているかは**この step でしか見えない**
+          grep -q "templates/react/_claude/skills/chamberlain-triggers/SKILL.md" /tmp/pack.txt
         working-directory: packages/create-chamberlain
 
       # scaffold CLI の smoke test。生成物の cargo check はしない — テンプレは
@@ -106,6 +111,10 @@ jobs:
           test -f "${RUNNER_TEMP}/scaffold-check/src-tauri/tauri.conf.json"
           test -f "${RUNNER_TEMP}/scaffold-check/.gitignore"
           test -d "${RUNNER_TEMP}/scaffold-check/triggers"
+          # トリガー仕様書の skill (#60)。core から template へ配られたものが scaffold
+          # 出力まで届き、_claude → .claude に戻っていること (tarball 同梱は上の step)
+          test -f "${RUNNER_TEMP}/scaffold-check/.claude/skills/chamberlain-triggers/SKILL.md"
+          test ! -e "${RUNNER_TEMP}/scaffold-check/_claude"
           # 3 プラットフォームビルドのワークフロー (#37)。テンプレへの同梱漏れと
           # _github → .github のリネーム漏れをここで止める
           test -f "${RUNNER_TEMP}/scaffold-check/.github/workflows/build.yml"

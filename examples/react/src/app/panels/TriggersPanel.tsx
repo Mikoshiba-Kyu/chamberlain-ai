@@ -133,6 +133,13 @@ export function TriggersPanel({
       setNotice(`${registered.name} (${registered.id}) を登録しました。`);
     });
 
+  const saveSkill = () =>
+    run(async () => {
+      const saved = await chamberlainApi.saveTriggerSkill();
+      // null = キャンセル。画面は何も変えない。
+      if (saved) setNotice(`${saved} に書き出しました。`);
+    });
+
   const unregister = (id: string) =>
     run(async () => {
       setConfirmingUnregister(null);
@@ -156,9 +163,14 @@ export function TriggersPanel({
         <button className="btn" onClick={pickFolder} disabled={busy}>
           フォルダから追加…
         </button>
+        <button className="btn" onClick={saveSkill} disabled={busy}>
+          書き方を skill として保存…
+        </button>
         <span className="hint">
           <code>manifest.json</code>{" "}
           があるフォルダを選ぶと、そのトリガーが何を読み・どこへ出るのかを確認してから登録します。
+          新しく作りたいときは、トリガーの書き方を skill として書き出して AI
+          に渡すと、フォルダごと作ってもらえます。
         </span>
       </div>
 

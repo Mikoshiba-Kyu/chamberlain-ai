@@ -126,6 +126,7 @@ async function renameDotfiles() {
   const dotfiles = [
     ["_gitignore", ".gitignore"],
     ["_github", ".github"],
+    ["_claude", ".claude"],
   ];
   for (const [from, to] of dotfiles) {
     const src = path.join(targetDir, from);

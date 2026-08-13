@@ -57,16 +57,49 @@ const DIVERGENT = new Set([
  *                 ルート `.gitignore` に従う
  * - `README.md`   scaffold されたプロジェクトの README。examples には不要
  * - `.env.example` examples では実物の `.env` を使う (gitignore 済み)
- * - `_github/**` scaffold されたプロジェクト用の GitHub Actions ワークフロー (#37)。
- *                リポ本体は同じ役割を `.github/workflows/build-example.yml` が持つ
- *                (#38)。テンプレのものは自己完結でなければならないので別ファイル
  */
-const TEMPLATE_ONLY = new Set([
-  "_gitignore",
-  "README.md",
-  ".env.example",
-  path.join("_github", "workflows", "build.yml"),
+const TEMPLATE_ONLY = new Set(["_gitignore", "README.md", ".env.example"]);
+
+/**
+ * scaffold 時に `.` 付きへ戻るディレクトリ (`bin/create.js` の renameDotfiles())。
+ * **配下は丸ごと examples に出さない** — `_` のままコピーされても誰からも読まれない。
+ *
+ * - `_github/` scaffold されたプロジェクト用の GitHub Actions ワークフロー (#37)。リポ
+ *              本体は同じ役割を `.github/workflows/build-example.yml` が持つ (#38)。
+ *              テンプレのものは自己完結でなければならないので別ファイル
+ * - `_claude/` トリガー仕様書の skill (#60)。中身の実体は core にある (下記)
+ *
+ * ファイル単位ではなく接頭辞で見るのは、`_claude/` が skills ディレクトリで、2 つ目の
+ * skill や参照ファイルが増えるのが前提の場所だから。1 つ足すたびにこの表を直す規律を
+ * 作ると、忘れた分が examples に死骸として生える。
+ */
+const TEMPLATE_ONLY_DIRS = ["_github", "_claude"];
+
+/**
+ * **core が実体を持ち、template へ配るもの** (#60)。
+ *
+ * 上の原則 (真実は template) の唯一の例外。トリガー仕様書は `packages/core` に置いて
+ * バイナリに焼き込んである (`include_str!`) — 配布されたアプリから skill として書き出せる
+ * 必要があり、かつ**実装と同じバージョンの仕様が出てこなければ意味が無い**ため。
+ *
+ * 配り先は scaffold されたプロジェクトの `.claude/skills/`。ただの md を置いても「読めと
+ * 言われないと読まない」が、skill なら「トリガーを足して」で載る。中身は配布アプリが
+ * 書き出すものと byte 単位で同じ。
+ */
+const FROM_CORE = new Map([
+  [
+    path.join("packages", "core", "src", "trigger-spec.md"),
+    path.join("_claude", "skills", "chamberlain-triggers", "SKILL.md"),
+  ],
 ]);
+
+/** examples に配らないもの (上の 2 つの表の合成)。 */
+function isTemplateOnly(rel) {
+  return (
+    TEMPLATE_ONLY.has(rel) ||
+    TEMPLATE_ONLY_DIRS.some((dir) => rel.startsWith(dir + path.sep))
+  );
+}
 
 const checkOnly = process.argv.includes("--check");
 
@@ -89,31 +122,41 @@ if (!existsSync(SOURCE)) {
   process.exit(1);
 }
 
+let written = 0;
+
+/**
+ * 1 ファイル分の同期。同じかどうかを返し、`--check` でなければ書く。
+ * 「同じなら触らない」「書いたら数える」は両方の段で同じ約束なのでここに閉じる。
+ */
+async function syncFile(fromAbs, toAbs) {
+  const src = await readFile(fromAbs);
+  const exists = existsSync(toAbs);
+  if (exists && src.equals(await readFile(toAbs))) return "same";
+  if (!checkOnly) {
+    await mkdir(path.dirname(toAbs), { recursive: true });
+    await writeFile(toAbs, src);
+    written++;
+  }
+  return exists ? "drifted" : "missing";
+}
+
+// core → template を先に流す。この後の template → examples が続きを運ぶ。
+const coreDrifted = [];
+for (const [from, rel] of FROM_CORE) {
+  const state = await syncFile(path.join(repoRoot, from), path.join(SOURCE, rel));
+  if (state !== "same") coreDrifted.push(`${from} -> templates/react/${rel}`);
+}
+
 const files = await listFiles(SOURCE);
-const shared = files.filter((f) => !DIVERGENT.has(f) && !TEMPLATE_ONLY.has(f));
+const shared = files.filter((f) => !DIVERGENT.has(f) && !isTemplateOnly(f));
 
 const drifted = [];
 const missing = [];
-let written = 0;
 
 for (const rel of shared) {
-  const from = path.join(SOURCE, rel);
-  const to = path.join(TARGET, rel);
-  const src = await readFile(from);
-
-  if (!existsSync(to)) {
-    missing.push(rel);
-  } else {
-    const dst = await readFile(to);
-    if (src.equals(dst)) continue;
-    drifted.push(rel);
-  }
-
-  if (!checkOnly) {
-    await mkdir(path.dirname(to), { recursive: true });
-    await writeFile(to, src);
-    written++;
-  }
+  const state = await syncFile(path.join(SOURCE, rel), path.join(TARGET, rel));
+  if (state === "missing") missing.push(rel);
+  else if (state === "drifted") drifted.push(rel);
 }
 
 // template から消えたのに examples に残っているファイルを検出する。
@@ -130,21 +173,33 @@ if (existsSync(TARGET)) {
   }
 }
 
-const problems = [...missing, ...drifted, ...stale];
+const problems = [...missing, ...drifted, ...stale, ...coreDrifted];
 
 if (checkOnly) {
   if (problems.length === 0) {
     console.log(`sync:template --check OK (${shared.length} shared files in sync)`);
     process.exit(0);
   }
-  console.error("examples/react is out of sync with templates/react.\n");
-  for (const f of missing) console.error(`  missing in examples : ${f}`);
-  for (const f of drifted) console.error(`  content differs     : ${f}`);
-  for (const f of stale) console.error(`  stale in examples   : ${f}`);
-  console.error(
-    "\nfix: edit packages/create-chamberlain/templates/react (the source of truth), " +
-      "then run `pnpm sync:template`.",
-  );
+  // 2 段あるので、どちらがずれたかで直す先が違う。**core 起点のファイルだけは
+  // template が真実ではない**ので、同じ fix 文を出すと消える編集を促すことになる。
+  if (missing.length + drifted.length + stale.length > 0) {
+    console.error("examples/react is out of sync with templates/react.\n");
+    for (const f of missing) console.error(`  missing in examples : ${f}`);
+    for (const f of drifted) console.error(`  content differs     : ${f}`);
+    for (const f of stale) console.error(`  stale in examples   : ${f}`);
+    console.error(
+      "\nfix: edit packages/create-chamberlain/templates/react (the source of truth), " +
+        "then run `pnpm sync:template`.\n",
+    );
+  }
+  if (coreDrifted.length > 0) {
+    console.error("the template copy is out of sync with its source in packages/core.\n");
+    for (const f of coreDrifted) console.error(`  core copy differs   : ${f}`);
+    console.error(
+      "\nfix: edit the file under packages/core (the source of truth for these), " +
+        "then run `pnpm sync:template`.",
+    );
+  }
   process.exit(1);
 }
 
@@ -157,6 +212,6 @@ if (stale.length > 0) {
 console.log(
   written === 0
     ? `sync:template: already in sync (${shared.length} shared files)`
-    : `sync:template: updated ${written} file(s) from the template`,
+    : `sync:template: updated ${written} file(s)`,
 );
 if (stale.length > 0) process.exit(1);

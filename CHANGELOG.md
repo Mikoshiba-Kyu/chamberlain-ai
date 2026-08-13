@@ -26,6 +26,11 @@
   - **登録の反映は再起動から。** 走っているプロセスにトリガーが増えないので、「`discover_triggers()` は起動時 1 回で確定する」前提 (#26) が保たれる
   - **解除は即時。** 積まれていた予定とトリガー state も同時に消える。同梱トリガーは外せない (停止はできる)
   - id が衝突したら焼き込みが勝つ。アプリに同梱された「そのアプリらしさ」を後から乗っ取らせない
+- **トリガーの書き方をまとめた仕様書を同梱するようになった (#60 / #55)。** 実行時登録で開いた供給元 (a)「エンドユーザーが自分で書く」は実際には「外部の生成 AI に書かせる」になるので、その AI に渡せる自己完結した 1 ファイルが要る
+  - 実体は `packages/core/src/trigger-spec.md` 1 つ。**core のバイナリに焼き込む** (`include_str!`) ので、仕様書のバージョンは常に動いている実装と一致する
+  - 配り方は **skill** (`chamberlain-triggers/SKILL.md`)。本文をコピーさせる形は採らない — 貼り付け経路だと AI が返した 2 ファイルをエンドユーザーが手で保存することになり、TS が書けない人向けの経路としてそこだけ人力で残る。skill として載れば AI がフォルダごと書き出せる
+  - エンドユーザーには「トリガー」画面の **[書き方を skill として保存…]** から届く (invoke command `save_trigger_skill`)。エージェント開発者には scaffold されたプロジェクトの `.claude/skills/chamberlain-triggers/SKILL.md` として届く (同期は `scripts/sync-template.mjs`)
+  - 仕様書の内容はテストで実装に結んである。載せた manifest は `validate_manifest` を通り、「使える記法」の表は `parse_schedule` を通り、「使えない記法」(cron 式 / `@every 7m` 等) は通らない。「素の `fetch` は無い」「相対 import は解決できない」は実物の V8 isolate を立てて確認する
 - invoke command に `pick_trigger_folder` / `register_trigger` / `unregister_trigger` / `restart_app` を追加 (#58)。フォルダ選択のダイアログは core が Rust 側で開くので、エージェント開発者側に capability の宣言もフロントの依存も増えない
 - `TriggerListItem` に `source` (`"bundled"` | `"registered"`) を追加。UI がバッジで出し分け、登録したものにだけ「解除」を出す
 - 活動ログの kind に `registered` / `unregistered` を追加。「誰かが後から仕事を増やした」も履歴に残る

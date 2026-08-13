@@ -47,7 +47,7 @@ pnpm tauri build
 
 ## 何を編集するか
 
-- `triggers/<id>/` — トリガーの追加・変更。各トリガーは `manifest.json` と `index.ts` のペア
+- `triggers/<id>/` — トリガーの追加・変更。各トリガーは `manifest.json` と `index.ts` のペア。書き方は `.claude/skills/chamberlain-triggers/SKILL.md` にまとまっています (Claude Code なら「トリガーを足して」で自動的に読まれます)
 - `src/app/` — 秘書 UI (React)。トリガー一覧・アクティビティ・チャット・設定パネル
 - `src-tauri/tauri.conf.json` — アプリ ID / アイコン / bundle 設定
 - `src-tauri/src/lib.rs` — Chamberlain 本体を起動する薄いエントリ (通常触らなくていい)

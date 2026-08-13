@@ -39,6 +39,7 @@ npm create chamberlain@latest my-secretary
 - [`docs/architecture.md`](docs/architecture.md) — 今の骨格 (責務分割・契約・意思決定)
 - [`docs/getting-started.md`](docs/getting-started.md) — セットアップと最初の動作確認 (エージェント開発者向け)
 - [`docs/versioning.md`](docs/versioning.md) — バージョン・リリース・タグ・ブランチ戦略
+- [`packages/core/src/trigger-spec.md`](packages/core/src/trigger-spec.md) — トリガー 1 個を書くための自己完結した仕様書 (生成 AI にはこれをそのまま渡す)
 
 ## コントリビュート
 
