@@ -81,9 +81,12 @@ export interface TriggerListItem {
  *
  * `requiredSecrets` / `allowedHosts` は core が実際に強制している宣言なので (#56 / #57)、
  * ここに出た以上のことはそのトリガーにはできない。
+ *
+ * 出どころは 2 つある。エンドユーザーが選んだフォルダ (#58) と、秘書が生成した下書き
+ * (#61)。**型が同じなのは意図的** — どちらも同じ画面で、同じ内容を見てから入る。
  */
 export interface TriggerCandidate {
-  /** 選ばれたフォルダの絶対パス。`registerTrigger()` にそのまま渡す。 */
+  /** フォルダの絶対パス。`registerTrigger()` にそのまま渡す。 */
   path: string;
   id: string;
   name: string;
@@ -97,6 +100,14 @@ export interface TriggerCandidate {
    * 乗っ取らせない)、`"registered"` は置き換え = 配布物の更新になる。
    */
   conflict: TriggerSource | null;
+  /**
+   * `index.ts` の静的検査で見つかった、仕様から外れている点 (#61)。
+   *
+   * **`requiredSecrets` / `allowedHosts` とは意味が違う。** あちらは「このトリガーに
+   * 何ができるか」(core が強制する)、こちらは「たぶん動かない」。登録の可否には効かない
+   * ので、判断材料として並べるだけ。
+   */
+  warnings: string[];
 }
 
 /**
@@ -133,6 +144,18 @@ export interface ChatMessage {
   role: "user" | "assistant";
   content: string;
   ts: number;
+}
+
+/**
+ * `chatSend()` の戻り値 (#61)。
+ *
+ * 秘書が「繰り返しやってほしいこと」を頼まれたと判断すると、トリガーを 1 つ書いて
+ * `draft` に載せて返す。**この時点では何も登録されていない** — UI は #58 と同じ同意画面を
+ * 出し、確認が取れてから `registerTrigger(draft.path)` を呼ぶ。
+ */
+export interface ChatTurn {
+  message: ChatMessage;
+  draft?: TriggerCandidate;
 }
 
 export const chamberlainApi = {
@@ -183,6 +206,12 @@ export const chamberlainApi = {
    * 積まれていた予定も同時に消える。同梱トリガーは外せない (停止はできる)。
    */
   unregisterTrigger: (id: string) => invoke<void>("unregister_trigger", { id }),
+  /**
+   * 秘書が作った下書きを捨てる (#61)。同意画面で「やめる」を押したときの後始末で、
+   * 何も登録されていないので取り消しではない。
+   */
+  discardTriggerDraft: (id: string) =>
+    invoke<void>("discard_trigger_draft", { id }),
   /** アプリを再起動する。登録を反映させるための口 (#58)。 */
   restartApp: () => invoke<void>("restart_app"),
   /**
@@ -198,6 +227,10 @@ export const chamberlainApi = {
   deleteSecret: (name: string) => invoke<void>("delete_secret", { name }),
 
   chatHistory: () => invoke<ChatMessage[]>("chat_history"),
-  chatSend: (message: string) => invoke<ChatMessage>("chat_send", { message }),
+  /**
+   * 秘書に話しかける。返るのは返答と、**秘書が用意したトリガーの下書き** (#61)。
+   * 下書きが付いてくるかどうかは秘書が決める (「毎朝〜」のような繰り返しの依頼)。
+   */
+  chatSend: (message: string) => invoke<ChatTurn>("chat_send", { message }),
   chatClear: () => invoke<void>("chat_clear"),
 };

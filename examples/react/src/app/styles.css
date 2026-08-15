@@ -396,6 +396,13 @@ body {
   color: #96590a;
 }
 
+/* 静的検査で見つかった「たぶん動かない」点 (#61)。宣言 (できること) とは別物なので、
+   同じ警告色でも箇条書きにして混ぜない */
+.consent-warnings {
+  margin: 0 0 12px;
+  padding-left: 20px;
+}
+
 .consent-actions {
   display: flex;
   gap: 8px;

@@ -1,5 +1,6 @@
 mod ai;
 mod chat;
+mod drafts;
 mod history;
 mod http;
 mod permissions;
@@ -28,11 +29,14 @@ use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_notification::{NotificationExt, PermissionState};
 use tauri_plugin_store::StoreExt;
 
+use crate::drafts::DraftDir;
 use crate::history::{origin_str, Activity, ActivityKind, HistoryStore, MAX_ROWS, RETENTION};
 use crate::permissions::{parse_host_pattern, HostPattern, TriggerGrants, TriggerPermissions};
+/// UI に渡る DTO ([`TriggerCandidate`]) に載るので、型も一緒に公開する。
+pub use crate::registry::TriggerSource;
 use crate::registry::{
-    install_trigger, installed_path, is_reserved_id, uninstall_trigger, validate_entry_path,
-    validate_registered_entry, validate_trigger_id, TriggerSource,
+    install_trigger, installed_path, is_reserved_id, lint_entry_source, read_entry_source,
+    uninstall_trigger, validate_entry_path, validate_registered_entry, validate_trigger_id,
 };
 use crate::schedule::{parse_schedule, resolve_tz, Schedule};
 use crate::secrets::SecretsService;
@@ -294,24 +298,33 @@ struct TriggerListItem {
 /// `requiredSecrets` / `allowedHosts` は core が実際に強制している宣言なので (#56 / #57)、
 /// ここに出た以上のことはそのトリガーにはできない。宣言が強制力を持つ状態で初めて、
 /// 入れる前に見せる意味がある。
+///
+/// `pub` なのは [`crate::chat::ChatTurn`] に載るため (#61)。秘書が作った下書きも
+/// 同じ型で同じ画面に出る — 出どころで見せ方が変わらないことが、この型の役目。
 #[derive(Clone, Debug, Serialize)]
-struct TriggerCandidate {
+pub struct TriggerCandidate {
     /// 選ばれたフォルダの絶対パス。UI はこれをそのまま `register_trigger` に返す。
-    path: String,
-    id: String,
-    name: String,
-    description: Option<String>,
-    schedule: String,
-    tz: Option<String>,
+    pub path: String,
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub schedule: String,
+    pub tz: Option<String>,
     #[serde(rename = "requiredSecrets")]
-    required_secrets: Vec<String>,
+    pub required_secrets: Vec<String>,
     #[serde(rename = "allowedHosts")]
-    allowed_hosts: Vec<String>,
+    pub allowed_hosts: Vec<String>,
     /// 同じ id が既にある場合の相手 (`"bundled"` | `"registered"`)。
     ///
     /// `"bundled"` は登録を拒否する — アプリに同梱された「そのアプリらしさ」を後から
     /// 乗っ取られないため。`"registered"` は置き換え (配布物の更新) として通す。
-    conflict: Option<TriggerSource>,
+    pub conflict: Option<TriggerSource>,
+    /// entry の静的検査で見つかった、仕様から外れている点 (#61)。
+    ///
+    /// **拒否ではない。**「宣言」(`requiredSecrets` / `allowedHosts`) が「このトリガーに
+    /// 何ができるか」を表すのに対し、こちらは「たぶん動かない」を表す。判断材料として
+    /// 並べるだけで、登録の可否には効かない ([`crate::registry::lint_entry_source`])。
+    pub warnings: Vec<String>,
 }
 
 /// UI が受け取るタスクリストの要素。「秘書がこれから何をするつもりか」を 1 画面で見せ、
@@ -1354,7 +1367,10 @@ fn resume_trigger(id: String, triggers: State<'_, TriggersRef>) -> Result<(), St
 /// **副作用は無い。** ここで返した宣言を UI が同意画面に出し、確認が取れてから
 /// [`register_trigger`] がコピーする。読むだけと入れるので 2 つに分かれているが、検証は
 /// 同じ関数を通る (登録側は UI の言うことを信じない)。
-fn inspect_candidate(
+///
+/// 秘書が生成した下書き (#61) もここを通る。**供給元で検証を分けない** — 分ければ、
+/// 緩い方を名乗る経路が価値を持つ。
+pub(crate) fn inspect_candidate(
     triggers: &[TriggerInfo],
     registered_dir: Option<&Path>,
     dir: &Path,
@@ -1381,7 +1397,8 @@ fn inspect_candidate(
     if let Some(e) = validated.config_error() {
         return Err(e);
     }
-    if !dir.join(&manifest.entry).is_file() {
+    let entry_path = dir.join(&manifest.entry);
+    if !entry_path.is_file() {
         return Err(format!(
             "entry '{}' がフォルダの中に見つかりません",
             manifest.entry
@@ -1390,6 +1407,11 @@ fn inspect_candidate(
     // 「今この場所にある」だけでは足りない。コピーを生き延びない置き方 (ドット始まりの
     // 下) は、入れた後に load error として現れるので入口で断る。
     validate_registered_entry(&manifest.entry)?;
+
+    // 中身も見る (#61)。宣言と違って強制力は無いが、**書いたのが AI なら誰も読んで
+    // いない**ので、機械が読んで同意画面に並べる。
+    let source = read_entry_source(&entry_path, &manifest.entry)?;
+    let warnings = lint_entry_source(&source)?;
 
     // 衝突判定は in-memory の一覧だけでは足りない。登録直後 (再起動前) のトリガーは
     // ディスクにあって一覧に無いので、両方見る。
@@ -1412,6 +1434,7 @@ fn inspect_candidate(
         // 出る文字列は、実際に効く宣言と 1 文字も違ってはいけない。
         allowed_hosts: validated.hosts.iter().map(|h| h.as_declared()).collect(),
         conflict,
+        warnings,
     })
 }
 
@@ -1468,9 +1491,13 @@ fn register_trigger(
     path: String,
     triggers: State<'_, TriggersRef>,
     registered: State<'_, RegisteredDir>,
+    drafts: State<'_, DraftDir>,
     history: State<'_, HistoryRef>,
 ) -> Result<TriggerCandidate, String> {
     let src = PathBuf::from(&path);
+    // 秘書が書いたものか、人が選んだフォルダか (#61)。**判断には使わない** — 検証も
+    // コピーも同じで、変わるのは観測面に残る 1 行だけ。
+    let from_draft = drafts.contains(&src);
     let dir = registered.get()?;
     // 下見の結果は UI が持って戻ってくるだけなので、manifest を読み直して同じ検証を
     // やり直す (フォルダは下見の後に書き換わりうる)。**選ばれたフォルダそのものは
@@ -1507,6 +1534,14 @@ fn register_trigger(
         }
     }
 
+    // 下書きは据え置きが終わった時点で用済み。残すと、次の起動まで「同意した覚えの
+    // ないトリガーの元」がディスクに残る。
+    if from_draft {
+        if let Err(e) = drafts::discard(drafts.get()?, &candidate.id) {
+            eprintln!("failed to discard the draft of '{}': {e}", candidate.id);
+        }
+    }
+
     let replaced = candidate.conflict.is_some();
     // 読み飛ばした数も書く。`.git` ごと選んだときに「入っていないもの」が分かる。
     let skipped = if stats.skipped > 0 {
@@ -1521,7 +1556,8 @@ fn register_trigger(
             &candidate.id,
             ActivityKind::Registered,
             format!(
-                "{} ({} 個のファイル{skipped})。鍵: {} / 宛先: {}",
+                "{}{} ({} 個のファイル{skipped})。鍵: {} / 宛先: {}",
+                if from_draft { "秘書が作った" } else { "" },
                 if replaced {
                     "トリガーを置き換えました"
                 } else {
@@ -1534,6 +1570,16 @@ fn register_trigger(
         ),
     );
     Ok(candidate)
+}
+
+/// 秘書が作った下書きを捨てる (#61)。同意画面で「やめる」を押したときの後始末。
+///
+/// **見送ったこと自体は記録しない。** 下書きを作ったことは `[drafted]` に残っており、
+/// そこに `[registered]` が続かなければ「入れなかった」と読める。断るたびに行が増えると、
+/// 観測面が「ユーザーが何を断ったか」の記録になってしまう。
+#[tauri::command]
+fn discard_trigger_draft(id: String, drafts: State<'_, DraftDir>) -> Result<(), String> {
+    drafts::discard(drafts.get()?, &id)
 }
 
 /// 登録されたトリガーを外す (#58)。
@@ -1733,6 +1779,7 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
             pick_trigger_folder,
             register_trigger,
             unregister_trigger,
+            discard_trigger_draft,
             restart_app,
             secrets::set_secret,
             secrets::has_secret,
@@ -1827,6 +1874,9 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
             // 空でも作っておく — フォルダがそこにあること自体が「直接置く」経路になる。
             // 登録系コマンドも同じ値を使い回す (解決と mkdir を毎回やり直さない)。
             let registered_dir = RegisteredDir::resolve(app.handle());
+            // 秘書が書いた下書きの置き場 (#61)。走査先ではないので discovery には渡さない
+            // — 同意を取る前の生成物が起動で勝手に動き出さないための線引き。
+            app.manage(DraftDir::resolve(app.handle()));
 
             let triggers: TriggersRef = Arc::new(discover_all(
                 app.handle(),
@@ -2042,6 +2092,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// entry の中身も下見の対象 (#61)。**動かないことが確定しているものは入口で断る。**
+    /// 供給元 ((a) 人が選んだフォルダ / (c) 秘書の生成) で分岐しない。
+    #[test]
+    fn inspect_rejects_an_entry_without_a_tick_export() {
+        let root = temp_dir("no-tick");
+        let dir = candidate_dir(&root, VALID_MANIFEST);
+        std::fs::write(dir.join("index.ts"), "export function run() {}").unwrap();
+
+        let err = inspect_candidate(&[], None, &dir).unwrap_err();
+
+        assert!(err.contains("tick"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 仕様から外れているだけのものは同意画面に並べる。**登録は止めない** — 文字列
+    /// マッチで拒否すると、動くトリガーを断りうる。
+    #[test]
+    fn inspect_reports_spec_violations_as_warnings() {
+        let root = temp_dir("warn");
+        let dir = candidate_dir(&root, VALID_MANIFEST);
+        std::fs::write(
+            dir.join("index.ts"),
+            "import { x } from \"./h.ts\";\nexport function tick() {}",
+        )
+        .unwrap();
+
+        let c = inspect_candidate(&[], None, &dir).unwrap();
+
+        assert_eq!(c.warnings.len(), 1, "{:?}", c.warnings);
+        assert!(c.warnings[0].contains("import"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// 衝突は 2 箇所から拾う: 起動時から居るトリガーと、登録済みだがまだ再起動して
     /// いないもの (ディスクにしか居ない)。
     #[test]
@@ -2131,6 +2214,47 @@ mod tests {
                     after.split_once('`').map(|(code, _)| code)
                 })
                 .collect()
+        }
+
+        /// 仕様書中の ```typescript ブロックのうち、トリガー 1 個として完結しているもの。
+        /// 型の抜粋 (`declare const chamberlain` 等) は export を持たないので落ちる。
+        fn trigger_typescript_blocks() -> Vec<&'static str> {
+            TRIGGER_SPEC
+                .split("```typescript\n")
+                .skip(1)
+                .map(|rest| {
+                    rest.split_once("\n```")
+                        .unwrap_or_else(|| {
+                            panic!("閉じていない typescript ブロックがある:\n{rest}")
+                        })
+                        .0
+                })
+                .filter(|block| block.contains("export") && block.contains("tick"))
+                .collect()
+        }
+
+        /// 仕様書どおりに書いた index.ts が、同意画面の静的検査を無傷で通ること (#61)。
+        ///
+        /// **警告 0 件まで見る。** ここがずれると、仕様どおりのトリガーに嘘の警告が出る。
+        /// `chamberlain.http.fetch` を素の `fetch` と取り違える類の誤検知は、配布物の
+        /// 例が一番早く見つける。
+        #[test]
+        fn index_samples_pass_the_entry_lint() {
+            let blocks = trigger_typescript_blocks();
+            assert!(
+                blocks.len() >= 4,
+                "index.ts の例が {} 件しかない",
+                blocks.len()
+            );
+            for block in blocks {
+                match lint_entry_source(block) {
+                    Ok(warnings) => assert!(
+                        warnings.is_empty(),
+                        "仕様書の例に警告が出る: {warnings:?}\n{block}"
+                    ),
+                    Err(e) => panic!("仕様書の例が入口で断られる: {e}\n{block}"),
+                }
+            }
         }
 
         /// skill として書き出す以上、frontmatter が要る (#60)。**name は書き出し先の

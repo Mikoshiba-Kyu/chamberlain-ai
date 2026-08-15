@@ -92,6 +92,12 @@ pub(crate) enum ActivityKind {
     Registered,
     /// 登録されたトリガーが解除された (#58)。
     Unregistered,
+    /// 秘書 (Type II) がトリガーの下書きを作った (#61)。
+    ///
+    /// **登録されなかったものも残す。** [`ActivityKind::Registered`] だけだと、同意画面で
+    /// 断られた下書きが観測面から消える。AI が書いたコードは誰も読んでいないという前提で
+    /// 機構を組んでいる以上、「何を書こうとしたか」は追えなければならない。
+    Drafted,
     /// manifest の宣言に無い権限をトリガーが要求したので拒否した (#56 / #57)。
     ///
     /// secret と宛先ホストで kind を分けない。UI から見て意味があるのは「宣言の外に
@@ -136,6 +142,7 @@ impl ActivityKind {
             Self::Deleted => "deleted",
             Self::Registered => "registered",
             Self::Unregistered => "unregistered",
+            Self::Drafted => "drafted",
             Self::Denied => "denied",
             Self::AiCall => "ai_call",
             Self::ConfigError => "config_error",
@@ -164,6 +171,7 @@ impl ActivityKind {
             Self::Deleted => Some("[deleted]"),
             Self::Registered => Some("[registered]"),
             Self::Unregistered => Some("[unregistered]"),
+            Self::Drafted => Some("[drafted]"),
             Self::Denied => Some("[denied]"),
             Self::AiCall => Some("[ai]"),
             Self::ConfigError => Some("[config error]"),
@@ -288,6 +296,7 @@ fn parse_kind(s: &str) -> Option<ActivityKind> {
         Deleted,
         Registered,
         Unregistered,
+        Drafted,
         Denied,
         AiCall,
         ConfigError,
