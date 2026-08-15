@@ -5,6 +5,8 @@ import {
   type TriggerListItem,
   type TriggerSource,
 } from "../api";
+import { ConsentCard, RestartNotice, formatPermissions } from "./ConsentCard";
+import { useBusyAction } from "./useBusyAction";
 
 interface Props {
   triggers: TriggerListItem[];
@@ -30,58 +32,9 @@ export function formatNextFireAt(ts: number | null): string {
   return `${d.getMonth() + 1}/${d.getDate()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
-/**
- * manifest に宣言された権限を 1 行にまとめる。何も宣言していなければ null。
- *
- * ここに出る文字列は**実際に効いている制限そのもの** (#56 / #57)。core が宣言の外を
- * 拒否するので、「宣言は飾りで実際は何でもできる」状態にはならない。実行時登録 (#58) の
- * 同意画面はこれと同じものを、入れる前に見せる。
- */
-export function formatPermissions(
-  t: Partial<Pick<TriggerListItem, "requiredSecrets" | "allowedHosts">>,
-): string | null {
-  // `?? []` は core の pin だけ古い状態への保険。release.yml が pin を機械で検査して
-  // いるが、手で戻された場合でも画面が真っ白にはならないようにする。
-  const secrets = t.requiredSecrets ?? [];
-  const hosts = t.allowedHosts ?? [];
-  const parts: string[] = [];
-  if (secrets.length > 0) {
-    parts.push(`鍵 ${secrets.join(", ")}`);
-  }
-  if (hosts.length > 0) {
-    parts.push(`宛先 ${hosts.join(", ")}`);
-  }
-  return parts.length > 0 ? parts.join(" · ") : null;
-}
-
 /** トリガーの出どころのラベル (#58)。 */
 export function sourceLabel(source: TriggerSource): string {
   return source === "registered" ? "登録" : "同梱";
-}
-
-/**
- * 同意画面に出す権限の行。**何も宣言していないことを空欄にしない。**
- *
- * 「宣言なし」は「制限なし」ではなく「鍵もネットワークも使えない」という強い意味を持つ
- * (#56 / #57)。空欄だと読み手が逆に取る。
- */
-export function formatConsentPermissions(
-  candidate: Pick<TriggerCandidate, "requiredSecrets" | "allowedHosts">,
-): string {
-  return (
-    formatPermissions(candidate) ?? "鍵もネットワークも使いません (宣言なし)"
-  );
-}
-
-/** id が既存とぶつかっているときの注意書き。ぶつかっていなければ null。 */
-export function describeConflict(conflict: TriggerSource | null): string | null {
-  if (conflict === "bundled") {
-    return "同じ id のトリガーがアプリに同梱されています。同梱された方が優先されるため、登録できません。";
-  }
-  if (conflict === "registered") {
-    return "同じ id のトリガーが既に登録されています。登録すると置き換わります。";
-  }
-  return null;
 }
 
 export function TriggersPanel({
@@ -94,26 +47,10 @@ export function TriggersPanel({
 }: Props) {
   // 下見が終わって同意待ちのトリガー。null の間は登録の口が閉じている。
   const [candidate, setCandidate] = useState<TriggerCandidate | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
   const [confirmingUnregister, setConfirmingUnregister] = useState<string | null>(
     null,
   );
-
-  /** 登録系の操作はどれも「二重に押させない・失敗を画面に出す」が要る。 */
-  const run = async (action: () => Promise<void>) => {
-    setBusy(true);
-    setError(null);
-    setNotice(null);
-    try {
-      await action();
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setBusy(false);
-    }
-  };
+  const { busy, error, notice, setNotice, run } = useBusyAction();
 
   const pickFolder = () =>
     run(async () => {
@@ -148,8 +85,6 @@ export function TriggersPanel({
       onChanged();
     });
 
-  const conflictNote = candidate ? describeConflict(candidate.conflict) : null;
-
   return (
     <section className="panel">
       <h1>トリガー</h1>
@@ -176,62 +111,15 @@ export function TriggersPanel({
 
       {error && <p className="error">エラー: {error}</p>}
       {notice && <p className="notice">{notice}</p>}
-      {restartPending && (
-        <div className="notice notice-action">
-          <span>
-            登録したトリガーは再起動後に動き始めます (解除は再起動を待ちません)。
-          </span>
-          <button className="btn" onClick={() => chamberlainApi.restartApp()}>
-            再起動する
-          </button>
-        </div>
-      )}
+      {restartPending && <RestartNotice />}
 
       {candidate && (
-        <div className="consent">
-          <h2>このトリガーを登録しますか？</h2>
-          <dl className="consent-fields">
-            <dt>ID</dt>
-            <dd>
-              <code>{candidate.id}</code>
-            </dd>
-            <dt>名前</dt>
-            <dd>
-              {candidate.name}
-              {candidate.description ? ` — ${candidate.description}` : ""}
-            </dd>
-            <dt>実行タイミング</dt>
-            <dd>
-              <code>{candidate.schedule}</code>
-              {candidate.tz ? ` (${candidate.tz})` : ""}
-            </dd>
-            <dt>できること</dt>
-            <dd>{formatConsentPermissions(candidate)}</dd>
-            <dt>場所</dt>
-            <dd className="consent-path">{candidate.path}</dd>
-          </dl>
-          <p className="hint">
-            ここに出ている宣言が、このトリガーにできることのすべてです。宣言していない鍵は読めず、
-            宣言していない宛先には出られません。
-          </p>
-          {conflictNote && <p className="consent-warning">{conflictNote}</p>}
-          <div className="consent-actions">
-            <button
-              className="btn"
-              onClick={confirmRegister}
-              disabled={busy || candidate.conflict === "bundled"}
-            >
-              登録する
-            </button>
-            <button
-              className="btn"
-              onClick={() => setCandidate(null)}
-              disabled={busy}
-            >
-              やめる
-            </button>
-          </div>
-        </div>
+        <ConsentCard
+          candidate={candidate}
+          busy={busy}
+          onConfirm={confirmRegister}
+          onCancel={() => setCandidate(null)}
+        />
       )}
 
       {triggers.length === 0 ? (

@@ -6,9 +6,9 @@
 //! できる」という例外を作ると、焼き込みを偽装する経路が価値を持ってしまう。
 //!
 //! このモジュールが持つのは、その 2 つ目のソースにファイルを迎え入れるときの門番だけ:
-//! 名前の検証 ([`validate_trigger_id`] / [`validate_entry_path`]) と、上限付きのコピー
-//! ([`copy_tree`])。manifest の意味の検証 (schedule / tz / allowedHosts) は `lib.rs` 側に
-//! あり、**焼き込みと共通**である。
+//! 名前の検証 ([`validate_trigger_id`] / [`validate_entry_path`])、entry の静的検査
+//! ([`lint_entry_source`])、上限付きのコピー ([`copy_tree`])。manifest の意味の検証
+//! (schedule / tz / allowedHosts) は `lib.rs` 側にあり、**焼き込みと共通**である。
 //!
 //! # 何を守っているのか
 //!
@@ -28,7 +28,7 @@ use serde::Serialize;
 /// のような判断が文字列比較になり、種類が増えたときに漏れてもコンパイラが教えてくれない。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum TriggerSource {
+pub enum TriggerSource {
     /// `bundle.resources` でアプリに焼き込まれたもの。エージェント開発者のもので、
     /// エンドユーザーは外せない (「アプリの形」の一部)。
     Bundled,
@@ -188,6 +188,152 @@ pub(crate) fn validate_registered_entry(entry: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// 静的検査のために entry を読む。**上限はコピーと同じ** ([`MAX_TOTAL_BYTES`])。
+///
+/// 下見はコピーの前に走るので、ここに上限が無いと、コピー側なら弾かれる大きさの
+/// ファイルを同意画面より先にまるごとメモリへ載せることになる。
+pub(crate) fn read_entry_source(path: &Path, entry: &str) -> Result<String, String> {
+    let len = std::fs::metadata(path)
+        .map_err(|e| format!("entry '{entry}' を読めません: {e}"))?
+        .len();
+    if len > MAX_TOTAL_BYTES {
+        return Err(format!(
+            "entry '{entry}' が大きすぎます (最大 {} MB)",
+            MAX_TOTAL_BYTES / (1024 * 1024)
+        ));
+    }
+    std::fs::read_to_string(path).map_err(|e| format!("entry '{entry}' を読めません: {e}"))
+}
+
+/// entry スクリプトを仕様書 (#60) のチェックリストで機械的に見る (#61)。
+///
+/// **同意画面に出す材料であって、安全の担保ではない。** 何ができるかを決めているのは
+/// manifest の宣言 (#56 / #57) で、そちらは Rust 側で強制されている。ここが見ているのは
+/// 「仕様から外れていて動かないのに、登録して再起動するまで気づけない」種類の間違いで、
+/// **書いたのが AI なら誰も中身を読んでいない** (#61 の前提) 以上、機械が読むしかない。
+///
+/// 戻り値の非対称は意図的:
+///
+/// - `Err` — **このままでは絶対に動かない**ものだけ。入口で断る方が、入れてから
+///   「壊れているトリガー」として一覧に並ぶより直しやすい ([`validate_registered_entry`]
+///   と同じ判断)
+/// - `Ok(warnings)` — 動くかもしれないが仕様から外れているもの。文字列マッチなので
+///   誤検知しうる以上、**拒否はしない**。読み手に見せて判断してもらう
+pub(crate) fn lint_entry_source(source: &str) -> Result<Vec<String>, String> {
+    if !exports_tick(source) {
+        return Err(
+            "index.ts に tick の export が見つかりません (`export function tick(ctx)` が要ります)"
+                .to_string(),
+        );
+    }
+
+    let mut warnings = Vec::new();
+    if source.lines().any(is_import_statement) {
+        warnings.push(
+            "import 文があります。トリガーは相対 import も外部モジュールも解決できないので、\
+             処理は index.ts 1 つに収めてください"
+                .to_string(),
+        );
+    }
+    if has_bare_call(source, "fetch") {
+        warnings.push(
+            "素の fetch() を呼んでいます。トリガーの実行環境に fetch は無いので、\
+             chamberlain.http.fetch() を使ってください"
+                .to_string(),
+        );
+    }
+    if has_bare_call(source, "require") || source.contains("process.env") {
+        warnings.push(
+            "require() / process.env があります。Node.js ではないので存在しません".to_string(),
+        );
+    }
+    if source.contains("export default") {
+        warnings.push(
+            "export default は認識されません。呼ばれるのは tick という名前の named export だけです"
+                .to_string(),
+        );
+    }
+    Ok(warnings)
+}
+
+/// 空白の連なりを 1 個に潰す。`export  async\n  function tick` のような書き方を
+/// 素朴な `contains` で拾うための前処理。
+fn squeeze_whitespace(source: &str) -> String {
+    source.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// `tick` が named export されているか。**見落としは拒否に直結する**ので、書き方は
+/// 広めに認める (`export function` / `export const` / 末尾の `export { tick }`)。
+fn exports_tick(source: &str) -> bool {
+    let squeezed = squeeze_whitespace(source);
+    const DIRECT: [&str; 5] = [
+        "export function tick",
+        "export async function tick",
+        "export const tick",
+        "export let tick",
+        "export var tick",
+    ];
+    if DIRECT.iter().any(|p| squeezed.contains(p)) {
+        return true;
+    }
+    // `export { tick }` / `export { run as tick }` — 波括弧の中だけを見る。名前を
+    // 付け替えているときに外から見える名前は `as` の右側。
+    squeezed.split("export {").skip(1).any(|rest| {
+        rest.split_once('}').is_some_and(|(list, _)| {
+            list.split(',').any(|item| {
+                let exposed = item.rsplit(" as ").next().unwrap_or(item);
+                exposed.trim() == "tick"
+            })
+        })
+    })
+}
+
+/// 行が import 文か。行頭で判定するので、コメント行 (`// import ...`) や文字列の中に
+/// 出てくる "import" は拾わない。
+fn is_import_statement(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("import ")
+        || trimmed.starts_with("import{")
+        || trimmed.starts_with("import(")
+        || trimmed.starts_with("import\"")
+        || trimmed.starts_with("import'")
+}
+
+/// 式の位置で `name(` を呼んでいるか。
+///
+/// **見逃す方に倒してある。** 拾いたいのは「`chamberlain.` を付け忘れた呼び出し」だけで、
+/// 同じ綴りは他の場所にも出る:
+///
+/// - `chamberlain.http.fetch(...)` — プロパティなので `.` で落とす
+/// - `declare const chamberlain: { http: { fetch(url: string): ... } }` — 型の宣言。
+///   仕様書 §5 が推奨している書き方そのものなので、**ここを拾うと正しく書けている
+///   トリガーに嘘の警告が出る** (テストで固定してある)
+///
+/// 型の宣言と呼び出しを分けているのは直前のトークン。`await` / `=` / `(` のような式の
+/// 位置に限れば、宣言 (直前が `{` や `;`) は自然に外れる。
+fn has_bare_call(source: &str, name: &str) -> bool {
+    /// 直前がこれなら「式の位置」。単独の `=` は `=>` `==` も兼ねる。
+    const EXPRESSION_LEAD: [&str; 10] =
+        ["await", "return", "=", "(", "[", "?", "!", "&&", "||", "+"];
+
+    let bytes = source.as_bytes();
+    source.match_indices(name).any(|(start, _)| {
+        // 識別子の一部やプロパティなら別物 (`myfetch` / `.fetch`)。
+        let joined = start
+            .checked_sub(1)
+            .map(|i| bytes[i])
+            .is_some_and(|b| b == b'.' || b.is_ascii_alphanumeric() || b == b'_' || b == b'$');
+        if joined {
+            return false;
+        }
+        if !source[start + name.len()..].trim_start().starts_with('(') {
+            return false;
+        }
+        let before = source[..start].trim_end();
+        EXPRESSION_LEAD.iter().any(|lead| before.ends_with(lead))
+    })
 }
 
 /// ディレクトリを再帰コピーする。上限を超えたら**途中で失敗する** (呼び出し側が後始末する)。
@@ -403,6 +549,81 @@ mod tests {
                 "{entry:?} は弾くはず"
             );
         }
+    }
+
+    /// 拒否は「絶対に動かない」ものだけ。書き方の幅は広く認める — 見落とすと、
+    /// 動くトリガーを入口で断ることになる。
+    #[test]
+    fn tick_export_is_recognised_in_every_form() {
+        for source in [
+            "export function tick(ctx) {}",
+            "export async function tick(ctx) {}",
+            "export  async\n  function\ttick(ctx) {}",
+            "export const tick = (ctx) => ({});",
+            "function tick(ctx) {}\nexport { tick };",
+            "function run(ctx) {}\nexport { helper, run as tick };",
+        ] {
+            assert!(
+                lint_entry_source(source).is_ok(),
+                "{source:?} は tick の export として認めるはず"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_tick_export_is_rejected() {
+        // 名前が違う / default export — どちらも呼ばれない (仕様書 §4)。
+        assert!(lint_entry_source("export function run(ctx) {}").is_err());
+        assert!(lint_entry_source("export default function tick(ctx) {}").is_err());
+    }
+
+    /// 仕様から外れているだけのものは**警告に留める**。文字列マッチは誤検知しうるので、
+    /// ここで拒否すると動くトリガーを断りうる。
+    #[test]
+    fn spec_violations_are_warnings_not_rejections() {
+        let source = r#"
+import { x } from "./helper.ts";
+export async function tick(ctx) {
+  const r = await fetch("https://example.com");
+  return { notify: { body: String(r.status) } };
+}
+"#;
+        let warnings = lint_entry_source(source).unwrap();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings.iter().any(|w| w.contains("import")));
+        assert!(warnings.iter().any(|w| w.contains("fetch")));
+    }
+
+    /// `chamberlain.http.fetch` は素の `fetch` ではない。**型の宣言も呼び出しではない** —
+    /// 仕様書 §5 が「型は自分で宣言してください」と言っている以上、正しく書いたトリガーには
+    /// 必ずこの形が入る。ここを取り違えると、同意画面に嘘の警告が出る。
+    #[test]
+    fn qualified_and_declared_fetch_are_not_flagged() {
+        let source = r#"
+declare const chamberlain: {
+  http: {
+    fetch(url: string, opts?: { method?: string }): Promise<{ status: number }>;
+  };
+};
+
+export async function tick(ctx) {
+  const r = await chamberlain.http.fetch("https://example.com");
+  return null;
+}
+"#;
+        assert_eq!(lint_entry_source(source).unwrap(), Vec::<String>::new());
+    }
+
+    /// コメントや文字列の中の "import" で警告を出さない。
+    #[test]
+    fn import_is_detected_by_line_not_by_substring() {
+        let source = r#"
+// import は使えないので 1 ファイルに書く
+export function tick(ctx) {
+  return { notify: { body: "important な話" } };
+}
+"#;
+        assert_eq!(lint_entry_source(source).unwrap(), Vec::<String>::new());
     }
 
     #[test]

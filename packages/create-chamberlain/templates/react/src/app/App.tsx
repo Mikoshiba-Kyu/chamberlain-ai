@@ -141,7 +141,13 @@ export function App() {
           <TasksPanel tasks={tasks} onDelete={deleteTask} />
         )}
         {active === "activity" && <ActivityPanel events={events} />}
-        {active === "chat" && <ChatPanel />}
+        {active === "chat" && (
+          // 秘書もトリガーを登録できる (#61) ので、再起動待ちの共有は TriggersPanel と同じ。
+          <ChatPanel
+            restartPending={restartPending}
+            onRegistered={() => setRestartPending(true)}
+          />
+        )}
         {active === "settings" && <SettingsPanel />}
       </main>
     </div>

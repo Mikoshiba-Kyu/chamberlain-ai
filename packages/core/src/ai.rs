@@ -2,7 +2,8 @@
 //!
 //! - Type II (chamberlain-core が提供する秘書 chat) と Type I (トリガーが呼ぶタスク AI) の
 //!   両方から共有される
-//! - MVP スコープ: chat completion のみ。streaming / tool use は扱わない
+//! - streaming は扱わない。tool use は **1 往復だけ**扱う (#61 — 秘書がトリガーの生成を
+//!   申し出るための口。ツールの結果を返して会話を続ける経路は無い)
 //! - API キーは secret store の `anthropic_api_key` から取る (呼び出し側の責務)
 
 use std::cell::RefCell;
@@ -50,6 +51,14 @@ pub struct Message {
     pub content: String,
 }
 
+/// モデルに渡す道具の定義 (#61)。`input_schema` は JSON Schema そのまま。
+#[derive(Serialize)]
+pub struct Tool<'a> {
+    pub name: &'a str,
+    pub description: &'a str,
+    pub input_schema: serde_json::Value,
+}
+
 #[derive(Serialize)]
 struct RequestBody<'a> {
     model: &'a str,
@@ -57,18 +66,45 @@ struct RequestBody<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     system: Option<&'a str>,
     messages: &'a [Message],
+    /// 空のときは送らない。`tools: []` を送っても害は無いが、道具を渡していない
+    /// 呼び出し (Type I の `ai.complete`) のリクエストを変えたくない。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<&'a [Tool<'a>]>,
 }
 
+/// 応答の content ブロック。
+///
+/// **未知の種別を握り潰す** (`Other`)。thinking など将来増えるブロックが混ざったときに
+/// パース自体が落ちると、秘書チャットが丸ごと使えなくなる。読めるものだけ拾う。
 #[derive(Deserialize)]
-struct ResponseContent {
-    #[serde(rename = "type")]
-    _type: String,
-    text: String,
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ContentBlock {
+    Text {
+        text: String,
+    },
+    ToolUse {
+        name: String,
+        input: serde_json::Value,
+    },
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Deserialize)]
 struct ResponseBody {
-    content: Vec<ResponseContent>,
+    content: Vec<ContentBlock>,
+}
+
+/// 1 往復の結果。道具を渡していなければ必ず [`Completion::Text`]。
+pub enum Completion {
+    Text(String),
+    /// モデルが道具を呼びたがっている。`text` は呼ぶ前に添えてきた前置き
+    /// (「承知しました、〜を作ります」)。無いこともある。
+    ToolUse {
+        text: Option<String>,
+        name: String,
+        input: serde_json::Value,
+    },
 }
 
 /// Anthropic Messages API に POST し、assistant のテキスト応答を返す。
@@ -82,11 +118,35 @@ pub async fn complete(
     system: Option<&str>,
     messages: &[Message],
 ) -> Result<String, String> {
+    match complete_with_tools(api_key, model, system, messages, &[]).await? {
+        Completion::Text(text) => Ok(text),
+        // 道具を渡していないので到達しない。潰さずエラーにする (黙って空文字を返すと
+        // 呼び出し側が「モデルが何も言わなかった」と誤読する)。
+        Completion::ToolUse { name, .. } => {
+            Err(format!("anthropic returned an unexpected tool_use: {name}"))
+        }
+    }
+}
+
+/// 道具を渡して 1 往復する (#61)。
+///
+/// **ツール結果を返して会話を続ける経路は持たない。** 秘書がトリガーの生成を申し出る
+/// 用途では、道具が呼ばれた時点で core 側の仕事 (生成 → 下書き → 同意画面) に移り、
+/// 会話は定型の 1 行で閉じる。往復を重ねる形にすると、失敗のたびにモデルが勝手に
+/// やり直して課金だけが伸びる。
+pub async fn complete_with_tools(
+    api_key: &str,
+    model: Option<&str>,
+    system: Option<&str>,
+    messages: &[Message],
+    tools: &[Tool<'_>],
+) -> Result<Completion, String> {
     let body = RequestBody {
         model: model.unwrap_or(DEFAULT_MODEL),
         max_tokens: DEFAULT_MAX_TOKENS,
         system,
         messages,
+        tools: (!tools.is_empty()).then_some(tools),
     };
 
     let response = ANTHROPIC_CLIENT
@@ -112,12 +172,36 @@ pub async fn complete(
     let parsed: ResponseBody = serde_json::from_str(&text)
         .map_err(|e| format!("failed to parse anthropic response: {e} — body: {text}"))?;
 
-    parsed
-        .content
-        .into_iter()
-        .next()
-        .map(|c| c.text)
-        .ok_or_else(|| "anthropic response had no content".to_string())
+    interpret(parsed.content).ok_or_else(|| "anthropic response had no content".to_string())
+}
+
+/// content ブロックの列を 1 つの結果に畳む。
+///
+/// ツール呼び出しがあればそちらが主で、テキストは前置きとして添える。**順序に頼らない** —
+/// text と tool_use のどちらが先に来るかは応答ごとに違う。
+fn interpret(blocks: Vec<ContentBlock>) -> Option<Completion> {
+    let mut texts: Vec<String> = Vec::new();
+    let mut tool: Option<(String, serde_json::Value)> = None;
+
+    for block in blocks {
+        match block {
+            ContentBlock::Text { text } => texts.push(text),
+            // 複数呼ばれても最初の 1 つだけ見る。core が受けられる道具は 1 つで、
+            // 2 つ目を黙って捨てる方が「両方やったつもり」になるより読みやすい。
+            ContentBlock::ToolUse { name, input } if tool.is_none() => tool = Some((name, input)),
+            _ => {}
+        }
+    }
+
+    let text = {
+        let joined = texts.join("\n").trim().to_string();
+        (!joined.is_empty()).then_some(joined)
+    };
+
+    match tool {
+        Some((name, input)) => Some(Completion::ToolUse { text, name, input }),
+        None => text.map(Completion::Text),
+    }
 }
 
 // --- deno_core op (JS runtime から `chamberlain.ai.complete(...)` として呼ばれる) ---
@@ -178,4 +262,61 @@ pub async fn op_chamberlain_ai_complete(
     )
     .await
     .map_err(JsErrorBox::generic)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn blocks(json: &str) -> Vec<ContentBlock> {
+        serde_json::from_str::<ResponseBody>(json).unwrap().content
+    }
+
+    /// 知らないブロック (thinking 等) が混ざってもパースは通る。ここが落ちると
+    /// 秘書チャットが丸ごと使えなくなる。
+    #[test]
+    fn unknown_blocks_do_not_break_parsing() {
+        let parsed = interpret(blocks(
+            r#"{"content":[{"type":"thinking","thinking":"…"},{"type":"text","text":"はい"}]}"#,
+        ));
+        assert!(matches!(parsed, Some(Completion::Text(t)) if t == "はい"));
+    }
+
+    /// tool_use があればそれが主。前置きのテキストは添えるだけで、text 扱いにはしない。
+    #[test]
+    fn tool_use_wins_over_the_preamble() {
+        let parsed = interpret(blocks(
+            r#"{"content":[
+                {"type":"text","text":"承知しました。"},
+                {"type":"tool_use","id":"x","name":"propose_trigger","input":{"request":"毎朝9時"}}
+            ]}"#,
+        ));
+        let Some(Completion::ToolUse { text, name, input }) = parsed else {
+            panic!("tool_use を拾えていない");
+        };
+        assert_eq!(text.as_deref(), Some("承知しました。"));
+        assert_eq!(name, "propose_trigger");
+        assert_eq!(input["request"], "毎朝9時");
+    }
+
+    /// 順序に頼らない。tool_use が先に来る応答もある。
+    #[test]
+    fn preamble_after_the_tool_use_is_still_picked_up() {
+        let parsed = interpret(blocks(
+            r#"{"content":[
+                {"type":"tool_use","id":"x","name":"propose_trigger","input":{}},
+                {"type":"text","text":"用意します。"}
+            ]}"#,
+        ));
+        assert!(
+            matches!(parsed, Some(Completion::ToolUse { text, .. }) if text.as_deref() == Some("用意します。"))
+        );
+    }
+
+    /// 空の応答は「テキストが空文字だった」ではなく「何も返ってこなかった」。
+    #[test]
+    fn empty_content_has_no_completion() {
+        assert!(interpret(blocks(r#"{"content":[]}"#)).is_none());
+        assert!(interpret(blocks(r#"{"content":[{"type":"text","text":"  "}]}"#)).is_none());
+    }
 }
