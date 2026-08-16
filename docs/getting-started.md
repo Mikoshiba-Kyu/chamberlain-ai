@@ -62,8 +62,9 @@ chamberlain.getSecret(name: string): Promise<string | null>
 chamberlain.ai.complete(opts: {
   prompt: string;
   system?: string;
-  model?: string;    // 省略時は claude-sonnet-5
-}): Promise<string>
+  model?: string;     // 省略時は claude-sonnet-5
+  maxTokens?: number; // 省略時 4096、上限 6144 (#68)
+}): Promise<string>   // 上限に達して切れたら例外
 ```
 
 `ctx` は tick に渡される純粋データ (`{ now, state }`) で、副作用のある API は `chamberlain.*` 側に分けてあります。詳細な設計意図と契約は [`docs/architecture.md`](./architecture.md#ambient-global-chamberlain) を参照してください。
