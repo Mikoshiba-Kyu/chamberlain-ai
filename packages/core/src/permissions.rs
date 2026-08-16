@@ -463,6 +463,28 @@ impl TriggerPermissions {
         self.record(record);
     }
 
+    /// 応答が `maxTokens` で切れたことを記録する (#68)。
+    ///
+    /// 呼び出し自体は [`Self::record_ai_call`] が既に数えているので、これは**そのうち
+    /// 何回が切れたか**を持つ 2 行目になる。1 行にまとめないのは、[`Self::record`] の
+    /// 重複排除が本文単位で、同じ行に混ぜると切れた回数が数えられなくなるため。
+    ///
+    /// **上限の値は本文に入れない。** トリガーは呼び出しごとに `maxTokens` を変えられる
+    /// ので、入れると model ごと 1 行のはずが値ごとに割れ、数えたい「何回中いくつ」が
+    /// まさに数えたい状況で数えられなくなる (prompt の長さを入れないのと同じ理由)。
+    /// 値が要るのはトリガー作者が読む例外文の側で、そちらには入っている。
+    ///
+    /// トリガーには例外が返っている (`ai.rs`) が、それは `catch` で握り潰せる。切り捨てを
+    /// 黙って通す経路をひとつも残さないために、観測面にも別途残す。
+    pub(crate) fn record_ai_truncation(&mut self, model: &str) {
+        let record = OpActivity::new(
+            self.current.clone(),
+            ActivityKind::AiCall,
+            format!("ai.complete model={model} truncated at maxTokens"),
+        );
+        self.record(record);
+    }
+
     /// 記録を 1 件足す。**同じ実行の中で同じ記録は 1 行にまとめ、回数だけ数える。**
     ///
     /// 1 回の tick に N 件を素通しすると、N 行の history 追記と N 回の UI emit になる。

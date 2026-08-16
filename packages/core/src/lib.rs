@@ -2324,6 +2324,24 @@ mod tests {
             }
         }
 
+        /// §5.2 が書いている `ai.complete` の上限が実装と一致していること (#68)。
+        ///
+        /// 切り捨てを例外にした以上、**この数字は逃げ道の説明**になっている。ずれると
+        /// 「仕様書どおりに `maxTokens` を指定したのに範囲外で断られる」が起きる。
+        #[test]
+        fn documented_ai_limits_match_the_implementation() {
+            for value in [ai::DEFAULT_MAX_TOKENS, ai::MAX_ALLOWED_MAX_TOKENS] {
+                assert!(
+                    TRIGGER_SPEC.contains(&value.to_string()),
+                    "仕様書 §5.2 に {value} が出てこない"
+                );
+            }
+            assert!(
+                TRIGGER_SPEC.contains("maxTokens"),
+                "仕様書が maxTokens を説明していない"
+            );
+        }
+
         /// 「使える記法」の表が全部パースを通ること。
         #[test]
         fn documented_schedules_parse() {

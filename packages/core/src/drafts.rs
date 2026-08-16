@@ -45,6 +45,17 @@ const ENTRY_FILE: &str = "index.ts";
 /// 生成に使うモデル。会話用と分けていない (分ける理由が出るまでは既定のまま)。
 const GENERATION_MODEL: Option<&str> = None;
 
+/// 生成 1 回分の応答の上限 (#68)。**取れるだけ取る。**
+///
+/// 既定の 4096 では足りない。仕様書 (#60) §5 は「TypeScript の型は自分で宣言してくださ
+/// い」と書いており、まともな `index.ts` は `declare const chamberlain: {...}` を先頭に
+/// 持つ — つまり**生成物が長くなる方向に指導している**。それを `manifest.json` ごと
+/// JSON 文字列にくるむ。
+///
+/// 天井を超えて取ることはできない。生成もトリガーと同じ 90 秒の timeout を共有していて、
+/// [`ai::MAX_ALLOWED_MAX_TOKENS`] はその中で吐き切れる長さだから。
+const GENERATION_MAX_TOKENS: u32 = ai::MAX_ALLOWED_MAX_TOKENS;
+
 /// 下書きの置き場。[`crate::RegisteredDir`] と同じく**起動時に 1 回だけ解決する**。
 ///
 /// 解決に失敗した環境では生成だけが使えなくなる (チャットも焼き込みトリガーも動く)。
@@ -98,6 +109,34 @@ pub(crate) struct DraftSite<'a> {
     pub registered_dir: Option<&'a Path>,
 }
 
+/// 下書きを用意できなかった理由。
+///
+/// **秘書が次に何を頼むかが変わるので型で分けている** (#68)。原因が分からないまま
+/// 「もう少し具体的に教えてください」と促すと、エンドユーザーはより詳しく書き直し、
+/// さらに長い生成物になって同じ場所で切れる — 誘導が逆を向く。
+///
+/// 運ぶのは分類だけで、**文言は持たない**。秘書の口調は [`crate::chat`] のもの。
+pub(crate) enum ProposalFailure {
+    /// 依頼そのものが `max_tokens` に当たって途中で切れた (道具の引数が欠けている)。
+    RequestTruncated,
+    /// 生成物が `max_tokens` に当たって途中で切れた。
+    Truncated,
+    /// それ以外 (読めなかった / 下見で断られた / 置き場が無い)。
+    Other(String),
+}
+
+impl From<String> for ProposalFailure {
+    fn from(message: String) -> Self {
+        Self::Other(message)
+    }
+}
+
+impl From<&str> for ProposalFailure {
+    fn from(message: &str) -> Self {
+        Self::Other(message.to_string())
+    }
+}
+
 /// 道具が呼ばれたときの一切を引き受ける (#61)。
 ///
 /// **返した時点でもまだ何も登録されていない。** 引数の解釈 → 生成 → 下書きを書く →
@@ -113,14 +152,14 @@ pub(crate) async fn propose(
     api_key: &str,
     input: &serde_json::Value,
     site: DraftSite<'_>,
-) -> Result<TriggerCandidate, String> {
+) -> Result<TriggerCandidate, ProposalFailure> {
     let root = site.root.ok_or("下書きの置き場を用意できませんでした")?;
     let request = input
         .get("request")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
     if request.trim().is_empty() {
-        return Err("何を繰り返すのかを読み取れませんでした".to_string());
+        return Err("何を繰り返すのかを読み取れませんでした".into());
     }
 
     let generated = generate(api_key, request).await?;
@@ -151,7 +190,7 @@ pub(crate) async fn propose(
         Err(e) => {
             let _ = std::fs::remove_dir_all(&path);
             record(format!("秘書が書いた下書きは使えませんでした: {e}"));
-            return Err(e);
+            return Err(e.into());
         }
     };
 
@@ -231,14 +270,28 @@ struct GeneratedPayload {
 }
 
 /// 仕様書を system prompt にして 1 回だけ生成させる。
-async fn generate(api_key: &str, request: &str) -> Result<GeneratedTrigger, String> {
+///
+/// **切り捨てを JSON パースの失敗として受け取らない** (#68)。応答が途中で切れれば
+/// `parse_generated` も必ず落ちるが、そこから返るのは `EOF while parsing a string at
+/// line 1 column 4093` であって、エンドユーザーには原因が読み取れない。
+async fn generate(api_key: &str, request: &str) -> Result<GeneratedTrigger, ProposalFailure> {
     let system = format!("{}\n\n{OUTPUT_CONTRACT}", crate::TRIGGER_SPEC);
     let messages = [ai::Message {
         role: ai::Role::User,
         content: format!("次の依頼に応えるトリガーを 1 つ作ってください。\n\n{request}"),
     }];
-    let raw = ai::complete(api_key, GENERATION_MODEL, Some(&system), &messages).await?;
-    parse_generated(&raw)
+    let (raw, stop) = ai::complete(
+        api_key,
+        GENERATION_MODEL,
+        Some(&system),
+        &messages,
+        GENERATION_MAX_TOKENS,
+    )
+    .await?;
+    if stop == ai::StopReason::Truncated {
+        return Err(ProposalFailure::Truncated);
+    }
+    Ok(parse_generated(&raw)?)
 }
 
 /// モデルの応答から 2 ファイルを取り出す。
@@ -246,9 +299,8 @@ async fn generate(api_key: &str, request: &str) -> Result<GeneratedTrigger, Stri
 /// **前置きとコードフェンスを許す。** 出力形式は指示してあるが、そこを外したときに
 /// 「生成できませんでした」で終わるより、最初の `{` から最後の `}` までを読む方が実用的。
 ///
-/// 応答が `max_tokens` (4096) で切れた場合もここで JSON パースに失敗する。**切り捨てを
-/// 切り捨てと言えない** (`stop_reason` を見ていない) ので、エンドユーザーには読めない
-/// 文言が出る。#68 で扱う。
+/// 切り捨ては[呼び出し側](generate)が先に弾いているので、ここまで来る失敗は
+/// 「最後まで書いたが形が違う」だけになる。
 fn parse_generated(raw: &str) -> Result<GeneratedTrigger, String> {
     let start = raw
         .find('{')

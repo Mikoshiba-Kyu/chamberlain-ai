@@ -153,25 +153,34 @@ pub async fn chat_send(
         })
         .collect();
 
-    let response = ai::complete_with_tools(
+    let (response, stop) = ai::complete_with_tools(
         &api_key,
         None,
         Some(CHAMBERLAIN_SYSTEM_PROMPT),
         &ai_messages,
         &[drafts::propose_trigger_tool()],
+        ai::DEFAULT_MAX_TOKENS,
     )
     .await?;
 
     let (content, draft) = match response {
-        ai::Completion::Text(text) => (text, None),
+        ai::Completion::Text(text) => (append_truncation_note(text, stop), None),
         // 呼ばれた道具が知らない名前だったときも、会話は続ける。モデルの言い間違いで
         // チャットが使えなくなる方が実害が大きい。
         ai::Completion::ToolUse { text, name, .. } if name != drafts::PROPOSE_TRIGGER_TOOL => {
             eprintln!("chat: ignoring unknown tool '{name}'");
             (
-                text.unwrap_or_else(|| "うまく応答できませんでした。".to_string()),
+                append_truncation_note(
+                    text.unwrap_or_else(|| "うまく応答できませんでした。".to_string()),
+                    stop,
+                ),
                 None,
             )
+        }
+        // 道具の引数が途中で切れている。**生成には進まない** (#68) — `input` が欠けたまま
+        // 進むと、依頼の一部だけを読んだ下書きに生成 1 回分を使い、同意画面まで出る。
+        ai::Completion::ToolUse { text, .. } if stop == ai::StopReason::Truncated => {
+            describe_proposal(text, Err(drafts::ProposalFailure::RequestTruncated))
         }
         ai::Completion::ToolUse { text, input, .. } => {
             let site = drafts::DraftSite {
@@ -198,13 +207,30 @@ pub async fn chat_send(
     })
 }
 
+const TRUNCATION_NOTE: &str = "(応答が長くなりすぎたため、ここで切れています)";
+
+/// 秘書の返答が途中で切れていたら、そう断る (#68)。
+///
+/// **黙って出さない。** 切れた文章はたいてい文の途中で終わるので、そのまま出すと
+/// 「秘書が言い淀んだ」ようにしか見えず、続きを求めればいいのか読み直せばいいのかが
+/// 分からない。ここは会話なので、Type I のように例外へ倒す (返答ごと捨てる) 必要は無い。
+fn append_truncation_note(text: String, stop: ai::StopReason) -> String {
+    match stop {
+        ai::StopReason::Complete => text,
+        // 1 文字も出ないまま切れることもある (`interpret` が空を返す経路)。空行から
+        // 始まる吹き出しにしないよう、そのときは断り書きだけを出す。
+        ai::StopReason::Truncated if text.is_empty() => TRUNCATION_NOTE.to_string(),
+        ai::StopReason::Truncated => format!("{text}\n\n{TRUNCATION_NOTE}"),
+    }
+}
+
 /// 下書きの結果を秘書の言葉にする。
 ///
 /// **生成の失敗は会話の失敗にしない。** `?` で返すと、ユーザーの発言だけが履歴に残って
 /// 秘書が黙ったように見える。
 fn describe_proposal(
     preamble: Option<String>,
-    outcome: Result<TriggerCandidate, String>,
+    outcome: Result<TriggerCandidate, drafts::ProposalFailure>,
 ) -> (String, Option<TriggerCandidate>) {
     match outcome {
         Ok(candidate) => {
@@ -215,11 +241,71 @@ fn describe_proposal(
                 Some(candidate),
             )
         }
-        Err(e) => (
-            format!(
-                "トリガーを用意できませんでした: {e}\n\nもう少し具体的に教えていただけますか。"
-            ),
-            None,
-        ),
+        // 促し方は失敗の種類で変える。切り捨てに「もう少し具体的に」と返すと、より長い
+        // 依頼になって同じ場所で切れる (#68)。
+        Err(failure) => {
+            let message = match failure {
+                drafts::ProposalFailure::RequestTruncated => "ご依頼が長すぎて途中で切れました。\
+                    \n\nお手数ですが、いくつかに分けてお伝えいただけますか。"
+                    .to_string(),
+                drafts::ProposalFailure::Truncated => {
+                    "トリガーを用意できませんでした: 生成された内容が長すぎて途中で切れました。\
+                    \n\nお手数ですが、依頼をもう少し小さく分けていただけますか。"
+                        .to_string()
+                }
+                drafts::ProposalFailure::Other(reason) => format!(
+                    "トリガーを用意できませんでした: {reason}\
+                    \n\nもう少し具体的に教えていただけますか。"
+                ),
+            };
+            (message, None)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use drafts::ProposalFailure;
+
+    /// 切り捨てのときだけ誘導が逆を向かないこと (#68)。
+    ///
+    /// 「もう少し具体的に」は原因が分からないときの促し方で、切り捨てに当てると
+    /// **より長い依頼 → より長い生成物 → 同じ場所で切れる**のループになる。同じ理由で
+    /// 「もう一度お願いします」も言わない — 同じ長さの依頼が同じ場所で切れる。
+    #[test]
+    fn truncation_asks_for_a_smaller_request_not_a_longer_one() {
+        for failure in [
+            ProposalFailure::Truncated,
+            ProposalFailure::RequestTruncated,
+        ] {
+            let (message, draft) = describe_proposal(None, Err(failure));
+            assert!(draft.is_none());
+            assert!(message.contains("切れました"), "{message}");
+            assert!(message.contains("分けて"), "{message}");
+            assert!(!message.contains("具体的に"), "{message}");
+        }
+
+        let (other, _) = describe_proposal(None, Err(ProposalFailure::Other("id がない".into())));
+        assert!(other.contains("id がない"), "{other}");
+        assert!(other.contains("具体的に"), "{other}");
+    }
+
+    /// 切れた返答を黙って出さない。文の途中で終わった文章は「言い淀んだ」ようにしか
+    /// 見えず、続きを頼めばいいのかが読み取れない。
+    #[test]
+    fn a_truncated_reply_says_so() {
+        let text = "承知しました。まず".to_string();
+        assert_eq!(
+            append_truncation_note(text.clone(), ai::StopReason::Complete),
+            text
+        );
+        let noted = append_truncation_note(text.clone(), ai::StopReason::Truncated);
+        assert!(noted.starts_with(&text), "{noted}");
+        assert!(noted.contains("切れています"), "{noted}");
+
+        // 1 文字も出ないまま切れた場合も黙らない。空行から始めない。
+        let empty = append_truncation_note(String::new(), ai::StopReason::Truncated);
+        assert_eq!(empty, TRUNCATION_NOTE);
     }
 }

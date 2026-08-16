@@ -202,6 +202,7 @@ declare const chamberlain: {
       prompt: string;
       system?: string;
       model?: string;
+      maxTokens?: number;
     }): Promise<string>;
   };
   http: {
@@ -242,8 +243,16 @@ const comment = await chamberlain.ai.complete({
 
 - 鍵の設定は不要です (framework の鍵を使います)。`model` を省略すると `claude-sonnet-5` です。
 - 返るのはテキストだけです。**JSON を返させたいなら prompt でそう指示し、`JSON.parse` の失敗に備えてください。**
-- 応答は最大 4096 トークン、90 秒でタイムアウトします。失敗すると例外になるので `try` / `catch` で包んでください。
-- 呼び出しは毎回活動ログに `[ai]` として残ります (model と回数だけ。prompt の中身は残りません)。
+- 応答は既定で最大 4096 トークンです。**上限に達して途中で切れた場合は例外になります** — 切れたテキストが返ることはありません。長い応答が要るなら `maxTokens` を渡してください (1〜6144)。範囲外の値も例外です。
+- 90 秒でタイムアウトします。上限が 6144 なのはこのためで、**それ以上は指定できても待てません**。切り捨てもタイムアウトも例外なので、`try` / `catch` で包んでください。
+- 呼び出しは毎回活動ログに `[ai]` として残ります (model と回数だけ。prompt の中身は残りません)。切れた場合は別の行で数えられます。
+
+```typescript
+const summary = await chamberlain.ai.complete({
+  prompt: `次の記事を 400 字でまとめてください。\n\n${article}`,
+  maxTokens: 6144,
+});
+```
 
 ### 5.3 `http.fetch` — 外部と通信する
 

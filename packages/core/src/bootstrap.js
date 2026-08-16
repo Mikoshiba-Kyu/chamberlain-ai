@@ -13,10 +13,15 @@
 //        `requiredSecrets` (the denial is recorded as `[denied]`).
 //        `anthropic_api_key` is never handed to triggers; use ai.complete.
 //   chamberlain.ai.complete(opts): Promise<string>
-//     opts: { prompt: string, system?: string, model?: string }
+//     opts: { prompt: string, system?: string, model?: string,
+//             maxTokens?: number }
 //     -- Call the Anthropic Messages API using the anthropic_api_key secret.
 //        Rejects if the key is not set. Default model is server-side.
-//        Every call is recorded in the activity history as `[ai]`.
+//        maxTokens defaults to 4096 and must be 1..=6144; out-of-range values
+//        reject rather than being clamped. A response cut short by maxTokens
+//        rejects too -- truncated text is never returned (#68).
+//        Every call is recorded in the activity history as `[ai]`, and a
+//        truncated one gets its own `[ai]` row.
 //   chamberlain.http.fetch(url, opts?): Promise<{ status: number, body: string }>
 //     opts: { method?: string, headers?: Record<string,string>, body?: string }
 //     -- Generic HTTP client. Response body is returned as raw text; parse JSON
