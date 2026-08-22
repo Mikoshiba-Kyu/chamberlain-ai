@@ -1,7 +1,8 @@
 //! Type II 秘書 chat の実装。
 //!
 //! - 会話履歴は `tauri-plugin-store` の別ファイル `chat-history.json` に保存
-//! - 毎回全履歴を Anthropic に送る。長さは `MAX_HISTORY` で頭からドロップ
+//! - 毎回全履歴を Anthropic に送る。長さは `MAX_HISTORY` で頭からドロップし、送る前に
+//!   プロンプトキャッシュの breakpoint を末尾に置く (#72)
 //! - system prompt はハードコード (将来 Settings で編集可にする、docs 未確定の論点)
 //! - Type I トリガーと同じ `anthropic_api_key` を使う (secret store 経由)
 //! - 道具を 1 つだけ持つ (#61)。「繰り返しやってほしいこと」を頼まれたら、秘書が自分で
@@ -20,7 +21,19 @@ use crate::{ai, HistoryRef, RegisteredDir, TriggerCandidate, TriggersRef};
 
 const CHAT_STORE_FILE: &str = "chat-history.json";
 const CHAT_MESSAGES_KEY: &str = "messages";
+
+/// ここを超えたら [`HISTORY_TRIM_TO`] まで落とす。
 const MAX_HISTORY: usize = 40;
+
+/// 落とした後に残す件数 (#72)。**1 件ずつ落とさない。**
+///
+/// 履歴の先頭が変わると prefix が変わり、プロンプトキャッシュが全損する。1 件ずつ
+/// 落とす形だと `MAX_HISTORY` を超えた瞬間から**毎ターン**それが起きて、キャッシュは
+/// 一度も読まれない。まとめて落とせば崖は (40-20)/2 = 10 往復に 1 回になる。
+///
+/// 半分にしているのは、落とす量と崖の間隔がそのまま裏返しだから — 残す量を増やすほど
+/// 1 回あたりに失う文脈は減るが、崖は近づく。
+const HISTORY_TRIM_TO: usize = 20;
 
 /// 会話に使うモデル。既定のまま (分ける理由が出るまでは [`drafts`] の生成と同じ)。
 const CHAT_MODEL: Option<&str> = None;
@@ -139,11 +152,7 @@ pub async fn chat_send(
     };
     history.push(user_msg);
 
-    // 履歴が MAX_HISTORY を超えたら古い方から drop。会話の対称性は捨てる (system
-    // prompt が context を補うので許容する)。
-    while history.len() > MAX_HISTORY {
-        history.remove(0);
-    }
+    trim_history(&mut history);
 
     // AI 呼び出し前に user メッセージを永続化。API キー未設定や API 側の失敗で
     // `?` return したとき、ユーザーが送った文言まで巻き添えで消えるのを防ぐ。
@@ -167,6 +176,8 @@ pub async fn chat_send(
         &ai_messages,
         &[drafts::propose_trigger_tool()],
         ai::DEFAULT_MAX_TOKENS,
+        // 秘書チャットは同じ prefix を連続ターンで送り直す唯一の経路 (#72)。
+        ai::CacheBreakpoint::LastMessage,
     )
     .await?;
 
@@ -217,6 +228,32 @@ pub async fn chat_send(
         message: assistant_msg,
         draft,
     })
+}
+
+/// 履歴を送れる形に整える。
+///
+/// **落とすのはまとめて 1 回** (#72)。`MAX_HISTORY` を超えたら [`HISTORY_TRIM_TO`] まで
+/// 一気に落とし、次に超えるまで先頭を動かさない。1 件ずつ落とすと毎ターン prefix が
+/// ずれてプロンプトキャッシュが一度も読まれない。
+///
+/// **先頭は必ず user にする。** Messages API は 1 通目が user であることを要求していて、
+/// 履歴は user / assistant の交互なので「偶数個だけ落とす」では足りない — 落とす件数は
+/// そのときの長さで決まり、奇数になれば先頭が assistant で始まる。
+///
+/// 長さが上限内でも先頭は見る。すでに assistant 始まりで保存されている履歴を、
+/// 起動しなおしただけでは直せないため。
+fn trim_history(history: &mut Vec<ChatMessage>) {
+    let keep = if history.len() > MAX_HISTORY {
+        HISTORY_TRIM_TO
+    } else {
+        history.len()
+    };
+    let mut drop = history.len() - keep;
+    // 直前に push した user がいるので、この探索は必ず止まる。
+    while drop < history.len() && history[drop].role != "user" {
+        drop += 1;
+    }
+    history.drain(..drop);
 }
 
 const TRUNCATION_NOTE: &str = "(応答が長くなりすぎたため、ここで切れています)";
@@ -279,6 +316,79 @@ fn describe_proposal(
 mod tests {
     use super::*;
     use drafts::ProposalFailure;
+
+    fn msg(role: &str, n: usize) -> ChatMessage {
+        ChatMessage {
+            role: role.to_string(),
+            content: format!("{role}-{n}"),
+            ts: n as u64,
+        }
+    }
+
+    /// 1 往復ぶん進める (user を足して整え、assistant の返答を足す)。
+    fn turn(history: &mut Vec<ChatMessage>, n: usize) {
+        history.push(msg("user", n));
+        trim_history(history);
+        history.push(msg("assistant", n));
+    }
+
+    /// 送る先頭は必ず user (#72)。
+    ///
+    /// Messages API は 1 通目が user であることを要求する。履歴は交互なので、落とす件数が
+    /// 奇数になると先頭が assistant になる — `MAX_HISTORY` が偶数、押し込む時点の長さが
+    /// 奇数 (直前に user を足したところ) なので、素直に引き算すると必ずそうなる。
+    #[test]
+    fn the_history_that_gets_sent_always_starts_with_a_user_turn() {
+        let mut history = Vec::new();
+        for n in 0..60 {
+            turn(&mut history, n);
+            // trim_history が走った直後の状態を見る (assistant を足す前と同じ先頭)。
+            assert_eq!(
+                history[0].role, "user",
+                "turn {n}: {:?}",
+                history[0].content
+            );
+            assert!(
+                history.len() <= MAX_HISTORY + 1,
+                "turn {n}: {}",
+                history.len()
+            );
+        }
+    }
+
+    /// 先頭が動くのは崖のときだけ (#72)。
+    ///
+    /// 1 件ずつ落とす形だと `MAX_HISTORY` を超えて以降**毎ターン**先頭が変わり、prefix が
+    /// 一致しないのでキャッシュは一度も読まれない。ここが落ちたら、cache_control を
+    /// 置いていても `cache_read_input_tokens` は 0 のままになる。
+    #[test]
+    fn the_prefix_only_moves_at_the_cliff_not_every_turn() {
+        let mut history = Vec::new();
+        let mut moved = 0;
+        for n in 0..60 {
+            let head = history.first().map(|m: &ChatMessage| m.content.clone());
+            turn(&mut history, n);
+            if head.is_some() && head != history.first().map(|m| m.content.clone()) {
+                moved += 1;
+            }
+        }
+        // 60 往復で 40 件の上限を 20 件まで落とすので、崖は 10 往復に 1 回。
+        assert!(moved <= 6, "prefix moved {moved} times in 60 turns");
+        assert!(moved > 0, "the cap never applied — the test proves nothing");
+    }
+
+    /// すでに assistant 始まりで保存されている履歴も直す。
+    ///
+    /// #72 より前の 1 件ずつ落とす形は、21 往復目から先頭を assistant にして送っていた。
+    /// その履歴はディスクに残っているので、長さが上限内でも先頭は見る。
+    #[test]
+    fn a_history_already_saved_assistant_first_is_repaired() {
+        let mut history = vec![msg("assistant", 0), msg("user", 1), msg("assistant", 2)];
+        history.push(msg("user", 3));
+        trim_history(&mut history);
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].content, "user-1");
+    }
 
     /// 切り捨てのときだけ誘導が逆を向かないこと (#68)。
     ///
