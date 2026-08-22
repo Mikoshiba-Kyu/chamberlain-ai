@@ -45,6 +45,10 @@ const ENTRY_FILE: &str = "index.ts";
 /// 生成に使うモデル。会話用と分けていない (分ける理由が出るまでは既定のまま)。
 const GENERATION_MODEL: Option<&str> = None;
 
+/// 活動ログでこの消費を名乗る名前 (#71)。**会話 (`chat.send`) と分ける** — 1 回の依頼で
+/// 2 回呼ばれる経路なので、まとめると「チャット 1 往復あたりいくら」が読めなくなる。
+const GENERATION_USAGE_LABEL: &str = "draft.generate";
+
 /// 生成 1 回分の応答の上限 (#68)。**取れるだけ取る。**
 ///
 /// 既定の 4096 では足りない。仕様書 (#60) §5 は「TypeScript の型は自分で宣言してくださ
@@ -162,7 +166,7 @@ pub(crate) async fn propose(
         return Err("何を繰り返すのかを読み取れませんでした".into());
     }
 
-    let generated = generate(api_key, request).await?;
+    let generated = generate(app, history, api_key, request).await?;
     let path = write(root, &generated)?;
 
     // **AI がコードを書いた瞬間を残す。** 登録されなかった下書きも含めて後から追える
@@ -274,13 +278,18 @@ struct GeneratedPayload {
 /// **切り捨てを JSON パースの失敗として受け取らない** (#68)。応答が途中で切れれば
 /// `parse_generated` も必ず落ちるが、そこから返るのは `EOF while parsing a string at
 /// line 1 column 4093` であって、エンドユーザーには原因が読み取れない。
-async fn generate(api_key: &str, request: &str) -> Result<GeneratedTrigger, ProposalFailure> {
+async fn generate(
+    app: &AppHandle,
+    history: &HistoryRef,
+    api_key: &str,
+    request: &str,
+) -> Result<GeneratedTrigger, ProposalFailure> {
     let system = format!("{}\n\n{OUTPUT_CONTRACT}", crate::TRIGGER_SPEC);
     let messages = [ai::Message {
         role: ai::Role::User,
         content: format!("次の依頼に応えるトリガーを 1 つ作ってください。\n\n{request}"),
     }];
-    let (raw, stop) = ai::complete(
+    let answered = ai::complete(
         api_key,
         GENERATION_MODEL,
         Some(&system),
@@ -288,6 +297,18 @@ async fn generate(api_key: &str, request: &str) -> Result<GeneratedTrigger, Prop
         GENERATION_MAX_TOKENS,
     )
     .await?;
+
+    // 生成は上限まで吐かせる呼び出し ([`GENERATION_MAX_TOKENS`]) なので 1 回が重く、
+    // 切り捨てや JSON パース失敗で捨てる回こそ消費は最大になる。記録が下の分岐より
+    // 先に来ることは [`crate::record_ai_usage`] の形が保証している (#71)。
+    let (raw, stop) = crate::record_ai_usage(
+        app,
+        history,
+        GENERATION_USAGE_LABEL,
+        GENERATION_MODEL,
+        answered,
+    );
+
     if stop == ai::StopReason::Truncated {
         return Err(ProposalFailure::Truncated);
     }

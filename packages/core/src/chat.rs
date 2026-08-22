@@ -22,6 +22,13 @@ const CHAT_STORE_FILE: &str = "chat-history.json";
 const CHAT_MESSAGES_KEY: &str = "messages";
 const MAX_HISTORY: usize = 40;
 
+/// 会話に使うモデル。既定のまま (分ける理由が出るまでは [`drafts`] の生成と同じ)。
+const CHAT_MODEL: Option<&str> = None;
+
+/// 活動ログでこの消費を名乗る名前 (#71)。トリガーの `ai.complete` と並ぶので、
+/// **どちらの経路かが本文だけで読める形にする。**
+const CHAT_USAGE_LABEL: &str = "chat.send";
+
 /// 秘書の persona と、道具をいつ使うかの判断基準。
 ///
 /// **「1 回きりか、繰り返しか」を秘書に判断させている** (#61 論点 1)。入口はどちらも
@@ -153,15 +160,20 @@ pub async fn chat_send(
         })
         .collect();
 
-    let (response, stop) = ai::complete_with_tools(
+    let answered = ai::complete_with_tools(
         &api_key,
-        None,
+        CHAT_MODEL,
         Some(CHAMBERLAIN_SYSTEM_PROMPT),
         &ai_messages,
         &[drafts::propose_trigger_tool()],
         ai::DEFAULT_MAX_TOKENS,
     )
     .await?;
+
+    // 秘書自身の消費も観測面に残す (#71)。下書きの生成 (2 回目の呼び出し) はこの先で
+    // 分岐した中にあり、そちらが失敗しても 1 回目の課金は起きている。
+    let (response, stop) =
+        crate::record_ai_usage(&app, &history_store, CHAT_USAGE_LABEL, CHAT_MODEL, answered);
 
     let (content, draft) = match response {
         ai::Completion::Text(text) => (append_truncation_note(text, stop), None),

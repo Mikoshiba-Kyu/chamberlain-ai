@@ -119,6 +119,97 @@ struct ResponseBody {
     /// **欠けていても落とさない** — 未知の値と同じく「切れていない」に倒す。
     #[serde(default)]
     stop_reason: Option<String>,
+    /// 消費したトークン (#71)。**欠けていても落とさない** — `stop_reason` と同じ方針。
+    #[serde(default)]
+    usage: Usage,
+}
+
+/// 1 回の呼び出しが消費したトークン (#71)。
+///
+/// **欠損にも未知フィールドにも強くする。** `usage` ごと無い応答も、知らない項目が
+/// 増えた応答も 0 として読む。これは観測のためのフィールドで、API の形が変わった日に
+/// 呼び出し自体が落ちるのは本末転倒 ([`ResponseBody::stop_reason`] と同じ方針)。
+///
+/// **`null` も 0 として読む。** Messages API はトークン数を nullable (`integer | null`)
+/// として返しうる (公式 SDK の型がそうなっている)。`#[serde(default)]` が効くのは
+/// **項目ごと無いとき**だけで、明示的な `null` は `invalid type: null, expected u32`
+/// になる。ここが落ちると `ResponseBody` のパースごと失敗する — 観測のために足した
+/// フィールドが AI 呼び出し自体を落とすことになる。
+///
+/// キャッシュの 2 つを最初から持つのは、**プロンプトキャッシュが効いているかどうかを
+/// 見る手段がこれしか無い**ため。最小キャッシュ長に満たない prefix はエラーにならず
+/// 黙って無視されるので、`cache_read_input_tokens` が 0 のままかどうかでしか
+/// 「入れたつもりで全ミス」を検出できない。
+#[derive(Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct Usage {
+    #[serde(deserialize_with = "null_as_zero")]
+    pub input_tokens: u32,
+    #[serde(deserialize_with = "null_as_zero")]
+    pub output_tokens: u32,
+    #[serde(deserialize_with = "null_as_zero")]
+    pub cache_creation_input_tokens: u32,
+    #[serde(deserialize_with = "null_as_zero")]
+    pub cache_read_input_tokens: u32,
+}
+
+/// `null` を 0 として読む。[`Usage`] の doc にある通り、API はトークン数を nullable で
+/// 返しうるので、項目の欠損だけを見る `#[serde(default)]` では足りない。
+fn null_as_zero<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    Ok(Option::<u32>::deserialize(d)?.unwrap_or(0))
+}
+
+impl Usage {
+    /// 記録は 1 実行につき 1 行に畳まれる (`permissions::TriggerPermissions::record`) ので、
+    /// 畳んだぶんを足し込めるようにする。
+    ///
+    /// **飽和加算。** 課金の観測のために panic する理由が無い (u32 が溢れるほどの
+    /// 消費が 1 実行で起きたなら、それ自体は行の数字を見れば分かる)。
+    pub fn saturating_add(self, other: Self) -> Self {
+        Self {
+            input_tokens: self.input_tokens.saturating_add(other.input_tokens),
+            output_tokens: self.output_tokens.saturating_add(other.output_tokens),
+            cache_creation_input_tokens: self
+                .cache_creation_input_tokens
+                .saturating_add(other.cache_creation_input_tokens),
+            cache_read_input_tokens: self
+                .cache_read_input_tokens
+                .saturating_add(other.cache_read_input_tokens),
+        }
+    }
+
+    /// 何も消費していない。応答が返る前に落ちた呼び出し (キー未設定 / API エラー) が
+    /// これになる。
+    pub fn is_zero(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// 活動ログの本文に消費を添える。0 のときは何も足さない — **添えない行は
+    /// 「応答が返らなかった」を意味する。** `tokens in=0 out=0` と書くと、
+    /// 呼びに行けなかったことと 0 トークンで返ってきたことが同じ見た目になる。
+    ///
+    /// キャッシュの 2 つは 0 なら書かない。プロンプトキャッシュを入れるまでは常に 0 で、
+    /// 毎行 2 項目のノイズになる。入れた後は 0 でなくなるので、効いているかがそのまま
+    /// 行に出る。
+    pub fn annotate(&self, message: String) -> String {
+        if self.is_zero() {
+            return message;
+        }
+        let mut out = format!(
+            "{message} tokens in={} out={}",
+            self.input_tokens, self.output_tokens
+        );
+        if self.cache_creation_input_tokens > 0 {
+            out.push_str(&format!(
+                " cache_write={}",
+                self.cache_creation_input_tokens
+            ));
+        }
+        if self.cache_read_input_tokens > 0 {
+            out.push_str(&format!(" cache_read={}", self.cache_read_input_tokens));
+        }
+        out
+    }
 }
 
 /// 応答が終わった理由のうち、呼び出し側の判断が変わるものだけを持つ (#68)。
@@ -140,6 +231,21 @@ impl StopReason {
             _ => Self::Complete,
         }
     }
+}
+
+/// 1 往復の結果。`content` の型は呼ぶ関数で決まる ([`complete`] なら [`String`]、
+/// [`complete_with_tools`] なら [`Completion`])。
+///
+/// **タプルではなく構造体にしてある。** #68 で `(結果, StopReason)` にしたところに
+/// `usage` (#71) が加わって 3 要素になり、位置で読む形は誤りに気づけない。
+///
+/// `usage` を `Option` にしないのは、**取れなかったことと 0 だったことを区別しない**
+/// ため。API が `usage` を返さない応答は起きない想定で、万一そうなっても記録が
+/// 「消費 0」として出る方が、そこだけ別の分岐を書かせるより安い。
+pub struct Response<T> {
+    pub content: T,
+    pub stop: StopReason,
+    pub usage: Usage,
 }
 
 /// 1 往復の結果。道具を渡していなければ必ず [`Completion::Text`]。
@@ -170,15 +276,26 @@ pub async fn complete(
     system: Option<&str>,
     messages: &[Message],
     max_tokens: u32,
-) -> Result<(String, StopReason), String> {
-    match complete_with_tools(api_key, model, system, messages, &[], max_tokens).await? {
-        (Completion::Text(text), stop) => Ok((text, stop)),
+) -> Result<Response<String>, String> {
+    let response = complete_with_tools(api_key, model, system, messages, &[], max_tokens).await?;
+    match response.content {
+        Completion::Text(text) => Ok(Response {
+            content: text,
+            stop: response.stop,
+            usage: response.usage,
+        }),
         // 道具を渡していないので到達しない。潰さずエラーにする (黙って空文字を返すと
         // 呼び出し側が「モデルが何も言わなかった」と誤読する)。
-        (Completion::ToolUse { name, .. }, _) => {
+        Completion::ToolUse { name, .. } => {
             Err(format!("anthropic returned an unexpected tool_use: {name}"))
         }
     }
+}
+
+/// 呼び出しに実際に使うモデル名。**送る値と記録に載る値を同じ関数から取る** (#71) —
+/// 既定を使った呼び出しが活動ログに `model=` 無しで並ぶと、消費をモデル別に読めない。
+pub fn resolve_model(model: Option<&str>) -> &str {
+    model.unwrap_or(DEFAULT_MODEL)
 }
 
 /// 道具を渡して 1 往復する (#61)。
@@ -194,9 +311,9 @@ pub async fn complete_with_tools(
     messages: &[Message],
     tools: &[Tool<'_>],
     max_tokens: u32,
-) -> Result<(Completion, StopReason), String> {
+) -> Result<Response<Completion>, String> {
     let body = RequestBody {
-        model: model.unwrap_or(DEFAULT_MODEL),
+        model: resolve_model(model),
         max_tokens,
         system,
         messages,
@@ -236,7 +353,11 @@ pub async fn complete_with_tools(
         None if stop == StopReason::Truncated => Completion::Text(String::new()),
         None => return Err("anthropic response had no content".to_string()),
     };
-    Ok((completion, stop))
+    Ok(Response {
+        content: completion,
+        stop,
+        usage: parsed.usage,
+    })
 }
 
 /// content ブロックの列を 1 つの結果に畳む。
@@ -307,8 +428,9 @@ fn checked_max_tokens(requested: Option<u32>) -> Result<u32, JsErrorBox> {
 /// API キーの持ち出しにあたる — 無制限に呼べると、エンドユーザーの課金でトリガー作者の
 /// 用事が処理される。レート制限は必要になってから。
 ///
-/// 記録するのは model と回数だけで、**prompt は残さない**。履歴はエンドユーザーの手元に
-/// 平文で溜まるので、内容まで書くと観測面がそのまま漏洩面になる。
+/// 記録するのは model・回数・消費したトークン数で、**prompt は残さない**。履歴は
+/// エンドユーザーの手元に平文で溜まるので、内容まで書くと観測面がそのまま漏洩面になる。
+/// **token 数は数値なのでこの線を越えない** (#71)。
 ///
 /// **応答が `maxTokens` で切れたら例外にする** (#68)。「切れた要約を通知した」より
 /// 「要約に失敗した」の方が秘書として正しい。長い応答が要るトリガーは `maxTokens` を
@@ -320,7 +442,7 @@ pub async fn op_chamberlain_ai_complete(
     #[serde] args: CompleteArgs,
 ) -> Result<String, JsErrorBox> {
     let max_tokens = checked_max_tokens(args.max_tokens)?;
-    let model = args.model.as_deref().unwrap_or(DEFAULT_MODEL);
+    let model = resolve_model(args.model.as_deref());
 
     // await 前に必要な情報を全部同期的に取り出しておく。
     // OpState を await 越しに保持しないための定型パターン。
@@ -344,7 +466,11 @@ pub async fn op_chamberlain_ai_complete(
         content: args.prompt,
     }];
 
-    let (text, stop) = complete(
+    let Response {
+        content: text,
+        stop,
+        usage,
+    } = complete(
         &api_key,
         Some(model),
         args.system.as_deref(),
@@ -353,6 +479,14 @@ pub async fn op_chamberlain_ai_complete(
     )
     .await
     .map_err(JsErrorBox::generic)?;
+
+    // 消費を呼び出しの行に足す (#71)。**切り捨ての分岐より先に。** 切れた応答は
+    // `max_tokens` を吐き切っているので消費は最大で、そこを例外の陰で落とすと
+    // 「一番高い呼び出しだけ記録に出ない」ことになる。
+    state
+        .borrow_mut()
+        .borrow_mut::<TriggerPermissions>()
+        .record_ai_usage(model, usage);
 
     if stop == StopReason::Truncated {
         // 例外は catch されうるので、切り捨て自体は観測面にも残す。`[ai]` の行を分けて
@@ -381,6 +515,10 @@ mod tests {
     fn stop_reason(json: &str) -> StopReason {
         let parsed: ResponseBody = serde_json::from_str(json).unwrap();
         StopReason::from_api(parsed.stop_reason.as_deref())
+    }
+
+    fn usage(json: &str) -> Usage {
+        serde_json::from_str::<ResponseBody>(json).unwrap().usage
     }
 
     /// 天井が timeout の中で届く値であること (#68)。
@@ -481,6 +619,112 @@ mod tests {
         assert!(
             matches!(parsed, Some(Completion::ToolUse { text, .. }) if text.as_deref() == Some("用意します。"))
         );
+    }
+
+    /// usage は**欠けても未知の項目が増えても落とさない** (#71)。ここが厳しいと、
+    /// 課金を観測するために足したフィールドのせいで呼び出し自体が使えなくなる。
+    #[test]
+    fn missing_or_unknown_usage_fields_read_as_zero() {
+        assert_eq!(
+            usage(r#"{"content":[],"usage":{"input_tokens":120,"output_tokens":34}}"#),
+            Usage {
+                input_tokens: 120,
+                output_tokens: 34,
+                ..Usage::default()
+            }
+        );
+        // キャッシュを使った応答。プロンプトキャッシュ (#71 の後続) が効いているかは
+        // ここが 0 でなくなるかどうかでしか見えない。
+        assert_eq!(
+            usage(
+                r#"{"content":[],"usage":{"input_tokens":4,"output_tokens":9,
+                   "cache_creation_input_tokens":1024,"cache_read_input_tokens":2048,
+                   "server_tool_use":{"web_search_requests":1}}}"#
+            ),
+            Usage {
+                input_tokens: 4,
+                output_tokens: 9,
+                cache_creation_input_tokens: 1024,
+                cache_read_input_tokens: 2048,
+            }
+        );
+        for body in [r#"{"content":[]}"#, r#"{"content":[],"usage":{}}"#] {
+            assert!(usage(body).is_zero(), "{body}");
+        }
+    }
+
+    /// **`null` も 0 として読む。** Messages API はトークン数を nullable で返しうる。
+    /// `#[serde(default)]` は項目の欠損しか見ないので、ここを `u32` のまま受けると
+    /// `ResponseBody` のパースごと落ち、**その AI 呼び出しが丸ごと失敗する**。
+    #[test]
+    fn null_token_counts_read_as_zero() {
+        assert_eq!(
+            usage(
+                r#"{"content":[],"usage":{"input_tokens":2095,"output_tokens":503,
+                   "cache_creation_input_tokens":null,"cache_read_input_tokens":null}}"#
+            ),
+            Usage {
+                input_tokens: 2095,
+                output_tokens: 503,
+                ..Usage::default()
+            }
+        );
+    }
+
+    /// 活動ログの行の形 (#71)。
+    ///
+    /// **0 のときは何も添えない。** 添えない行は「応答が返らなかった」(キー未設定 /
+    /// API エラー) を意味する。`tokens in=0 out=0` と書くと、呼びに行けなかったことと
+    /// 0 トークンで返ってきたことが同じ見た目になる。
+    #[test]
+    fn the_activity_line_carries_only_the_numbers_that_mean_something() {
+        let base = || "ai.complete model=claude-sonnet-5".to_string();
+        assert_eq!(Usage::default().annotate(base()), base());
+
+        let plain = Usage {
+            input_tokens: 3120,
+            output_tokens: 880,
+            ..Usage::default()
+        };
+        assert_eq!(
+            plain.annotate(base()),
+            "ai.complete model=claude-sonnet-5 tokens in=3120 out=880"
+        );
+
+        let cached = Usage {
+            cache_creation_input_tokens: 1024,
+            cache_read_input_tokens: 2048,
+            ..plain
+        };
+        assert_eq!(
+            cached.annotate(base()),
+            "ai.complete model=claude-sonnet-5 tokens in=3120 out=880 cache_write=1024 cache_read=2048"
+        );
+    }
+
+    /// 畳まれた行のために足せること。飽和で止まり、panic しない。
+    #[test]
+    fn usage_adds_up_and_saturates() {
+        let a = Usage {
+            input_tokens: 10,
+            output_tokens: 2,
+            cache_creation_input_tokens: 1,
+            cache_read_input_tokens: 3,
+        };
+        assert_eq!(
+            a.saturating_add(a),
+            Usage {
+                input_tokens: 20,
+                output_tokens: 4,
+                cache_creation_input_tokens: 2,
+                cache_read_input_tokens: 6,
+            }
+        );
+        let huge = Usage {
+            input_tokens: u32::MAX,
+            ..Usage::default()
+        };
+        assert_eq!(huge.saturating_add(huge).input_tokens, u32::MAX);
     }
 
     /// 空の応答は「テキストが空文字だった」ではなく「何も返ってこなかった」。

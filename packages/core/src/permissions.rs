@@ -28,6 +28,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::ai::Usage;
 use crate::history::ActivityKind;
 use crate::secrets::{store as secret_store, ANTHROPIC_API_KEY_NAME};
 
@@ -341,6 +342,13 @@ pub(crate) struct OpActivity {
     pub message: String,
     /// 同じ実行の中で同じ記録が起きた回数。1 のときは表示に出さない。
     pub count: u32,
+    /// この行が表す呼び出しが消費したトークン (#71)。畳まれた行では**合算**される。
+    ///
+    /// **本文とは別の数値フィールドで持つ。** 本文に書くと呼び出しごとに文字列が割れ、
+    /// [`TriggerPermissions::record`] の畳みが効かなくなる (`maxTokens` の値を本文に
+    /// 入れなかったのと同じ理由 — #68)。畳みを壊さずに数を持つには、まとめるときに
+    /// 足せる場所が要る。
+    pub usage: Usage,
 }
 
 impl OpActivity {
@@ -353,15 +361,22 @@ impl OpActivity {
             kind,
             message: truncate_chars(message, MAX_MESSAGE_CHARS),
             count: 1,
+            usage: Usage::default(),
         }
     }
 
-    /// 表示用の本文。2 回以上なら回数を添える。
+    fn with_usage(mut self, usage: Usage) -> Self {
+        self.usage = usage;
+        self
+    }
+
+    /// 表示用の本文。2 回以上なら回数を、消費があればトークン数を添える。
     pub(crate) fn display(&self) -> String {
-        match self.count {
+        let counted = match self.count {
             1 => self.message.clone(),
             n => format!("{} (×{n})", self.message),
-        }
+        };
+        self.usage.annotate(counted)
     }
 }
 
@@ -453,14 +468,48 @@ impl TriggerPermissions {
     ///
     /// 本文に prompt の中身も長さも入れない。中身は履歴がそのまま漏洩面になるため、長さは
     /// [`Self::record`] の重複排除のキーが毎回変わって**まとめる意味が消える**ため。
-    /// 知りたいのは呼び出しの量で、それは回数が持つ。
+    /// 知りたいのは呼び出しの量で、それは回数と [`Self::record_ai_usage`] が持つ。
     pub(crate) fn record_ai_call(&mut self, model: &str) {
-        let record = OpActivity::new(
+        let record = self.ai_call_row(model);
+        self.record(record);
+    }
+
+    /// 応答が返ってきたら、その消費を**呼び出しの行に足す** (#71)。
+    ///
+    /// [`Self::record_ai_call`] は呼びに行く前に走る (キー未設定や API エラーで落ちた
+    /// 呼び出しも残すため) ので、消費が分かるのはいつも後になる。行を分けずに後から
+    /// 足しに来るのは、**回数と消費が同じ行に並んでいないと読めない**から — 「3 回で
+    /// 何トークン」が知りたいのであって、回数の行と消費の行が別々にあっても足し算は
+    /// 読み手の仕事になる。
+    ///
+    /// **回数は増やさない。** 数えているのは呼び出しの回数で、これはその内訳を足すだけ。
+    pub(crate) fn record_ai_usage(&mut self, model: &str, usage: Usage) {
+        let record = self.ai_call_row(model).with_usage(usage);
+        // 呼び出しの行 → それが種類上限 ([`MAX_PENDING`]) で畳まれた先、の順に探す。
+        // 畳まれた行を見ずに [`Self::record`] へ回すと、そこで回数がもう 1 つ増えて
+        // **溢れた分の呼び出し回数が 2 倍に出る**。
+        let overflow = OpActivity::new(
+            record.trigger_id.clone(),
+            record.kind,
+            OVERFLOW_MESSAGE.to_string(),
+        );
+        match self.find(&record).or_else(|| self.find(&overflow)) {
+            Some(i) => self.pending[i].usage = self.pending[i].usage.saturating_add(usage),
+            // どちらも無いのは、応答が実行文脈の外で返ってきた場合 (await されなかった
+            // promise が `leave()` の後に解決した — モジュール doc の既知の限界)。
+            // **消費は捨てない。** 課金は起きているので、1 回分の行として新しく残す。
+            None => self.record(record),
+        }
+    }
+
+    /// `ai.complete` の呼び出しを表す行。**呼び出しの記録と消費の記録で同じものを使う** —
+    /// 本文が 1 文字でも違うと [`Self::find_mut`] が見つけられず、消費が別の行になる。
+    fn ai_call_row(&self, model: &str) -> OpActivity {
+        OpActivity::new(
             self.current.clone(),
             ActivityKind::AiCall,
             format!("ai.complete model={model}"),
-        );
-        self.record(record);
+        )
     }
 
     /// 応答が `maxTokens` で切れたことを記録する (#68)。
@@ -509,25 +558,37 @@ impl TriggerPermissions {
             activity.trigger_id,
             activity.kind,
             OVERFLOW_MESSAGE.to_string(),
-        );
+        )
+        // 畳んだ先でも消費は残す。溢れた行こそ呼び出しの多い実行なので、そこで
+        // トークン数が消えると一番見たい消費が観測面から落ちる。
+        .with_usage(activity.usage);
         if !self.bump(&overflow) {
             self.pending.push(overflow);
         }
     }
 
-    /// 同じ記録が既にあれば回数を足して `true`。
+    /// 同じ記録が既にあれば回数と消費を足して `true`。
     fn bump(&mut self, activity: &OpActivity) -> bool {
-        match self.pending.iter_mut().find(|a| {
-            a.trigger_id == activity.trigger_id
-                && a.kind == activity.kind
-                && a.message == activity.message
-        }) {
-            Some(existing) => {
-                existing.count = existing.count.saturating_add(1);
+        match self.find(activity) {
+            Some(i) => {
+                self.pending[i].count = self.pending[i].count.saturating_add(1);
+                self.pending[i].usage = self.pending[i].usage.saturating_add(activity.usage);
                 true
             }
             None => false,
         }
+    }
+
+    /// 同じ記録 (帰属先 + 種別 + 本文) の行。まとめる単位はここ 1 箇所が決める。
+    ///
+    /// 参照ではなく添字を返すのは、[`Self::record_ai_usage`] が**2 つの候補を順に
+    /// 探す**ため。`&mut` を返すと 1 つ目の借用が生きたまま 2 つ目を探せない。
+    fn find(&self, activity: &OpActivity) -> Option<usize> {
+        self.pending.iter().position(|a| {
+            a.trigger_id == activity.trigger_id
+                && a.kind == activity.kind
+                && a.message == activity.message
+        })
     }
 }
 
@@ -826,6 +887,117 @@ mod tests {
             "ai.complete model=claude-sonnet-5 (×2)"
         );
         assert_eq!(recorded[1].display(), "ai.complete model=claude-opus-5");
+    }
+
+    fn tokens(input: u32, output: u32) -> Usage {
+        Usage {
+            input_tokens: input,
+            output_tokens: output,
+            ..Usage::default()
+        }
+    }
+
+    /// トークン数は**呼び出しの行に足される** (#71)。畳まれた行では合算され、回数と
+    /// 並んで 1 行に出る。ここが割れると、本文に数を入れなかった意味 (#68 と同じ) が消える。
+    #[test]
+    fn token_counts_ride_along_on_the_call_row_and_add_up() {
+        let mut s = state();
+        s.enter("declaring");
+        s.record_ai_call("claude-sonnet-5");
+        s.record_ai_usage("claude-sonnet-5", tokens(3000, 800));
+        s.record_ai_call("claude-sonnet-5");
+        s.record_ai_usage("claude-sonnet-5", tokens(120, 80));
+
+        let recorded = s.leave();
+        assert_eq!(recorded.len(), 1, "消費が別行に割れている: {recorded:?}");
+        assert_eq!(
+            recorded[0].display(),
+            "ai.complete model=claude-sonnet-5 (×2) tokens in=3120 out=880"
+        );
+    }
+
+    /// **応答が返らなかった呼び出しにはトークンが付かない。** キー未設定や API エラーでも
+    /// 呼びに行った事実は残る (`record_ai_call` は await の前に走る) が、そこに
+    /// `tokens in=0 out=0` と書くと「0 トークンで返ってきた」と区別が付かなくなる。
+    #[test]
+    fn a_call_that_never_got_an_answer_carries_no_tokens() {
+        let mut s = state();
+        s.enter("declaring");
+        s.record_ai_call("claude-sonnet-5");
+
+        let recorded = s.leave();
+        assert_eq!(recorded[0].display(), "ai.complete model=claude-sonnet-5");
+    }
+
+    /// 消費は呼び出しの行にしか足さない。切り捨ての行 (#68) は「何回中いくつが切れたか」を
+    /// 数えるためのもので、そこに混ぜると同じ消費が 2 回出る。
+    #[test]
+    fn truncation_keeps_its_own_row_without_the_tokens() {
+        let mut s = state();
+        s.enter("declaring");
+        s.record_ai_call("claude-sonnet-5");
+        s.record_ai_usage("claude-sonnet-5", tokens(10, 6144));
+        s.record_ai_truncation("claude-sonnet-5");
+
+        let recorded = s.leave();
+        assert_eq!(recorded.len(), 2, "{recorded:?}");
+        assert_eq!(
+            recorded[0].display(),
+            "ai.complete model=claude-sonnet-5 tokens in=10 out=6144"
+        );
+        assert_eq!(
+            recorded[1].display(),
+            "ai.complete model=claude-sonnet-5 truncated at maxTokens"
+        );
+    }
+
+    /// 呼び出しの行が見つからなくても**消費は捨てない**。応答が実行文脈の外で返る
+    /// (await されなかった promise が `leave()` の後に解決した) 場合がこれになる。
+    /// 課金は起きているので、行が無ければ新しく残す。
+    #[test]
+    fn usage_without_its_call_row_is_still_recorded() {
+        let mut s = state();
+        s.enter("declaring");
+        s.record_ai_usage("claude-sonnet-5", tokens(90, 12));
+
+        let recorded = s.leave();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(
+            recorded[0].display(),
+            "ai.complete model=claude-sonnet-5 tokens in=90 out=12"
+        );
+    }
+
+    /// 種類数が溢れて 1 行に畳まれても、消費はその行に残る。溢れるのは呼び出しの多い
+    /// 実行なので、そこでトークン数が消えると一番見たい消費が観測面から落ちる。
+    #[test]
+    fn folded_rows_keep_the_tokens_they_swallowed() {
+        let mut s = state();
+        s.enter("declaring");
+        for i in 0..MAX_PENDING * 2 {
+            let model = format!("model-{i}");
+            s.record_ai_call(&model);
+            s.record_ai_usage(&model, tokens(10, 1));
+        }
+
+        let recorded = s.leave();
+        let total: u32 = recorded.iter().map(|a| a.usage.input_tokens).sum();
+        assert_eq!(
+            total,
+            (MAX_PENDING as u32) * 2 * 10,
+            "畳まれた分の消費が落ちている: {recorded:?}"
+        );
+
+        // **回数は水増ししない。** 消費を足しに行った先で回数まで増えると、溢れた分の
+        // 呼び出し回数が 2 倍に出る (`[ai]` の回数は課金の読み筋そのもの)。
+        let overflow = recorded
+            .iter()
+            .find(|a| a.message == OVERFLOW_MESSAGE)
+            .expect("溢れた分の行が無い");
+        assert_eq!(
+            overflow.count as usize, MAX_PENDING,
+            "溢れた分の回数が呼び出し数と合わない: {overflow:?}"
+        );
     }
 
     /// 宣言の無いトリガーが grants に載っていなくても素通りさせない。
