@@ -81,17 +81,93 @@ pub struct Tool<'a> {
     pub input_schema: serde_json::Value,
 }
 
+/// プロンプトキャッシュの breakpoint をどこに置くか (#72)。
+///
+/// **公開契約には出さない。** `chamberlain.ai.complete` の口は変えないので、トリガー
+/// 作者が breakpoint を書く手段は無い。Type I の prompt は作者が 1 発ずつ組むもので、
+/// core からは中身も再利用の見込みも見えない。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CacheBreakpoint {
+    /// 置かない。リクエストの JSON は cache_control を入れる前と 1 バイトも変わらない。
+    None,
+    /// `messages` の最後のブロックに置く。render 順が `tools` → `system` → `messages`
+    /// なので、**これ 1 つで道具定義・system prompt・履歴の全体が対象になる。**
+    ///
+    /// breakpoint は前方へ最大 20 ブロック遡って前回のキャッシュを探す。会話は 1 往復
+    /// あたり 2 ブロックしか伸びないので、毎ターンここに置くだけで前ターンぶんが読める。
+    LastMessage,
+}
+
+/// TTL は既定 (5 分) のまま。秘書チャットは会話中の連続ターンで、たいてい間に合う。
+/// 1 時間 TTL は書き込みが 2 倍で、元を取るには同じ prefix を 3 回以上使う必要がある —
+/// 会話が 5 分空いたら、それは次の会話であることの方が多い。
+const EPHEMERAL: CacheControl = CacheControl { kind: "ephemeral" };
+
+#[derive(Serialize, Clone, Copy)]
+struct CacheControl {
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
 #[derive(Serialize)]
 struct RequestBody<'a> {
     model: &'a str,
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     system: Option<&'a str>,
-    messages: &'a [Message],
+    messages: Vec<WireMessage<'a>>,
     /// 空のときは送らない。`tools: []` を送っても害は無いが、道具を渡していない
     /// 呼び出し (Type I の `ai.complete`) のリクエストを変えたくない。
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<&'a [Tool<'a>]>,
+}
+
+/// リクエストに載せる 1 メッセージ。[`Message`] との違いは `content` の形だけ。
+#[derive(Serialize)]
+struct WireMessage<'a> {
+    role: &'a Role,
+    content: WireContent<'a>,
+}
+
+/// `content` は文字列でもブロック配列でもよい。cache_control はブロックにしか付かない。
+///
+/// **breakpoint を置く呼び出しでは、置かないメッセージも含めて全部ブロックにする。**
+/// 同じ 1 通が「最後だからブロック」「次のターンでは最後でないから文字列」と形を変えると、
+/// prefix が前ターンと一致する保証が消える — キャッシュは prefix の一致でしか効かない。
+#[derive(Serialize)]
+#[serde(untagged)]
+enum WireContent<'a> {
+    Text(&'a str),
+    Blocks([TextBlock<'a>; 1]),
+}
+
+#[derive(Serialize)]
+struct TextBlock<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    text: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
+}
+
+/// [`Message`] の列をリクエストの形にする。
+fn wire_messages(messages: &[Message], cache: CacheBreakpoint) -> Vec<WireMessage<'_>> {
+    let last = messages.len().wrapping_sub(1);
+    messages
+        .iter()
+        .enumerate()
+        .map(|(i, m)| WireMessage {
+            role: &m.role,
+            content: match cache {
+                CacheBreakpoint::None => WireContent::Text(&m.content),
+                CacheBreakpoint::LastMessage => WireContent::Blocks([TextBlock {
+                    kind: "text",
+                    text: &m.content,
+                    cache_control: (i == last).then_some(EPHEMERAL),
+                }]),
+            },
+        })
+        .collect()
 }
 
 /// 応答の content ブロック。
@@ -277,7 +353,17 @@ pub async fn complete(
     messages: &[Message],
     max_tokens: u32,
 ) -> Result<Response<String>, String> {
-    let response = complete_with_tools(api_key, model, system, messages, &[], max_tokens).await?;
+    // 道具も履歴も持たない 1 発の呼び出しなので、キャッシュする prefix が無い (#72)。
+    let response = complete_with_tools(
+        api_key,
+        model,
+        system,
+        messages,
+        &[],
+        max_tokens,
+        CacheBreakpoint::None,
+    )
+    .await?;
     match response.content {
         Completion::Text(text) => Ok(Response {
             content: text,
@@ -304,6 +390,9 @@ pub fn resolve_model(model: Option<&str>) -> &str {
 /// 用途では、道具が呼ばれた時点で core 側の仕事 (生成 → 下書き → 同意画面) に移り、
 /// 会話は定型の 1 行で閉じる。往復を重ねる形にすると、失敗のたびにモデルが勝手に
 /// やり直して課金だけが伸びる。
+///
+/// `cache` はプロンプトキャッシュの breakpoint (#72)。**呼び出し側が決める** — 効くのは
+/// 同じ prefix を短い間隔で何度も送る経路だけで、それを知っているのはここではない。
 pub async fn complete_with_tools(
     api_key: &str,
     model: Option<&str>,
@@ -311,12 +400,13 @@ pub async fn complete_with_tools(
     messages: &[Message],
     tools: &[Tool<'_>],
     max_tokens: u32,
+    cache: CacheBreakpoint,
 ) -> Result<Response<Completion>, String> {
     let body = RequestBody {
         model: resolve_model(model),
         max_tokens,
         system,
-        messages,
+        messages: wire_messages(messages, cache),
         tools: (!tools.is_empty()).then_some(tools),
     };
 
@@ -507,6 +597,94 @@ pub async fn op_chamberlain_ai_complete(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn convo(contents: &[&str]) -> Vec<Message> {
+        contents
+            .iter()
+            .enumerate()
+            .map(|(i, c)| Message {
+                role: if i % 2 == 0 {
+                    Role::User
+                } else {
+                    Role::Assistant
+                },
+                content: (*c).to_string(),
+            })
+            .collect()
+    }
+
+    fn wire(messages: &[Message], cache: CacheBreakpoint) -> serde_json::Value {
+        serde_json::to_value(wire_messages(messages, cache)).unwrap()
+    }
+
+    /// breakpoint を置かない呼び出しのリクエストは、#72 の前と 1 バイトも変わらない。
+    ///
+    /// **Type I (`ai.complete`) と下書きの生成がここを通る。** キャッシュを入れた副作用で
+    /// それらの `content` がブロック配列に変わると、公開契約に出さないと決めた変更が
+    /// トリガー作者から見えるリクエストに漏れる。
+    #[test]
+    fn no_breakpoint_leaves_the_request_shape_untouched() {
+        let messages = convo(&["ask", "answer", "again"]);
+        assert_eq!(
+            wire(&messages, CacheBreakpoint::None),
+            serde_json::json!([
+                {"role": "user", "content": "ask"},
+                {"role": "assistant", "content": "answer"},
+                {"role": "user", "content": "again"},
+            ])
+        );
+    }
+
+    /// breakpoint は末尾に 1 つだけ。**残りもブロック配列にする。**
+    ///
+    /// 同じ 1 通が「今は最後だからブロック」「次のターンでは最後でないから文字列」と
+    /// 形を変えると、次のターンの prefix が前のターンと一致しない。キャッシュは prefix の
+    /// 一致でしか効かないので、それは breakpoint を置いていないのと同じことになる。
+    #[test]
+    fn the_breakpoint_sits_on_the_last_block_and_the_rest_are_still_blocks() {
+        let messages = convo(&["ask", "answer", "again"]);
+        assert_eq!(
+            wire(&messages, CacheBreakpoint::LastMessage),
+            serde_json::json!([
+                {"role": "user", "content": [{"type": "text", "text": "ask"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "answer"}]},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "again", "cache_control": {"type": "ephemeral"}}
+                ]},
+            ])
+        );
+    }
+
+    /// 会話が伸びても、前のターンで送ったぶんの bytes は変わらない。
+    ///
+    /// これが崩れると `cache_read_input_tokens` は 0 のまま、しかも**エラーにはならない** —
+    /// 最小キャッシュ長に届かなかった場合と見分けがつかなくなる。
+    #[test]
+    fn growing_the_conversation_keeps_the_earlier_prefix_byte_identical() {
+        let turn_n = convo(&["ask", "answer", "again"]);
+        let turn_next = convo(&["ask", "answer", "again", "sure", "more"]);
+
+        let before = wire(&turn_n, CacheBreakpoint::LastMessage);
+        let after = wire(&turn_next, CacheBreakpoint::LastMessage);
+        let (before, after) = (before.as_array().unwrap(), after.as_array().unwrap());
+
+        // 末尾 (breakpoint が乗っていた 1 通) 以外はそのまま。
+        assert_eq!(before[..before.len() - 1], after[..before.len() - 1]);
+        // 末尾からは cache_control が外れ、それ以外は変わらない。
+        assert_eq!(
+            after[before.len() - 1],
+            serde_json::json!({"role": "user", "content": [{"type": "text", "text": "again"}]})
+        );
+    }
+
+    /// 空の messages で panic しない (`len() - 1` を素で書くと 0 で落ちる)。
+    #[test]
+    fn an_empty_conversation_is_not_a_panic() {
+        assert_eq!(
+            wire(&[], CacheBreakpoint::LastMessage),
+            serde_json::json!([])
+        );
+    }
 
     fn blocks(json: &str) -> Vec<ContentBlock> {
         serde_json::from_str::<ResponseBody>(json).unwrap().content
