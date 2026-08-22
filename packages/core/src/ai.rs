@@ -130,6 +130,12 @@ struct ResponseBody {
 /// 増えた応答も 0 として読む。これは観測のためのフィールドで、API の形が変わった日に
 /// 呼び出し自体が落ちるのは本末転倒 ([`ResponseBody::stop_reason`] と同じ方針)。
 ///
+/// **`null` も 0 として読む。** Messages API はトークン数を nullable (`integer | null`)
+/// として返しうる (公式 SDK の型がそうなっている)。`#[serde(default)]` が効くのは
+/// **項目ごと無いとき**だけで、明示的な `null` は `invalid type: null, expected u32`
+/// になる。ここが落ちると `ResponseBody` のパースごと失敗する — 観測のために足した
+/// フィールドが AI 呼び出し自体を落とすことになる。
+///
 /// キャッシュの 2 つを最初から持つのは、**プロンプトキャッシュが効いているかどうかを
 /// 見る手段がこれしか無い**ため。最小キャッシュ長に満たない prefix はエラーにならず
 /// 黙って無視されるので、`cache_read_input_tokens` が 0 のままかどうかでしか
@@ -137,10 +143,20 @@ struct ResponseBody {
 #[derive(Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[serde(default)]
 pub struct Usage {
+    #[serde(deserialize_with = "null_as_zero")]
     pub input_tokens: u32,
+    #[serde(deserialize_with = "null_as_zero")]
     pub output_tokens: u32,
+    #[serde(deserialize_with = "null_as_zero")]
     pub cache_creation_input_tokens: u32,
+    #[serde(deserialize_with = "null_as_zero")]
     pub cache_read_input_tokens: u32,
+}
+
+/// `null` を 0 として読む。[`Usage`] の doc にある通り、API はトークン数を nullable で
+/// 返しうるので、項目の欠損だけを見る `#[serde(default)]` では足りない。
+fn null_as_zero<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    Ok(Option::<u32>::deserialize(d)?.unwrap_or(0))
 }
 
 impl Usage {
@@ -635,6 +651,24 @@ mod tests {
         for body in [r#"{"content":[]}"#, r#"{"content":[],"usage":{}}"#] {
             assert!(usage(body).is_zero(), "{body}");
         }
+    }
+
+    /// **`null` も 0 として読む。** Messages API はトークン数を nullable で返しうる。
+    /// `#[serde(default)]` は項目の欠損しか見ないので、ここを `u32` のまま受けると
+    /// `ResponseBody` のパースごと落ち、**その AI 呼び出しが丸ごと失敗する**。
+    #[test]
+    fn null_token_counts_read_as_zero() {
+        assert_eq!(
+            usage(
+                r#"{"content":[],"usage":{"input_tokens":2095,"output_tokens":503,
+                   "cache_creation_input_tokens":null,"cache_read_input_tokens":null}}"#
+            ),
+            Usage {
+                input_tokens: 2095,
+                output_tokens: 503,
+                ..Usage::default()
+            }
+        );
     }
 
     /// 活動ログの行の形 (#71)。

@@ -485,12 +485,19 @@ impl TriggerPermissions {
     /// **回数は増やさない。** 数えているのは呼び出しの回数で、これはその内訳を足すだけ。
     pub(crate) fn record_ai_usage(&mut self, model: &str, usage: Usage) {
         let record = self.ai_call_row(model).with_usage(usage);
-        match self.find_mut(&record) {
-            Some(existing) => existing.usage = existing.usage.saturating_add(usage),
-            // 呼び出しの行が無いのは、記録が種類上限 ([`MAX_PENDING`]) で畳まれたか、
-            // 応答が実行文脈の外で返ってきた場合 (await されなかった promise が
-            // `leave()` の後に解決した — モジュール doc の既知の限界)。**消費は
-            // 捨てない。** 課金は起きているので、1 回分の行として新しく残す。
+        // 呼び出しの行 → それが種類上限 ([`MAX_PENDING`]) で畳まれた先、の順に探す。
+        // 畳まれた行を見ずに [`Self::record`] へ回すと、そこで回数がもう 1 つ増えて
+        // **溢れた分の呼び出し回数が 2 倍に出る**。
+        let overflow = OpActivity::new(
+            record.trigger_id.clone(),
+            record.kind,
+            OVERFLOW_MESSAGE.to_string(),
+        );
+        match self.find(&record).or_else(|| self.find(&overflow)) {
+            Some(i) => self.pending[i].usage = self.pending[i].usage.saturating_add(usage),
+            // どちらも無いのは、応答が実行文脈の外で返ってきた場合 (await されなかった
+            // promise が `leave()` の後に解決した — モジュール doc の既知の限界)。
+            // **消費は捨てない。** 課金は起きているので、1 回分の行として新しく残す。
             None => self.record(record),
         }
     }
@@ -562,11 +569,10 @@ impl TriggerPermissions {
 
     /// 同じ記録が既にあれば回数と消費を足して `true`。
     fn bump(&mut self, activity: &OpActivity) -> bool {
-        let usage = activity.usage;
-        match self.find_mut(activity) {
-            Some(existing) => {
-                existing.count = existing.count.saturating_add(1);
-                existing.usage = existing.usage.saturating_add(usage);
+        match self.find(activity) {
+            Some(i) => {
+                self.pending[i].count = self.pending[i].count.saturating_add(1);
+                self.pending[i].usage = self.pending[i].usage.saturating_add(activity.usage);
                 true
             }
             None => false,
@@ -574,8 +580,11 @@ impl TriggerPermissions {
     }
 
     /// 同じ記録 (帰属先 + 種別 + 本文) の行。まとめる単位はここ 1 箇所が決める。
-    fn find_mut(&mut self, activity: &OpActivity) -> Option<&mut OpActivity> {
-        self.pending.iter_mut().find(|a| {
+    ///
+    /// 参照ではなく添字を返すのは、[`Self::record_ai_usage`] が**2 つの候補を順に
+    /// 探す**ため。`&mut` を返すと 1 つ目の借用が生きたまま 2 つ目を探せない。
+    fn find(&self, activity: &OpActivity) -> Option<usize> {
+        self.pending.iter().position(|a| {
             a.trigger_id == activity.trigger_id
                 && a.kind == activity.kind
                 && a.message == activity.message
@@ -977,6 +986,17 @@ mod tests {
             total,
             (MAX_PENDING as u32) * 2 * 10,
             "畳まれた分の消費が落ちている: {recorded:?}"
+        );
+
+        // **回数は水増ししない。** 消費を足しに行った先で回数まで増えると、溢れた分の
+        // 呼び出し回数が 2 倍に出る (`[ai]` の回数は課金の読み筋そのもの)。
+        let overflow = recorded
+            .iter()
+            .find(|a| a.message == OVERFLOW_MESSAGE)
+            .expect("溢れた分の行が無い");
+        assert_eq!(
+            overflow.count as usize, MAX_PENDING,
+            "溢れた分の回数が呼び出し数と合わない: {overflow:?}"
         );
     }
 
