@@ -439,6 +439,37 @@ fn record_activity(app: &AppHandle, history: &HistoryRef, activity: &Activity) {
     );
 }
 
+/// Type II (秘書自身の AI) が使ったトークンを、Type I と同じ活動ログに載せる (#71)。
+///
+/// **`TriggerPermissions` の経路は通れない。** あちらは JS の実行文脈に紐付く記録で、
+/// 秘書チャットと下書き生成はそこを通らない。一方これも**エンドユーザーの課金で回る
+/// 呼び出し**で、履歴を毎回全部送るチャットこそ一番積み上がる — 消費の観測が Type I に
+/// しか無ければ、一番大きい部分が見えないままになる。
+///
+/// 帰属先はトリガーではないので `__meta__`。kind は Type I と同じ `[ai]` にする —
+/// UI から見て意味があるのは「AI に金を使った」という 1 つの概念で、どちら由来かは
+/// `source` と本文が持つ (`[denied]` が secret とホストで kind を分けないのと同じ判断)。
+///
+/// **残すのは応答が返った呼び出しだけ。** Type I が「試行」を残す (キー未設定や API
+/// エラーで落ちた回も数える) のは、そこで抑えたいのがトリガー作者による呼び出しの量だから。
+/// こちらの目的は課金の可視化で、返ってこなかった呼び出しは課金されていない。
+///
+/// **prompt も会話の中身も残さない** (#57 の線)。token 数は数値なのでこの線を越えない。
+pub(crate) fn record_ai_usage(
+    app: &AppHandle,
+    history: &HistoryRef,
+    what: &str,
+    model: Option<&str>,
+    usage: ai::Usage,
+) {
+    let message = usage.annotate(format!("{what} model={}", ai::resolve_model(model)));
+    record_activity(
+        app,
+        history,
+        &Activity::new(META_NAMESPACE, ActivityKind::AiCall, message),
+    );
+}
+
 fn read_trigger_state(app: &AppHandle, trigger_id: &str) -> serde_json::Value {
     match app.store(STATE_STORE_FILE) {
         Ok(store) => store

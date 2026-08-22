@@ -669,9 +669,26 @@ chamberlain.http.fetch(url: string, opts?: {
 
 宛先を core が決める (Anthropic 固定) ので `allowedHosts` のような形が取れない。一方これは **framework が持つ API キーの持ち出し**にあたり、無制限に呼べるとエンドユーザーの課金でトリガー作者の用事が処理できてしまう。そこで宣言は取らず、**呼び出しを必ず履歴に残す** (`[ai]`)。レート制限は必要になってから。
 
-記録するのは model と回数だけで、**prompt は残さない**。中身を書くと履歴がそのまま漏洩面になるし、長さを入れると下の重複排除のキーが毎回変わってまとめる意味が消える。知りたいのは呼び出しの量で、それは回数が持つ。
+記録するのは model と回数と**消費したトークン数** (#71) で、**prompt は残さない**。中身を書くと履歴がそのまま漏洩面になるし、長さを入れると下の重複排除のキーが毎回変わってまとめる意味が消える。知りたいのは呼び出しの量で、それは回数とトークン数が持つ。
 
-Type II の秘書チャット (`chat_send`) はこの経路を通らない。あちらはエンドユーザー自身が自分の秘書に話しかけているので、「誰かのコードが裏で API を使った」記録とは意味が違う。
+#### いくら使ったかを観測面に出す (#71)
+
+AI 呼び出しは**エンドユーザーの API キー = エンドユーザーの課金**で回る。回数だけでは「毎朝 9 時のトリガーが自分にいくら請求しているか」が分からず、Anthropic のコンソールに行っても Chamberlain 以外の利用と混ざる。そこで応答の `usage` を活動ログの行に載せる。
+
+```text
+[ai] weather-morning: ai.complete model=claude-sonnet-5 (×2) tokens in=3120 out=880
+[ai] __meta__: chat.send model=claude-sonnet-5 tokens in=8412 out=214
+```
+
+**持つのは token 数だけで、金額には換算しない。** 換算するとモデル別の単価を core が抱えることになり、#27 の「カタログの陳腐化を追い続ける」論点に直結する。トリガー単位 / 日単位の累計も持たない (必要になったら `history.db` から集計できる)。
+
+**トークン数は本文ではなく行の数値フィールドに持つ。** 本文に書くと呼び出しごとに文字列が割れ、下の重複排除 (1 実行につき種類ごとに 1 行) が効かなくなる — `maxTokens` の値を本文に入れなかったのと同じ理由 (#68)。畳むときは加算する。**0 のときは何も添えない**、つまりトークンの付いていない `[ai]` 行は「応答が返ってこなかった」(キー未設定 / API エラー) を意味する。記録は呼びに行く前に置くので、消費は後から同じ行に足しに来る形になる。
+
+`cache_creation_input_tokens` / `cache_read_input_tokens` も最初から読んでいて、**0 でないときだけ**行に出る。プロンプトキャッシュを入れたときに効いているかを見る手段がこれしか無いため — 最小キャッシュ長に満たない prefix はエラーにならず黙って無視されるので、「入れたつもりで全ミス」が静かに起きうる。
+
+**Type II (秘書チャット / 下書き生成) も同じログに載せる。** `chat_send` は `TriggerPermissions` の経路を通らないが、履歴を毎回全部送るチャットこそ消費が積み上がる — 「誰かのコードが裏で API を使った」記録としての意味は薄くても、課金の観測としては一番大きい部分になる。帰属先がトリガーではないので `source` は `__meta__`、kind は Type I と同じ `[ai]` で、経路は本文が名乗る (`chat.send` / `draft.generate`)。1 回の依頼で 2 回呼ばれるので**会話と生成は行を分ける**。
+
+**prompt も会話の中身も残さない** のは #57 の線のまま。token 数は数値なのでこの線を越えない。
 
 #### 応答の切り捨ては呼び出し側が決める (#68)
 
@@ -811,7 +828,7 @@ Rust 側から Tauri の `Emitter::emit("activity", ...)` で JS 側に届く。
 interface ActivityEvent {
   id?: number;      // 履歴上の行 id。live emit と保存済み履歴の同一判定に使う
   ts: number;       // ms since epoch (実際に起きた時刻)
-  source: string;   // trigger ID (トリガーに紐付かないものは "__task__")
+  source: string;   // trigger ID (タスク由来だが解決できないものは "__task__"、framework 自身のものは "__meta__")
   kind: string;     // 種別の安定した識別子 ("notify" / "skipped" / ...)
   message: string;  // 表示用の 1 行。prefix は kind から組み立てられている
   taskId?: string;         // 元になったタスクのスナップショット
@@ -840,7 +857,7 @@ UI 側 (`chamberlainApi.onActivity`) は `@tauri-apps/api/event` の `listen` �
 | `[registered]` / `[unregistered]` | トリガーが実行時に登録された / 解除された (#58)。同意画面で見せた宣言をそのまま本文に載せる |
 | `[drafted]` | 秘書がトリガーの下書きを作った (#61)。**登録されなかったものも残る** |
 | `[denied]` | manifest の宣言に無い権限をトリガーが要求したので拒否した ([トリガーの権限](#トリガーの権限-56--57) 節) |
-| `[ai]` | トリガーが `chamberlain.ai.complete` を呼んだ (framework の API キーの持ち出しなので記録する) |
+| `[ai]` | AI を呼んだ。トリガーの `chamberlain.ai.complete` (framework の API キーの持ち出しなので記録する) と、秘書自身のチャット / 下書き生成 (`source` は `__meta__`)。消費したトークン数を添える (#71) |
 | `[config error]` | manifest (`schedule` / `tz` / `allowedHosts`) が壊れていて実行対象にできない |
 
 `schedule_error` という kind が DB 上に残ることがあるが、これは `[config error]` に統合される前の行を読むためだけのもので、新しい行は書かれない。
