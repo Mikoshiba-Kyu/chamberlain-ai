@@ -289,11 +289,7 @@ async fn generate(
         role: ai::Role::User,
         content: format!("次の依頼に応えるトリガーを 1 つ作ってください。\n\n{request}"),
     }];
-    let ai::Response {
-        content: raw,
-        stop,
-        usage,
-    } = ai::complete(
+    let answered = ai::complete(
         api_key,
         GENERATION_MODEL,
         Some(&system),
@@ -302,15 +298,15 @@ async fn generate(
     )
     .await?;
 
-    // **失敗の分岐より先に記録する** (#71)。生成は上限まで吐かせる呼び出し
-    // ([`GENERATION_MAX_TOKENS`]) なので 1 回が重く、切り捨てや JSON パース失敗で
-    // 捨てる回こそ消費は最大になる。
-    crate::record_ai_usage(
+    // 生成は上限まで吐かせる呼び出し ([`GENERATION_MAX_TOKENS`]) なので 1 回が重く、
+    // 切り捨てや JSON パース失敗で捨てる回こそ消費は最大になる。記録が下の分岐より
+    // 先に来ることは [`crate::record_ai_usage`] の形が保証している (#71)。
+    let (raw, stop) = crate::record_ai_usage(
         app,
         history,
         GENERATION_USAGE_LABEL,
         GENERATION_MODEL,
-        usage,
+        answered,
     );
 
     if stop == ai::StopReason::Truncated {

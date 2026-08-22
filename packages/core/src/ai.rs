@@ -426,7 +426,7 @@ pub async fn op_chamberlain_ai_complete(
     #[serde] args: CompleteArgs,
 ) -> Result<String, JsErrorBox> {
     let max_tokens = checked_max_tokens(args.max_tokens)?;
-    let model = args.model.as_deref().unwrap_or(DEFAULT_MODEL);
+    let model = resolve_model(args.model.as_deref());
 
     // await 前に必要な情報を全部同期的に取り出しておく。
     // OpState を await 越しに保持しないための定型パターン。

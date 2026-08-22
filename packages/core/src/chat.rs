@@ -160,11 +160,7 @@ pub async fn chat_send(
         })
         .collect();
 
-    let ai::Response {
-        content: response,
-        stop,
-        usage,
-    } = ai::complete_with_tools(
+    let answered = ai::complete_with_tools(
         &api_key,
         CHAT_MODEL,
         Some(CHAMBERLAIN_SYSTEM_PROMPT),
@@ -174,9 +170,10 @@ pub async fn chat_send(
     )
     .await?;
 
-    // 秘書自身の消費も観測面に残す (#71)。**下書きの生成より前に。** 生成 (2 回目の
-    // 呼び出し) はここから分岐した先で、そちらが失敗しても 1 回目の課金は起きている。
-    crate::record_ai_usage(&app, &history_store, CHAT_USAGE_LABEL, CHAT_MODEL, usage);
+    // 秘書自身の消費も観測面に残す (#71)。下書きの生成 (2 回目の呼び出し) はこの先で
+    // 分岐した中にあり、そちらが失敗しても 1 回目の課金は起きている。
+    let (response, stop) =
+        crate::record_ai_usage(&app, &history_store, CHAT_USAGE_LABEL, CHAT_MODEL, answered);
 
     let (content, draft) = match response {
         ai::Completion::Text(text) => (append_truncation_note(text, stop), None),

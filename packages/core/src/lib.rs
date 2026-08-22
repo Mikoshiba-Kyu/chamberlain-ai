@@ -450,24 +450,32 @@ fn record_activity(app: &AppHandle, history: &HistoryRef, activity: &Activity) {
 /// UI から見て意味があるのは「AI に金を使った」という 1 つの概念で、どちら由来かは
 /// `source` と本文が持つ (`[denied]` が secret とホストで kind を分けないのと同じ判断)。
 ///
+/// **応答を丸ごと取り、`usage` を呼び出し側に返さない。** 記録を各 call site の作法に
+/// すると、`let ai::Response { content, stop, .. }` と書いた 3 つ目の call site の消費が
+/// 黙って観測面から消える (`..` は警告を出さない)。中身を取るには記録を通る、という形に
+/// しておけば、忘れようがない。切り捨てや失敗の分岐より先に記録されるのも同じ帰結。
+///
 /// **残すのは応答が返った呼び出しだけ。** Type I が「試行」を残す (キー未設定や API
 /// エラーで落ちた回も数える) のは、そこで抑えたいのがトリガー作者による呼び出しの量だから。
 /// こちらの目的は課金の可視化で、返ってこなかった呼び出しは課金されていない。
 ///
 /// **prompt も会話の中身も残さない** (#57 の線)。token 数は数値なのでこの線を越えない。
-pub(crate) fn record_ai_usage(
+pub(crate) fn record_ai_usage<T>(
     app: &AppHandle,
     history: &HistoryRef,
     what: &str,
     model: Option<&str>,
-    usage: ai::Usage,
-) {
-    let message = usage.annotate(format!("{what} model={}", ai::resolve_model(model)));
+    response: ai::Response<T>,
+) -> (T, ai::StopReason) {
+    let message = response
+        .usage
+        .annotate(format!("{what} model={}", ai::resolve_model(model)));
     record_activity(
         app,
         history,
         &Activity::new(META_NAMESPACE, ActivityKind::AiCall, message),
     );
+    (response.content, response.stop)
 }
 
 fn read_trigger_state(app: &AppHandle, trigger_id: &str) -> serde_json::Value {
