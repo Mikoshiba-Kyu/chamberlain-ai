@@ -1712,7 +1712,11 @@ mod tests {
             grace(),
         );
         let handed: Vec<&str> = first.jobs.iter().map(|j| j.task.id.as_str()).collect();
-        assert_eq!(handed, vec!["manual-busy-1"], "同じトリガーが二重に配られた");
+        assert_eq!(
+            handed,
+            vec!["manual-busy-1"],
+            "同じトリガーが二重に配られた"
+        );
 
         // 1 件目が走っている間は、次の心拍でも 2 件目は出ない。
         let mut during = CollectingDispatcher::default();
