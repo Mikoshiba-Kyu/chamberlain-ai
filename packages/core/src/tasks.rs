@@ -114,6 +114,17 @@ pub(crate) struct TaskStore {
     pub tasks: Vec<Task>,
     #[serde(default)]
     pub expansion: BTreeMap<String, ExpansionState>,
+    /// 心拍が executor へ渡し、まだ結果が返っていないタスクの id (#81)。
+    ///
+    /// **永続化しない。** プロセスが落ちれば空に戻り、タスク本体はリストに残ったままなので
+    /// 次回起動でもう一度実行される — [`crate::worker`] の at-least-once がそのまま
+    /// 生き残る。永続化すると逆に「実行中のまま二度と動かないタスク」を作ってしまう。
+    ///
+    /// 心拍が JS を自分で回していた頃はこれが要らなかった。実行が別スレッドに出て
+    /// **心拍が走り続ける**ようになったので、「配ったが終わっていない」という状態が
+    /// 初めて観測可能になり、名前が要る。
+    #[serde(skip)]
+    pub in_flight: HashSet<String>,
 }
 
 impl TaskStore {
@@ -192,8 +203,55 @@ impl TaskStore {
         self.tasks
             .iter()
             .take_while(|t| t.scheduled_at <= now)
+            // 既に executor が抱えているものは配らない (#81)。`take_while` の後で
+            // 弾くのが要点で、条件に混ぜると実行中のタスクで走査が止まり、その後ろの
+            // due なタスクが心拍 1 回ぶん見えなくなる。
+            .filter(|t| !self.in_flight.contains(&t.id))
             .cloned()
             .collect()
+    }
+
+    /// タスクを executor へ渡した印を付ける (#81)。
+    ///
+    /// 戻り値は返さない。[`TaskStore::due`] が実行中のタスクを既に除いているので
+    /// 「既に印が付いていた」は起こらず、`bool` を返すと呼び出し側に見ないでよい
+    /// 判断材料を渡すことになる。
+    pub(crate) fn mark_in_flight(&mut self, task_id: &str) {
+        self.in_flight.insert(task_id.to_string());
+    }
+
+    /// 引き渡しに失敗したタスクの印を落とす (#81)。
+    ///
+    /// 印だけ残ると、そのタスクは [`TaskStore::due`] からも [`sweep_stale`] からも
+    /// 外れたまま二度と動かない — リストにも UI にも残り続けるのに、活動ログには
+    /// 1 行も出ない。渡せなかったときは普通の pending に戻す。
+    pub(crate) fn clear_in_flight(&mut self, task_id: &str) {
+        self.in_flight.remove(task_id);
+    }
+
+    /// このトリガーの実行が既に走っているか (#81)。
+    ///
+    /// **同じトリガーを二重に走らせないための判定。** 標準レーンは作業員が複数いるので、
+    /// 同じトリガーの別タスク (手動実行 2 連打、手動 + 定時) が同時に due になると、
+    /// 印がタスク単位である以上どちらも配られて別々の isolate で並行に走る。両方が
+    /// `read_state` してから `write_state` するので、後の書き込みが前の結果を消す。
+    ///
+    /// 長レーンのタスクは走らせる前にリストから消える ([`crate::worker::Lane`] の
+    /// at-most-once) のでここには映らない。**そちらは作業員 1 人で直列**であることが
+    /// 二重実行を防いでいる (`LONG_WORKERS` を増やすならこの判定も要る)。
+    pub(crate) fn has_in_flight_for(&self, trigger_id: &str) -> bool {
+        self.tasks
+            .iter()
+            .any(|t| t.trigger_id.as_deref() == Some(trigger_id) && self.in_flight.contains(&t.id))
+    }
+
+    /// 実行が終わったタスクをリストから外し、実行中の印も落とす (#81)。
+    ///
+    /// 2 つを 1 つの関数にしてあるのは、**片方だけ実行された状態が必ずバグ**だから。
+    /// 印だけ残ると二度と実行されず、リストにだけ残ると毎心拍やり直す。
+    pub(crate) fn finish(&mut self, task_id: &str) {
+        self.remove(task_id);
+        self.in_flight.remove(task_id);
     }
 
     /// 指定トリガーの pending タスクのうち最も早い `scheduled_at`。UI の「次回発火予定」用。
@@ -245,7 +303,11 @@ impl TaskStore {
             )
             .unwrap_or_default();
 
-        let mut loaded = TaskStore { tasks, expansion };
+        let mut loaded = TaskStore {
+            tasks,
+            expansion,
+            ..Default::default()
+        };
         // due 取り出しは「先頭から scheduled_at 昇順」を前提にしている。手で編集された
         // tasks.json を読んだ場合にもこの不変条件を成立させる。
         loaded.normalize();
@@ -500,7 +562,13 @@ pub(crate) fn sweep_stale(
     let mut kept = Vec::with_capacity(store.tasks.len());
 
     for task in std::mem::take(&mut store.tasks) {
-        if task.origin != TaskOrigin::Schedule || task.scheduled_at >= cutoff {
+        // 実行中のものは掃除しない (#81)。長い仕事は猶予を超えて走り続けるのが正常で、
+        // ここで掃除すると「走っている最中に破棄しました」と観測面が嘘をつき、
+        // 完了時の [`TaskStore::finish`] も何も消さない空振りになる。
+        if store.in_flight.contains(&task.id)
+            || task.origin != TaskOrigin::Schedule
+            || task.scheduled_at >= cutoff
+        {
             kept.push(task);
             continue;
         }

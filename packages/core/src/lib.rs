@@ -43,7 +43,8 @@ use crate::secrets::SecretsService;
 use crate::tasks::{Task, TaskOrigin, TaskStore};
 use crate::watchdog::Watchdog;
 use crate::worker::{
-    heartbeat, lock_tasks, reconcile_at_startup, TickResult, TriggerSpec, WorkerHost, WorkerState,
+    heartbeat, lock_tasks, reconcile_at_startup, run_job, Dispatcher, ExecutorHost, Job, Lane,
+    TickResult, TriggerSpec, WorkerHost, WorkerState,
 };
 
 /// 心臓周期。展開型スケジューラ (#26) では心拍は「due なタスクを取り出す粒度」であり、
@@ -84,11 +85,45 @@ const SCHEDULE_GRACE_TICKS: u32 = 2;
 /// この上下関係は `the_js_budget_sits_between_its_two_constraints` で固定してある。
 /// どちらかの定数を動かすと窓が閉じてそこで気づく。
 ///
+/// **上限の根拠は #81 で置き場所が変わった。** 心拍は JS を回さなくなったので、暴走が
+/// 止めるのは心拍ではなく executor である。他トリガーのタスクは破棄されずに順番待ちの
+/// 列に入り、番が回ってきた時点で [`crate::worker::run_job`] が猶予を当て直す。
+/// 結果 (暴走が猶予より長ければ他の予定が落ちる) は同じなので、上下関係は生きている。
+///
 /// 窓が狭いことは、そもそも 1 tick に AI 呼び出しを何度も積むトリガーが構造的に
 /// 苦しいことを意味する。上の保証も暴走 1 件まで — 同一心拍で複数が暴走すれば
 /// 予算 × 件数まで伸びる。dev (心拍 10 秒 = 猶予 20 秒) でも成り立たないが、
 /// dev で予定が流れることは実害として扱わない。
 const JS_BUDGET: Duration = Duration::from_secs(110);
+
+/// 宣言できる実行時間の上限 (#81)。`maxRuntimeSec` はここまで書ける。
+///
+/// **[`JS_BUDGET`] と違って、上から挟むものが無い。** 心拍は JS を回さなくなったので、
+/// 長い仕事が走っている間も予定は積まれ続ける。ここが決めているのは
+/// 「事故で暴走したトリガーが、長レーンの作業員を最大どれだけ占有しうるか」だけである。
+///
+/// 30 分は #81 の発端 (フィード取得 + 20〜50 本の要約 + 組み立て = 80〜200 秒) に
+/// 対して十分に余裕があり、かつ「秘書が半日戻ってこない」にはならない長さとして選んだ。
+/// 消費そのものの天井ではない — それは #82 が別に持つ。
+const MAX_RUNTIME: Duration = Duration::from_secs(30 * 60);
+
+/// 心拍から渡された仕事を実際に走らせる作業員の数 (#81)。
+///
+/// **2 つのレーンに分かれている。** どちらに入るかは manifest の `maxRuntimeSec` を
+/// 宣言したかで決まる。分ける理由は 2 つあって、どちらも「宣言しなかったトリガーを
+/// 守る」ことに帰着する。
+///
+/// - **飢餓** — プールを共有すると、長い仕事が全部の作業員を埋めた間、短いトリガーの
+///   予定は順番待ちのまま猶予を超えて捨てられる。レーンが分かれていれば、宣言して
+///   いないトリガーは常に [`STANDARD_WORKERS`] 人分の席を持つ
+/// - **予算の強制** — `rustyscript::RuntimeOptions::timeout` は Runtime 生成時に固定で、
+///   呼び出しごとには変えられない (裏取り済み。#81 のコメント参照)。作業員ごとに
+///   上限が違えば、その作業員が受け持つ仕事の上限とちょうど一致させられる
+///
+/// isolate 1 つの限界コストは実測 1.5 MB 程度なので (#81)、この人数は重さではなく
+/// 上の 2 つで決めている。
+const STANDARD_WORKERS: usize = 2;
+const LONG_WORKERS: usize = 1;
 
 const STATE_STORE_FILE: &str = "triggers-state.json";
 
@@ -184,13 +219,30 @@ struct TriggerManifest {
     /// ([`crate::schedule::resolve_tz`])。
     #[serde(default)]
     tz: Option<String>,
+    /// 1 回の実行に要する時間の自己申告 (#81)。省略時は [`JS_BUDGET`] (110 秒)。
+    ///
+    /// **書くことは 2 つを同時に名乗ることである。**
+    ///
+    /// 1. 長レーンで走らせてほしい ([`LONG_WORKERS`])。宣言しなかったトリガーの席を
+    ///    奪わない代わりに、宣言した者どうしでは順番待ちになる
+    /// 2. 途中で落ちてもやり直さなくてよい。心拍のタスクは at-least-once だが、
+    ///    AI 呼び出しを何十回も積む仕事を丸ごと焼き直すとエンドユーザーの請求が倍に
+    ///    なる (#71 / #72)。長い仕事は走らせる前にタスクを消す (at-most-once)
+    ///
+    /// 2 つを別々の宣言にしなかったのは、**片方だけ名乗る意味が無い**ため。長い仕事は
+    /// 必然的に高く、高い仕事のやり直しは黙って行ってよいものではない。
+    ///
+    /// 範囲は (`JS_BUDGET`, [`MAX_RUNTIME`]]。範囲外は丸めずに構成エラーにする (#68 と
+    /// 同じ方針) — 黙って丸めると、宣言と実際の上限がずれたまま気づけない。
+    #[serde(default, rename = "maxRuntimeSec")]
+    max_runtime_sec: Option<u64>,
 }
 
 /// [`TriggerManifest`] が読むキーの全部。**serde は未知のキーを黙って無視する**ので、
 /// 配布する仕様書 (#60) の例に綴り違い (`required_secrets` 等) が混ざっていないかを
 /// テストで見るために名前を並べておく。構造体にフィールドを足したらここにも足す。
 #[cfg(test)]
-const MANIFEST_FIELDS: [&str; 8] = [
+const MANIFEST_FIELDS: [&str; 9] = [
     "id",
     "name",
     "description",
@@ -199,6 +251,7 @@ const MANIFEST_FIELDS: [&str; 8] = [
     "allowedHosts",
     "schedule",
     "tz",
+    "maxRuntimeSec",
 ];
 
 struct TriggerInfo {
@@ -228,6 +281,9 @@ struct TriggerInfo {
     config_error: Option<String>,
     /// 検証済みの `allowedHosts` (#57)。`config_error` があるトリガーでは空。
     hosts: Vec<HostPattern>,
+    /// 1 回の実行に許される時間 (#81)。`maxRuntimeSec` の宣言か、既定の [`JS_BUDGET`]。
+    /// これが `JS_BUDGET` を超えているトリガーが長レーンで走る。
+    max_runtime: Duration,
 }
 
 type TriggersRef = Arc<Vec<TriggerInfo>>;
@@ -286,6 +342,9 @@ struct TriggerListItem {
     required_secrets: Vec<String>,
     #[serde(rename = "allowedHosts")]
     allowed_hosts: Vec<String>,
+    /// 宣言された 1 回あたりの上限 (#81)。宣言が無ければ null。
+    #[serde(rename = "maxRuntimeSec")]
+    max_runtime_sec: Option<u64>,
     /// `"bundled"` (アプリに焼き込まれた) | `"registered"` (実行時に登録された) (#58)。
     ///
     /// エンドユーザーが外せるのは後者だけ。「アプリの形」と「秘書にさせる仕事」の
@@ -314,6 +373,13 @@ pub struct TriggerCandidate {
     pub required_secrets: Vec<String>,
     #[serde(rename = "allowedHosts")]
     pub allowed_hosts: Vec<String>,
+    /// 宣言された 1 回あたりの上限 (#81)。宣言が無ければ null (既定の 110 秒)。
+    ///
+    /// **同意画面に出す理由は他の宣言と同じ。** これが入っているトリガーは 110 秒より
+    /// 長く走り、その間 AI 呼び出しがエンドユーザーの実費で積み上がりうる (#71 / #72)。
+    /// 「入れる前に見せる」の対象として `requiredSecrets` / `allowedHosts` と同格である。
+    #[serde(rename = "maxRuntimeSec")]
+    pub max_runtime_sec: Option<u64>,
     /// 同じ id が既にある場合の相手 (`"bundled"` | `"registered"`)。
     ///
     /// `"bundled"` は登録を拒否する — アプリに同梱された「そのアプリらしさ」を後から
@@ -660,6 +726,8 @@ struct ValidatedManifest {
     tz: chrono_tz::Tz,
     /// 検証済みの `allowedHosts` (#57)。エラーがあるときは空。
     hosts: Vec<HostPattern>,
+    /// 解決済みの 1 回あたりの上限 (#81)。宣言が無ければ [`JS_BUDGET`]。
+    max_runtime: Duration,
     /// 見つかった構成エラー。1 件ずつ観測面に流せるよう配列で持つ。
     errors: Vec<String>,
 }
@@ -712,13 +780,44 @@ fn validate_manifest(manifest: &TriggerManifest) -> ValidatedManifest {
     if let Err(e) = validate_entry_path(&manifest.entry) {
         errors.push(e);
     }
+    let max_runtime = match validate_max_runtime(manifest.max_runtime_sec) {
+        Ok(d) => d,
+        Err(e) => {
+            errors.push(e);
+            JS_BUDGET
+        }
+    };
 
     ValidatedManifest {
         schedule,
         tz,
         hosts,
+        max_runtime,
         errors,
     }
+}
+
+/// `maxRuntimeSec` の宣言を実行時間の上限に変える (#81)。
+///
+/// 下限が [`JS_BUDGET`] **超**なのは、それ以下なら宣言する意味が無いからではなく、
+/// 宣言が「長レーンに入る」の意思表示だからである。110 秒以内で済む仕事に長レーンの
+/// 席を取らせると、宣言していないトリガーを守るという分割の目的が薄れる。
+///
+/// 「もっと短く切ってほしい」という宣言は今のところ受け付けない。要るようになったら
+/// 別の名前で足す — 同じキーに 2 つの意味を持たせない。
+fn validate_max_runtime(declared: Option<u64>) -> Result<Duration, String> {
+    let Some(secs) = declared else {
+        return Ok(JS_BUDGET);
+    };
+    let floor = JS_BUDGET.as_secs();
+    let ceiling = MAX_RUNTIME.as_secs();
+    if secs <= floor || secs > ceiling {
+        return Err(format!(
+            "maxRuntimeSec は {} より大きく {} 以下で宣言してください (指定: {secs})",
+            floor, ceiling
+        ));
+    }
+    Ok(Duration::from_secs(secs))
 }
 
 /// 1 つのディレクトリを走査して有効なトリガーだけを拾う。
@@ -811,6 +910,7 @@ fn discover_triggers(
             tz: validated.tz,
             config_error,
             hosts: validated.hosts,
+            max_runtime: validated.max_runtime,
         });
     }
 
@@ -907,7 +1007,7 @@ fn find_trigger<'a>(triggers: &'a [TriggerInfo], id: &str) -> Option<&'a Trigger
 ///
 /// 解除されたトリガー (#58) はここに現れない。心拍から見れば「manifest から消えた」のと
 /// 同じ扱いになり、残っている予定は孤児として片付く。
-fn build_specs(triggers: &[TriggerInfo], host: &TauriHost) -> Vec<TriggerSpec> {
+fn build_specs(triggers: &[TriggerInfo], loaded: &HashSet<String>) -> Vec<TriggerSpec> {
     active_triggers(triggers)
         .map(|t| TriggerSpec {
             id: t.manifest.id.clone(),
@@ -917,9 +1017,18 @@ fn build_specs(triggers: &[TriggerInfo], host: &TauriHost) -> Vec<TriggerSpec> {
             schedule: t.schedule.clone(),
             tz: t.tz,
             paused: t.paused.load(Ordering::Relaxed),
-            runnable: t.config_error.is_none() && host.is_loaded(&t.manifest.id),
+            runnable: t.config_error.is_none() && loaded.contains(&t.manifest.id),
+            max_runtime: t.max_runtime,
+            lane: Lane::of(t.max_runtime),
         })
         .collect()
+}
+
+/// 実行時間の上限を「宣言として見せる値」に戻す (#81)。既定のままなら null。
+///
+/// UI に出すのは**強制されている側**の値なので、`TriggerInfo::max_runtime` から作る。
+fn declared_max_runtime_sec(max_runtime: Duration) -> Option<u64> {
+    (max_runtime != JS_BUDGET).then_some(max_runtime.as_secs())
 }
 
 /// manifest の宣言を実行時の権限の形に写す (#56)。
@@ -941,29 +1050,35 @@ fn build_grants(triggers: &[TriggerInfo]) -> BTreeMap<String, TriggerGrants> {
         .collect()
 }
 
-/// 本番の [`WorkerHost`]。worker スレッドが所有する副作用の実体をひとまとめにする。
+/// 本番の [`WorkerHost`]。心拍スレッドが所有する副作用の実体 (#81)。
 ///
-/// `rustyscript::Runtime` は V8 の thread affinity を持つのでこの構造体ごと worker
-/// スレッドに閉じ込める (`AppHandle` は `Send + Sync` なので問題ない)。
+/// **V8 を持たない。** 心拍は JS を回さないので、`AppHandle` と履歴 DB だけで足りる。
+/// executor 側はこれを内側に持つ [`TauriExecutorHost`]。
 struct TauriHost {
     app: AppHandle,
+    history: HistoryRef,
+}
+
+/// 本番の [`ExecutorHost`]。executor スレッドが所有する副作用の実体 (#81)。
+///
+/// `rustyscript::Runtime` は V8 の thread affinity を持つのでこの構造体ごと executor
+/// スレッドに閉じ込める (`AppHandle` は `Send + Sync` なので問題ない)。
+struct TauriExecutorHost {
+    /// 観測面・履歴・タスク永続化は心拍側と同じ実装を使う。executor も activity を書き
+    /// タスクリストを保存するので、2 度書かずに内側に持つ。
+    base: TauriHost,
     runtime: rustyscript::Runtime,
     /// ロードに成功したトリガーのモジュール。起動時に 1 回作られ、以後変わらない。
     ///
     /// `Rc` なのは [`Self::run_js`] が `runtime` だけを貸すため。ハンドルを先に手元へ
     /// 取り出す必要があり、`ModuleHandle` の実体はモジュールのソースを抱えている。
     loaded: BTreeMap<String, Rc<rustyscript::ModuleHandle>>,
-    history: HistoryRef,
     /// JS 実行 1 回の予算を見張る番犬 (#59)。`runtime` の isolate を外から止めるので、
     /// この構造体と寿命を揃える。
     watchdog: Watchdog,
 }
 
-impl TauriHost {
-    fn is_loaded(&self, trigger_id: &str) -> bool {
-        self.loaded.contains_key(trigger_id)
-    }
-
+impl TauriExecutorHost {
     /// `OpState` に載せた [`TriggerPermissions`] を触る。
     ///
     /// **JS が動いていない間だけ呼べる。** `op_state()` の `RefCell` は op の実行中に
@@ -992,6 +1107,7 @@ impl TauriHost {
     fn run_js<T>(
         &mut self,
         trigger_id: &str,
+        budget: Duration,
         f: impl FnOnce(&mut rustyscript::Runtime) -> Result<T, rustyscript::Error>,
     ) -> Result<T, String> {
         self.with_permissions(|p| p.enter(trigger_id));
@@ -999,7 +1115,7 @@ impl TauriHost {
             let Self {
                 runtime, watchdog, ..
             } = self;
-            watchdog.guard(runtime, f)
+            watchdog.guard(budget, runtime, f)
         };
         for op_activity in self.with_permissions(|p| p.leave()) {
             let source = op_activity
@@ -1008,40 +1124,14 @@ impl TauriHost {
                 .unwrap_or_else(|| META_NAMESPACE.into());
             let message = op_activity.display();
             eprintln!("[{}] {source}: {message}", op_activity.kind.as_str());
-            self.activity(Activity::new(source, op_activity.kind, message));
+            self.base
+                .activity(Activity::new(source, op_activity.kind, message));
         }
         result
     }
 }
 
 impl WorkerHost for TauriHost {
-    fn read_state(&mut self, trigger_id: &str) -> serde_json::Value {
-        read_trigger_state(&self.app, trigger_id)
-    }
-
-    fn write_state(&mut self, trigger_id: &str, state: serde_json::Value) {
-        write_trigger_state(&self.app, trigger_id, state);
-    }
-
-    fn call_tick(
-        &mut self,
-        trigger_id: &str,
-        ctx: serde_json::Value,
-    ) -> Result<Option<TickResult>, String> {
-        // 未ロードの判定は run_js の外で済ませる。中で早期 return すると
-        // enter したまま leave されない経路ができる。
-        let Some(handle) = self.loaded.get(trigger_id).cloned() else {
-            return Err(format!("trigger '{trigger_id}' is not loaded"));
-        };
-        self.run_js(trigger_id, |rt| {
-            rt.call_function(Some(&handle), "tick", rustyscript::json_args!(ctx))
-        })
-    }
-
-    fn notify(&mut self, title: &str, body: &str) {
-        send_notification(&self.app, title, body);
-    }
-
     fn activity(&mut self, activity: Activity) {
         record_activity(&self.app, &self.history, &activity);
     }
@@ -1064,6 +1154,51 @@ impl WorkerHost for TauriHost {
     }
 }
 
+/// executor も観測面とタスク永続化を触る。心拍側と同じ実装に委譲する。
+impl WorkerHost for TauriExecutorHost {
+    fn activity(&mut self, activity: Activity) {
+        self.base.activity(activity);
+    }
+
+    fn sweep_history(&mut self, now: u64) -> usize {
+        self.base.sweep_history(now)
+    }
+
+    fn save_tasks(&mut self, store: &TaskStore) {
+        self.base.save_tasks(store);
+    }
+}
+
+impl ExecutorHost for TauriExecutorHost {
+    fn read_state(&mut self, trigger_id: &str) -> serde_json::Value {
+        read_trigger_state(&self.base.app, trigger_id)
+    }
+
+    fn write_state(&mut self, trigger_id: &str, state: serde_json::Value) {
+        write_trigger_state(&self.base.app, trigger_id, state);
+    }
+
+    fn call_tick(
+        &mut self,
+        trigger_id: &str,
+        ctx: serde_json::Value,
+        budget: Duration,
+    ) -> Result<Option<TickResult>, String> {
+        // 未ロードの判定は run_js の外で済ませる。中で早期 return すると
+        // enter したまま leave されない経路ができる。
+        let Some(handle) = self.loaded.get(trigger_id).cloned() else {
+            return Err(format!("trigger '{trigger_id}' is not loaded"));
+        };
+        self.run_js(trigger_id, budget, |rt| {
+            rt.call_function(Some(&handle), "tick", rustyscript::json_args!(ctx))
+        })
+    }
+
+    fn notify(&mut self, title: &str, body: &str) {
+        send_notification(&self.base.app, title, body);
+    }
+}
+
 /// トリガーの JS を動かす Runtime の構成。
 ///
 /// **1 箇所にまとめてあるのは、仕様書 (#60) の「できないこと」がここに依存するため。**
@@ -1076,13 +1211,244 @@ fn trigger_runtime_options() -> rustyscript::RuntimeOptions {
     }
 }
 
-/// JS ワーカー: 単一の rustyscript Runtime に N モジュールを載せ、心拍ごとに
-/// 「due なタスクを取り出して実行する」。V8 の thread affinity を守るため、Runtime は
-/// この std::thread に閉じ込め、tokio 側と UI 側からは mpsc で心拍を送るだけ。
+/// 本番の [`Dispatcher`]。心拍から executor スレッドへ mpsc で渡す (#81)。
 ///
-/// 心拍 1 回の中身は [`crate::worker::heartbeat`] にある。ここが持つのは
-/// 「Runtime を立てて、モジュールを載せて、時計を送る」までで、副作用の順序や
-/// 分類の判断は [`TauriHost`] の裏に押し出してある (#46)。
+/// **送信は詰まらない。** `mpsc::channel` は無制限なので、executor が長い仕事を抱えて
+/// いても心拍はここで待たされない。待たされたら「心拍は塞がらない」が嘘になる。
+///
+/// 積み上がりを抑えるのは別の仕組み — 実行中のタスクは
+/// [`crate::tasks::TaskStore::in_flight`] のおかげで二重に配られず、実行に間に合わ
+/// なかった予定は猶予超過として掃除される。
+struct ChannelDispatcher {
+    standard: mpsc::Sender<Job>,
+    long: mpsc::Sender<Job>,
+}
+
+impl Dispatcher for ChannelDispatcher {
+    fn dispatch(&mut self, job: Job) -> bool {
+        let queue = match job.lane {
+            Lane::Standard => &self.standard,
+            Lane::Long => &self.long,
+        };
+        // 作業員が全滅している場合は捨てる。`false` を返すと心拍が実行中の印を落とし、
+        // タスクは普通の pending に戻る — 掃除にも次の心拍にも見えるので、リストに
+        // 残ったまま何の行も出ないタスクにはならない。
+        if queue.send(job).is_err() {
+            eprintln!("executor lane is gone; dropping job");
+            return false;
+        }
+        true
+    }
+}
+
+/// 作業員 1 人を立てるための材料。引数が増えたのでまとめただけで、意味は無い。
+struct ExecutorConfig {
+    /// どのレーンの作業員か。Runtime に掛ける上限も配送保証もここから決まる
+    /// ([`Lane::budget`] / [`Lane::at_most_once`])。
+    lane: Lane,
+    app: AppHandle,
+    task_store: TaskStoreRef,
+    history: HistoryRef,
+    secrets_service: SecretsService,
+    /// manifest 由来の権限表 (#56 / #57)。レーンに依らないので呼び出し側で 1 回組む。
+    grants: Arc<BTreeMap<String, TriggerGrants>>,
+    /// 読み込み済みの entry。同上、読み込みは 1 回で足りる。
+    modules: Arc<Vec<LoadedEntry>>,
+    schedule_grace: Duration,
+}
+
+/// 読み込み済みの entry 1 件 (#81)。
+///
+/// `max_runtime` を写して持つのは、作業員が「自分のレーンか」と「予算はいくらか」を
+/// これだけで決められるようにするため。`triggers` を引き直すと、載せる側と実行する側で
+/// 別の manifest を見る余地が生まれる。
+struct LoadedEntry {
+    trigger_id: String,
+    max_runtime: Duration,
+    module: rustyscript::Module,
+}
+
+/// トリガーの entry ファイルを**1 回だけ**読む (#81)。
+///
+/// 作業員は複数いるが、読むのは 1 回でよい — `rustyscript::Module` は「ファイル名 +
+/// 中身」を持つだけで、isolate に依存しない。読み直すと I/O も `[load error]` の行も
+/// 人数ぶんに増え、後者は同じ故障が 3 行に見える。
+///
+/// 構成エラーのあるトリガーは読まない (load しない = 展開もされない)。UI には
+/// `list_triggers` 経由で error 付きで見える。
+fn load_trigger_modules(
+    app: &AppHandle,
+    history: &HistoryRef,
+    triggers: &[TriggerInfo],
+) -> Vec<LoadedEntry> {
+    let mut loaded = Vec::new();
+    for t in triggers.iter() {
+        if t.config_error.is_some() {
+            continue;
+        }
+        let entry_path = t.dir.join(&t.manifest.entry);
+        match rustyscript::Module::load(&entry_path) {
+            Ok(module) => loaded.push(LoadedEntry {
+                trigger_id: t.manifest.id.clone(),
+                max_runtime: t.max_runtime,
+                module,
+            }),
+            Err(e) => {
+                eprintln!(
+                    "failed to load trigger '{}' at {:?}: {e}",
+                    t.manifest.id, entry_path
+                );
+                record_activity(
+                    app,
+                    history,
+                    &Activity::new(&t.manifest.id, ActivityKind::LoadError, e.to_string()),
+                );
+            }
+        }
+    }
+    loaded
+}
+
+/// 作業員 1 人 = 1 スレッド + 1 V8 isolate (#81)。
+///
+/// **自分のレーンのトリガーだけをロードする。** 全部載せると、標準レーンの作業員が
+/// 二度と呼ばないモジュールのトップレベルを実行することになる。
+///
+/// `ready` には「ロードできたトリガー id」を返す。心拍は全作業員ぶんの和を待ってから
+/// 動き出す — 先に走ると、まだ載っていないトリガーの予定が `[error] is not loaded` で
+/// 消費されてしまう。
+fn spawn_executor(
+    config: ExecutorConfig,
+    jobs: Arc<Mutex<mpsc::Receiver<Job>>>,
+    ready: mpsc::Sender<HashSet<String>>,
+) {
+    let ExecutorConfig {
+        lane,
+        app,
+        task_store,
+        history,
+        secrets_service,
+        grants,
+        modules,
+        schedule_grace,
+    } = config;
+
+    std::thread::spawn(move || {
+        // 予算 (#59) 付きで立てる。止め方 2 通りが一組で入ることは guarding 側の責任。
+        let (mut runtime, watchdog) =
+            match Watchdog::guarding(lane.budget(), trigger_runtime_options()) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    eprintln!("failed to init JS runtime: {e}");
+                    // 報告を落とさない。握ったまま返ると心拍が永久に待つ。
+                    let _ = ready.send(HashSet::new());
+                    return;
+                }
+            };
+
+        // OpState に SecretsService を注入。op_chamberlain_get_secret がここから
+        // service 名 (tauri identifier) を借りて keyring を叩く。併せて、extension が
+        // 載せた既定の TriggerPermissions を manifest 由来の宣言で差し替える (#56)。
+        // op から見える権限の判断材料はこれだけで、JS 側から差し替える手段は無い。
+        //
+        // **作業員ごとに OpState は独立している。** isolate が別なので当然だが、
+        // 実行文脈 (`enter` / `leave`) が「その isolate の中では直列」という前提の上に
+        // 成り立っていることの裏返しでもある (#56)。
+        {
+            let op_state = runtime.deno_runtime().op_state();
+            let mut op_state = op_state.borrow_mut();
+            op_state.put(secrets_service);
+            op_state.put(TriggerPermissions::new((*grants).clone()));
+        }
+
+        let mut host = TauriExecutorHost {
+            base: TauriHost { app, history },
+            runtime,
+            loaded: BTreeMap::new(),
+            watchdog,
+        };
+
+        // 自分のレーンのトリガーを isolate に載せる。読み込みは呼び出し側で済んでいるので、
+        // ここでやるのは V8 へのコンパイルと初期化 (= isolate ごとに必ず要る作業) だけ。
+        // 失敗したものはスキップ (他は動く)。
+        for entry in modules.iter() {
+            if Lane::of(entry.max_runtime) != lane {
+                continue;
+            }
+            // load_module はモジュールのトップレベルを実行する = JS が動く。宣言を正しく
+            // 書いたトリガーが初期化時に自分の secret を読めるよう、ここも実行文脈に含める。
+            // 含めなくても既定拒否で安全側には倒れるが、正しいトリガーが理由の分かりにくい
+            // [denied] を踏むことになる。予算 (#59) が掛かるのも同じ理由で、ここを外すと
+            // 無限ループを書いたトリガー 1 つで**その作業員**が起動してこなくなる。
+            let handle = match host.run_js(&entry.trigger_id, entry.max_runtime, |rt| {
+                rt.load_module(&entry.module)
+            }) {
+                Ok(h) => h,
+                Err(e) => {
+                    eprintln!("failed to instantiate trigger '{}': {e}", entry.trigger_id);
+                    host.activity(Activity::new(
+                        &entry.trigger_id,
+                        ActivityKind::InstantiateError,
+                        e,
+                    ));
+                    continue;
+                }
+            };
+            host.loaded
+                .insert(entry.trigger_id.clone(), Rc::new(handle));
+        }
+
+        // ロードできたぶんを報告して持ち場につく。**起動時の突き合わせはここでやらない** —
+        // 作業員は自分のレーンしか知らないので、全レーンを見る必要のある突き合わせは
+        // 全員の報告が揃う心拍スレッド側の仕事である。
+        //
+        // 報告したら送信端を手放す。心拍は人数を数えて待っているのでこれが無くても
+        // 揃うが、**報告せずに死んだ作業員がいたとき**の逃げ道になる (全員の送信端が
+        // 落ちれば `recv` が Err を返し、心拍は残りを待たずに動き出せる)。
+        let _ = ready.send(host.loaded.keys().cloned().collect());
+        drop(ready);
+
+        // 仕事が来たら 1 件ずつ実行する。**受け取りと実行しかしない** — どのタスクが
+        // 実行に値するかの判断は心拍側で終わっている。
+        //
+        // ロックは `recv()` の間だけ握る。握ったまま実行すると、同じレーンの他の作業員が
+        // 次の仕事を取れず、人数を増やした意味が消える。
+        loop {
+            let job = {
+                let rx = jobs.lock().unwrap_or_else(|e| e.into_inner());
+                match rx.recv() {
+                    Ok(job) => job,
+                    Err(_) => break,
+                }
+            };
+            run_job(&mut host, &task_store, job, now_millis(), schedule_grace);
+        }
+    });
+}
+
+/// 心拍スレッドと executor スレッドを立てる (#81)。
+///
+/// **JS を回すのは executor だけ。** 心拍は「誰のどの予定が今やるべきか」を判断して
+/// executor へ mpsc で渡し、実行の完了を待たずに次の心拍へ進む。V8 の thread affinity を
+/// 守るため、Runtime は executor スレッドに閉じ込める。
+///
+/// ```text
+///   tokio timer ──tick──▶ 心拍スレッド ──Job──▶ executor スレッド
+///     (1 分ごと)          (V8 を持たない)         (Runtime + 番犬)
+///                              │                        │
+///                              └──── TaskStore (Arc<Mutex>) ────┘
+/// ```
+///
+/// 心拍 1 回の中身は [`crate::worker::heartbeat`]、実行 1 件の中身は
+/// [`crate::worker::run_job`] にある。ここが持つのは「スレッドを 2 本立てて、
+/// モジュールを載せて、時計を送る」までで、副作用の順序や分類の判断は
+/// [`TauriHost`] / [`TauriExecutorHost`] の裏に押し出してある (#46)。
+///
+/// # 起動順序
+///
+/// モジュールのロードと起動時突き合わせは **executor スレッドが済ませてから** 心拍を
+/// 受け付ける。心拍が先に走ると、まだ `loaded` に入っていないトリガーの予定が
+/// `[error] is not loaded` で消費される。両者の間は `ready` チャネルで直列化する。
 ///
 /// 戻り値は心拍への割り込み用 Sender。手動実行 (#20) がこれを使って次の心拍を待たずに
 /// タスクを処理させる。
@@ -1095,96 +1461,92 @@ fn spawn_trigger_worker(
     tick_interval: Duration,
 ) -> mpsc::Sender<()> {
     let (tick_tx, tick_rx) = mpsc::channel::<()>();
-    let app_for_worker = app.clone();
     let timer_tx = tick_tx.clone();
     // schedule 由来タスクの猶予。心拍が数回遅れたぶんは実行し、それを超えた遅れは
     // missed-fire として破棄する (#26 決定事項 8 / [`crate::tasks`] モジュール doc)。
     let schedule_grace = tick_interval * SCHEDULE_GRACE_TICKS;
 
+    // レーンごとに 1 本のキュー。作業員が複数いる場合は受信端を共有して、空いた者が
+    // 次の仕事を取る。**キューをレーンで分けることが飢餓対策の実体**で、長い仕事が
+    // 何本詰まっていても標準レーンの作業員はそれを見ない。
+    let (standard_tx, standard_rx) = mpsc::channel::<Job>();
+    let (long_tx, long_rx) = mpsc::channel::<Job>();
+    let standard_rx = Arc::new(Mutex::new(standard_rx));
+    let long_rx = Arc::new(Mutex::new(long_rx));
+
+    // 各作業員が「自分がロードできたトリガー」を報告する口。心拍は全員ぶんを集めて
+    // 和を取ってから動き出す (起動順序)。
+    let (ready_tx, ready_rx) = mpsc::channel::<HashSet<String>>();
+
+    // 権限の表はレーンに依らないので 1 回だけ組んで配る (作業員ごとに組み直さない)。
+    let grants = Arc::new(build_grants(&triggers));
+
+    // entry ファイルの**読み込みも 1 回**にする。`Module` は「ファイル名 + 中身」なので
+    // clone は安く、作業員ごとに読み直すとディスク I/O も `[load error]` の行も人数ぶんに
+    // なる。**V8 へのコンパイルは isolate ごとに要る**ので、そちらは各作業員が行う。
+    let modules = Arc::new(load_trigger_modules(&app, &history, &triggers));
+
+    let workers = STANDARD_WORKERS + LONG_WORKERS;
+    for (lane, rx, count) in [
+        (Lane::Standard, &standard_rx, STANDARD_WORKERS),
+        (Lane::Long, &long_rx, LONG_WORKERS),
+    ] {
+        for _ in 0..count {
+            spawn_executor(
+                ExecutorConfig {
+                    lane,
+                    app: app.clone(),
+                    task_store: Arc::clone(&task_store),
+                    history: Arc::clone(&history),
+                    secrets_service: secrets_service.clone(),
+                    grants: Arc::clone(&grants),
+                    modules: Arc::clone(&modules),
+                    schedule_grace,
+                },
+                Arc::clone(rx),
+                ready_tx.clone(),
+            );
+        }
+    }
+
+    // 心拍スレッド。V8 を持たないので、ここが JS で塞がることはない。
     std::thread::spawn(move || {
-        // 予算 (#59) 付きで立てる。止め方 2 通りが一組で入ることは guarding 側の責任。
-        let (mut runtime, watchdog) = match Watchdog::guarding(JS_BUDGET, trigger_runtime_options())
-        {
-            Ok(pair) => pair,
-            Err(e) => {
-                eprintln!("failed to init JS runtime: {e}");
-                return;
+        // 全作業員がモジュールを載せ終えるまで待ち、ロードできた id の和を取る。
+        //
+        // **人数を数える。** 「送信端が全部落ちたら」で待つ形にすると、報告後に送信端を
+        // 手放し忘れた作業員が 1 人いるだけで心拍が永久に動き出さない — トリガーも展開も
+        // 観測面も止まったまま、エラーは 1 行も出ない。人数は定数なので数えられる。
+        //
+        // 途中で `Err` になるのは作業員が報告せずに死んだ場合。そのトリガーが動かない
+        // だけで、展開と観測面は生きている方がよいので先へ進む。
+        let mut loaded = HashSet::new();
+        for _ in 0..workers {
+            match ready_rx.recv() {
+                Ok(ids) => loaded.extend(ids),
+                Err(_) => break,
             }
-        };
-
-        // OpState に SecretsService を注入。op_chamberlain_get_secret がここから
-        // service 名 (tauri identifier) を借りて keyring を叩く。併せて、extension が
-        // 載せた既定の TriggerPermissions を manifest 由来の宣言で差し替える (#56)。
-        // op から見える権限の判断材料はこれだけで、JS 側から差し替える手段は無い。
-        {
-            let op_state = runtime.deno_runtime().op_state();
-            let mut op_state = op_state.borrow_mut();
-            op_state.put(secrets_service);
-            op_state.put(TriggerPermissions::new(build_grants(&triggers)));
         }
 
-        let mut host = TauriHost {
-            app: app_for_worker,
-            runtime,
-            loaded: BTreeMap::new(),
-            history,
-            watchdog,
-        };
+        let mut host = TauriHost { app, history };
 
-        // 起動時に全モジュールをロード。ロード失敗したものはスキップ (他トリガーは動く)。
-        // config_error があるトリガーはこの段階でスキップ (load しない = 展開もされない)。
-        // UI には list_triggers 経由で error 付きで見える。
-        for t in triggers.iter() {
-            if t.config_error.is_some() {
-                continue;
-            }
-            let entry_path = t.dir.join(&t.manifest.entry);
-            let module = match rustyscript::Module::load(&entry_path) {
-                Ok(m) => m,
-                Err(e) => {
-                    eprintln!(
-                        "failed to load trigger '{}' at {:?}: {e}",
-                        t.manifest.id, entry_path
-                    );
-                    host.activity(Activity::new(
-                        &t.manifest.id,
-                        ActivityKind::LoadError,
-                        e.to_string(),
-                    ));
-                    continue;
-                }
-            };
-            // load_module はモジュールのトップレベルを実行する = JS が動く。宣言を正しく
-            // 書いたトリガーが初期化時に自分の secret を読めるよう、ここも実行文脈に含める。
-            // 含めなくても既定拒否で安全側には倒れるが、正しいトリガーが理由の分かりにくい
-            // [denied] を踏むことになる。予算 (#59) が掛かるのも同じ理由で、ここを外すと
-            // 無限ループを書いたトリガー 1 つで**起動そのもの**が返ってこなくなる。
-            let handle = match host.run_js(&t.manifest.id, |rt| rt.load_module(&module)) {
-                Ok(h) => h,
-                Err(e) => {
-                    eprintln!("failed to instantiate trigger '{}': {e}", t.manifest.id);
-                    host.activity(Activity::new(
-                        &t.manifest.id,
-                        ActivityKind::InstantiateError,
-                        e,
-                    ));
-                    continue;
-                }
-            };
-            host.loaded.insert(t.manifest.id.clone(), Rc::new(handle));
-        }
-
-        // 古い state の残骸を掃除してから、永続タスクリストを現在の manifest と突き合わせる。
+        // 古い state の残骸を掃除してから、永続タスクリストを現在の manifest と
+        // 突き合わせる。**全レーンを見る必要がある**ので作業員ではなくここでやる
+        // (突き合わせ自体は `runnable` を見ない — [`reconcile_at_startup`] の doc)。
         drop_legacy_fire_times(&host.app);
-        let specs = build_specs(&triggers, &host);
+        let specs = build_specs(&triggers, &loaded);
         reconcile_at_startup(&mut host, &specs, &task_store, now_millis());
 
+        let mut dispatcher = ChannelDispatcher {
+            standard: standard_tx,
+            long: long_tx,
+        };
         let mut state = WorkerState::default();
         while tick_rx.recv().is_ok() {
             // paused はここで読み直す (UI から心拍の合間に切り替わる)。
-            let specs = build_specs(&triggers, &host);
+            let specs = build_specs(&triggers, &loaded);
             heartbeat(
                 &mut host,
+                &mut dispatcher,
                 &specs,
                 &task_store,
                 &mut state,
@@ -1196,8 +1558,8 @@ fn spawn_trigger_worker(
 
     tauri::async_runtime::spawn(async move {
         // 起動直後に 1 回起こす。sleep 先行だと、初回起動から最初の心拍まで (prod で 1 分)
-        // 展開が走らず UI が「予定なし」を出してしまう。mpsc は buffered なので、worker が
-        // モジュールロードと起動時突き合わせを終えて recv() に到達した時点で消費される。
+        // 展開が走らず UI が「予定なし」を出してしまう。mpsc は buffered なので、心拍が
+        // 起動時突き合わせを終えて recv() に到達した時点で消費される。
         if timer_tx.send(()).is_err() {
             return;
         }
@@ -1267,6 +1629,11 @@ fn list_triggers(
             // 大文字や前後の空白の差で「UI に見えている文字列」と「実際に効く宣言」が
             // ずれる。ここで見せるものは強制力を持つ側と同一でなければならない。
             allowed_hosts: t.hosts.iter().map(|h| h.as_declared()).collect(),
+            // **強制されている側の値を出す。** 生の宣言 (`manifest.max_runtime_sec`) は
+            // 構成エラーのトリガーでは効いておらず、一覧はそれも載せるため
+            // (`error` 付きで見せるのがこの一覧の役目)。宣言 99999 が構成エラーとして
+            // 弾かれて 110 秒で動くのに 99999 と表示する、が起きないようにする。
+            max_runtime_sec: declared_max_runtime_sec(t.max_runtime),
             source: t.source,
         })
         .collect()
@@ -1472,6 +1839,7 @@ pub(crate) fn inspect_candidate(
         // 検証済みのパターンから組み立て直す (list_triggers と同じ理由)。同意画面に
         // 出る文字列は、実際に効く宣言と 1 文字も違ってはいけない。
         allowed_hosts: validated.hosts.iter().map(|h| h.as_declared()).collect(),
+        max_runtime_sec: manifest.max_runtime_sec,
         conflict,
         warnings,
     })
@@ -1965,6 +2333,192 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
 mod tests {
     use super::*;
 
+    /// `maxRuntimeSec` の宣言が範囲外なら構成エラーになり、丸められない (#81)。
+    ///
+    /// 黙って丸めると、宣言と実際の上限がずれたまま誰も気づけない。#68 が
+    /// `maxTokens` で同じ判断をしている。
+    #[test]
+    fn an_out_of_range_max_runtime_is_a_config_error_not_a_clamp() {
+        let floor = JS_BUDGET.as_secs();
+        let ceiling = MAX_RUNTIME.as_secs();
+        for bad in [0, 1, floor, ceiling + 1, ceiling * 10] {
+            assert!(
+                validate_max_runtime(Some(bad)).is_err(),
+                "{bad} 秒が通ってしまう"
+            );
+        }
+        for ok in [floor + 1, ceiling / 2, ceiling] {
+            assert_eq!(
+                validate_max_runtime(Some(ok)).expect("通らない"),
+                Duration::from_secs(ok)
+            );
+        }
+        assert_eq!(validate_max_runtime(None).expect("既定"), JS_BUDGET);
+    }
+
+    /// 宣言の有無がそのままレーンを決める (#81)。**判断は 1 箇所** なので、
+    /// ここがずれると「宣言したのに標準レーンで 110 秒に切られる」が静かに起きる。
+    #[test]
+    fn declaring_a_max_runtime_is_what_moves_a_trigger_to_the_long_lane() {
+        assert_eq!(
+            Lane::of(validate_max_runtime(None).unwrap()),
+            Lane::Standard
+        );
+        assert_eq!(Lane::of(JS_BUDGET), Lane::Standard);
+        assert_eq!(
+            Lane::of(validate_max_runtime(Some(JS_BUDGET.as_secs() + 1)).unwrap()),
+            Lane::Long
+        );
+        assert_eq!(Lane::of(MAX_RUNTIME), Lane::Long);
+        // レーンが配送保証を決めている (#81 の 2 つめの意味)。
+        assert!(Lane::Long.at_most_once());
+        assert!(!Lane::Standard.at_most_once());
+    }
+
+    /// 引き渡しがレーンで分かれること (#81)。**キューが別であることが飢餓対策の実体**
+    /// なので、ここが 1 本に戻ると長い仕事が短いトリガーの席を埋める。
+    #[test]
+    fn jobs_go_to_the_queue_their_lane_names() {
+        let (standard_tx, standard_rx) = mpsc::channel::<Job>();
+        let (long_tx, long_rx) = mpsc::channel::<Job>();
+        let mut dispatcher = ChannelDispatcher {
+            standard: standard_tx,
+            long: long_tx,
+        };
+
+        for (id, lane, max_runtime) in [
+            ("quick", Lane::Standard, JS_BUDGET),
+            ("digest", Lane::Long, MAX_RUNTIME),
+            ("ping", Lane::Standard, JS_BUDGET),
+        ] {
+            dispatcher.dispatch(Job {
+                task: tasks::Task {
+                    id: format!("task-{id}"),
+                    trigger_id: Some(id.to_string()),
+                    scheduled_at: 0,
+                    origin: TaskOrigin::Schedule,
+                    created_at: 0,
+                },
+                trigger_id: id.to_string(),
+                trigger_name: id.to_string(),
+                max_runtime,
+                lane,
+            });
+        }
+        drop(dispatcher);
+
+        let standard: Vec<String> = standard_rx.iter().map(|j| j.trigger_id).collect();
+        let long: Vec<String> = long_rx.iter().map(|j| j.trigger_id).collect();
+        assert_eq!(standard, vec!["quick", "ping"]);
+        assert_eq!(long, vec!["digest"]);
+    }
+
+    /// 同じレーンの作業員が 1 本のキューを分け合い、**1 件を 1 人だけが取る** (#81)。
+    ///
+    /// 受信端を `Arc<Mutex<_>>` で共有する形の要点はここで、取り合いにならないこと
+    /// (二重実行が起きない) と、空いた者が次を取れること (人数が意味を持つ) の両方が
+    /// 同時に要る。
+    #[test]
+    fn workers_in_a_lane_share_one_queue_and_each_job_is_taken_once() {
+        let (tx, rx) = mpsc::channel::<u32>();
+        let rx = Arc::new(Mutex::new(rx));
+        let taken = Arc::new(Mutex::new(Vec::new()));
+
+        let mut handles = Vec::new();
+        for _ in 0..STANDARD_WORKERS {
+            let rx = Arc::clone(&rx);
+            let taken = Arc::clone(&taken);
+            handles.push(std::thread::spawn(move || loop {
+                // 本番と同じく、ロックは recv() の間だけ握る。
+                let job = {
+                    let guard = rx.lock().unwrap_or_else(|e| e.into_inner());
+                    match guard.recv() {
+                        Ok(job) => job,
+                        Err(_) => break,
+                    }
+                };
+                taken.lock().unwrap_or_else(|e| e.into_inner()).push(job);
+            }));
+        }
+
+        for n in 0..50 {
+            tx.send(n).expect("送れない");
+        }
+        drop(tx);
+        for h in handles {
+            h.join().expect("作業員が落ちた");
+        }
+
+        let mut got = taken.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            (0..50).collect::<Vec<_>>(),
+            "取りこぼしか二重取りがある"
+        );
+    }
+
+    /// 全員が報告した時点で心拍が動き出すこと (#81)。
+    ///
+    /// 心拍は「送信端が全部落ちた」を「全員ぶん揃った」の合図に使っている。作業員が
+    /// 報告した後も送信端を持ったまま持ち場につくと、**心拍は永久に動き出さない** —
+    /// トリガーも展開もタイムラインも一切動かないまま、エラーは 1 行も出ない。
+    /// 見つけにくい壊れ方なので、握手の形だけ固定しておく。
+    #[test]
+    fn the_heartbeat_starts_once_every_worker_has_reported() {
+        let workers = STANDARD_WORKERS + LONG_WORKERS;
+        let (ready_tx, ready_rx) = mpsc::channel::<HashSet<String>>();
+        let (done_tx, done_rx) = mpsc::channel::<HashSet<String>>();
+
+        // **送信端を手放さない作業員**を模す。本番の作業員は手放すが、手放し忘れても
+        // 心拍が動き出すことがこの数え方の主張である (以前は「全部落ちたら」で待って
+        // いたので、1 人の持ちっぱなしで心拍が永久に止まった)。
+        for i in 0..workers {
+            let ready = ready_tx.clone();
+            std::thread::spawn(move || {
+                let _ = ready.send(HashSet::from([format!("trigger-{i}")]));
+                std::thread::sleep(Duration::from_secs(2));
+            });
+        }
+
+        std::thread::spawn(move || {
+            let mut loaded = HashSet::new();
+            for _ in 0..workers {
+                match ready_rx.recv() {
+                    Ok(ids) => loaded.extend(ids),
+                    Err(_) => break,
+                }
+            }
+            let _ = done_tx.send(loaded);
+        });
+
+        let loaded = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("全員が報告しても心拍が動き出さない (送信端を手放していない?)");
+        assert_eq!(loaded.len(), workers, "報告が取りこぼされている");
+    }
+
+    /// 作業員の構成が「宣言しなかったトリガーを守る」形になっていること (#81)。
+    ///
+    /// 標準レーンが 2 人以上要るのは、1 人だと長さ以外は同じ 2 本の標準トリガーが
+    /// 直列になり、片方が予算いっぱい使うともう片方が猶予を割るため。長レーンが
+    /// 1 人以上要るのは、0 人なら宣言したトリガーが永久に走らないため。
+    #[test]
+    fn the_lanes_are_staffed_so_undeclared_triggers_keep_a_seat() {
+        const {
+            assert!(
+                STANDARD_WORKERS >= 2,
+                "標準レーンが 1 人だと長さの違わない 2 本が互いを待たせる"
+            );
+            assert!(LONG_WORKERS >= 1, "長レーンに作業員がいない");
+        }
+        // 長い仕事がどれだけ詰まっても標準レーンの席は減らない (キューが別)。
+        assert!(
+            MAX_RUNTIME > JS_BUDGET,
+            "長レーンの上限が標準と同じなら分ける意味が無い"
+        );
+    }
+
     /// JS の予算は 2 つの定数に挟まれている (#59)。どちらかを動かして窓が閉じたら
     /// ここで気づく — 気づかないと「正常な AI 応答を殺す」か「暴走 1 件が他トリガーの
     /// 予定を落とす」のどちらかが静かに戻る。根拠は [`JS_BUDGET`] の doc。
@@ -1992,6 +2546,7 @@ mod tests {
                 required_secrets: Vec::new(),
                 allowed_hosts: Vec::new(),
                 schedule: "@hourly".to_string(),
+                max_runtime_sec: None,
                 tz: None,
             },
             dir: PathBuf::from(format!("/tmp/{id}")),
@@ -2002,6 +2557,7 @@ mod tests {
             tz: chrono_tz::UTC,
             config_error: None,
             hosts: Vec::new(),
+            max_runtime: JS_BUDGET,
         }
     }
 
@@ -2407,6 +2963,24 @@ mod tests {
                     "仕様書が使えないと書いている '{code}' がパースを通ってしまう"
                 );
             }
+        }
+
+        /// §6 が書いている `maxRuntimeSec` の範囲が実装と一致していること (#81)。
+        ///
+        /// **仕様書は「範囲外は構成エラー」と断言している**ので、ここがずれると
+        /// 「仕様書どおりに書いたのにトリガーが動かない」が起きる。両端の数字を
+        /// 本文から拾って、実際の検証に掛ける。
+        #[test]
+        fn spec_states_the_real_max_runtime_range() {
+            let doc = super::TRIGGER_SPEC;
+            let floor = JS_BUDGET.as_secs() + 1;
+            let ceiling = MAX_RUNTIME.as_secs();
+            assert!(
+                doc.contains(&format!("**{floor}〜{ceiling} (秒)**")),
+                "仕様書が書いている範囲が実装 ({floor}〜{ceiling}) と違う"
+            );
+            // 本文が挙げている例がそのまま通ること。
+            assert!(validate_max_runtime(Some(1800)).is_ok());
         }
 
         /// 仕様書の「できないこと」(§6) が実際の JS 環境と一致していること。
