@@ -4,15 +4,32 @@
 //! モジュールは**その判断を実際の副作用に繋ぐ順序**を持つ。展開 → due 取り出し → 分類 →
 //! 実行 → 後片付け、という一巡そのものがここの責務である。
 //!
+//! # 心拍は JS を回さない (#81)
+//!
+//! 心拍と実行は**別のスレッド**にいる。[`heartbeat`] は「誰のどの予定が今やるべきものか」
+//! までを判断して [`Dispatcher`] に渡し、結果を待たずに戻る。実行の中身は [`run_job`] で、
+//! V8 isolate を持つ executor スレッドが呼ぶ。
+//!
+//! **これが「秘書は待たせない」の実体である。** 以前は心拍そのものが JS を呼んでいたので、
+//! 1 本のトリガーが返ってこないと心拍ごと止まった。`JS_BUDGET` が猶予より短く取ってあった
+//! のはそれを抑えるためで、天井の上限は「他のトリガーの予定を守る」から来ていた。
+//! 心拍が実行を待たなくなった今、その上限の根拠は心拍側には無い。
+//!
+//! 引き換えに、「配ったがまだ終わっていない」という状態が初めて生まれる。これを持つのが
+//! [`crate::tasks::TaskStore::in_flight`] で、**永続化しない**ことで at-least-once を保つ。
+//!
 //! # なぜ trait を挟むか
 //!
-//! [`WorkerHost`] は worker が触る副作用を数え上げたもの。本番の実装は `lib.rs` の
-//! `TauriHost` (AppHandle + JS Runtime + ロード済みモジュール)、テストでは記録用の fake を
-//! 差す。これで「時計を進めるだけでシナリオを書く」ことができる。
+//! [`WorkerHost`] は心拍が触る副作用を、[`ExecutorHost`] は実行側が触る副作用を数え上げた
+//! もの。本番の実装は `lib.rs` にあり、テストでは記録用の fake を差す。これで「時計を
+//! 進めるだけでシナリオを書く」ことができる。
 //!
-//! JS 実行 ([`WorkerHost::call_tick`]) も境界の裏に置いてある。V8 は thread affinity を持ち
-//! 起動も安くないので、心拍のロジックを検証するのに本物の Runtime を回す必要は無い。
+//! JS 実行 ([`ExecutorHost::call_tick`]) も境界の裏に置いてある。V8 は thread affinity を
+//! 持ち起動も安くないので、心拍のロジックを検証するのに本物の Runtime を回す必要は無い。
 //! 「トリガーの JS が実際に動くか」は別レイヤの関心である。
+//!
+//! テストの [`Dispatcher`] は受け取った仕事をその場で [`run_job`] に流す。**実行が別
+//! スレッドに出た後も、副作用を 1 本の列として検証し続けられる**のはこのため。
 //!
 //! # 副作用の順序は仕様である
 //!
@@ -37,8 +54,58 @@ use crate::history::{needs_sweep, Activity, ActivityKind};
 use crate::schedule::Schedule;
 use crate::tasks::{
     classify_due, expand_trigger, needs_expansion, reconcile, sweep_stale, Disposition,
-    ExpansionState, TaskStore, TriggerRuntimeState, TriggerSpecView,
+    ExpansionState, Task, TaskStore, TriggerRuntimeState, TriggerSpecView,
 };
+
+/// トリガーが走るレーン (#81)。manifest の `maxRuntimeSec` を宣言したかで決まる。
+///
+/// **配送保証がレーンごとに違う。** 分けた理由は [`Lane::at_most_once`] にある。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Lane {
+    /// 宣言しなかったトリガー。今までどおり 110 秒以内で、落ちたらやり直す。
+    Standard,
+    /// `maxRuntimeSec` を宣言したトリガー。長く走れる代わりにやり直さない。
+    Long,
+}
+
+impl Lane {
+    /// 実行時間の上限からレーンを決める (#81)。**判断はここ 1 箇所**。
+    ///
+    /// 既定値のままのトリガーは標準レーン。`maxRuntimeSec` を書いた時点で長レーンに
+    /// 移り、配送保証も at-most-once に変わる ([`Lane::at_most_once`])。
+    pub(crate) fn of(max_runtime: Duration) -> Self {
+        if max_runtime > crate::JS_BUDGET {
+            Lane::Long
+        } else {
+            Lane::Standard
+        }
+    }
+
+    /// このレーンの作業員に与える上限。
+    ///
+    /// **`RuntimeOptions::timeout` は Runtime 生成時に固定**なので (呼び出しごとには
+    /// 変えられない)、レーンの作業員はこの値で立てる。レーンが「キュー + 上限 + 配送
+    /// 保証」の 3 つ揃いであることを型の上に置くための関数で、値と `Lane` が食い違う
+    /// 組み合わせを作れなくする。
+    pub(crate) fn budget(self) -> Duration {
+        match self {
+            Lane::Standard => crate::JS_BUDGET,
+            Lane::Long => crate::MAX_RUNTIME,
+        }
+    }
+
+    /// 落ちたときにやり直さないか。
+    ///
+    /// 心拍のタスクは at-least-once である — 秘書は「1 回多く言う > 一言忘れる」
+    /// ([`crate::worker`] のモジュール doc)。短い通知ならこれでよい。
+    ///
+    /// **長い仕事では前提が違う。** AI 呼び出しを何十回も積む仕事はエンドユーザーの
+    /// 実費で (#71 / #72)、クラッシュ後に黙って丸ごと焼き直すと請求が倍になる。
+    /// 言い忘れより高くつくので、長レーンだけ at-most-once に倒す。
+    pub(crate) fn at_most_once(self) -> bool {
+        matches!(self, Lane::Long)
+    }
+}
 
 #[derive(Deserialize, Clone)]
 pub(crate) struct NotifyPayload {
@@ -56,27 +123,12 @@ pub(crate) struct TickResult {
     pub state: Option<serde_json::Value>,
 }
 
-/// worker が触る副作用の全て。ここに無い副作用を worker が持ってはならない
+/// 心拍が触る副作用の全て。ここに無い副作用を心拍が持ってはならない
 /// (持った瞬間にその経路がテストの外に出る)。
+///
+/// **JS を回す副作用はここに無い** (#81)。心拍は V8 を持たないスレッドで走るので、
+/// 型の上でも触れない。実行側の副作用は [`ExecutorHost`] にある。
 pub(crate) trait WorkerHost {
-    /// トリガーの永続 state (`triggers-state.json`) を読む。未設定なら `{}`。
-    fn read_state(&mut self, trigger_id: &str) -> serde_json::Value;
-
-    /// トリガーの永続 state を書く。
-    fn write_state(&mut self, trigger_id: &str, state: serde_json::Value);
-
-    /// トリガーの JS `tick(ctx)` を呼ぶ。`Ok(None)` は「戻り値なし」。
-    /// `Err` は JS 例外・ロード済みモジュール不在などの実行失敗。
-    fn call_tick(
-        &mut self,
-        trigger_id: &str,
-        ctx: serde_json::Value,
-    ) -> Result<Option<TickResult>, String>;
-
-    /// OS 通知を出す。permission が無い等で出せない場合も worker には成功として見せる
-    /// (観測面は activity 側が担保するため)。
-    fn notify(&mut self, title: &str, body: &str);
-
     /// 観測面 (#6) にイベントを流す。live emit と履歴への永続化の両方がここに入る。
     fn activity(&mut self, activity: Activity);
 
@@ -85,6 +137,65 @@ pub(crate) trait WorkerHost {
 
     /// タスクリストを永続化する。1 心拍あたり最大 1 回に抑えるのは worker の責任。
     fn save_tasks(&mut self, store: &TaskStore);
+}
+
+/// トリガー 1 件を実際に走らせる側が触る副作用 (#81)。[`run_job`] だけが使う。
+///
+/// [`WorkerHost`] を継いでいるのは、実行の結果もまた観測面に出てタスクリストを
+/// 書き換えるからで、**実行が終わるのを待たずに心拍が進む**以上、後片付けは
+/// 実行した側が自分でやるしかない。
+pub(crate) trait ExecutorHost: WorkerHost {
+    /// トリガーの永続 state (`triggers-state.json`) を読む。未設定なら `{}`。
+    fn read_state(&mut self, trigger_id: &str) -> serde_json::Value;
+
+    /// トリガーの永続 state を書く。
+    fn write_state(&mut self, trigger_id: &str, state: serde_json::Value);
+
+    /// トリガーの JS `tick(ctx)` を呼ぶ。`Ok(None)` は「戻り値なし」。
+    /// `Err` は JS 例外・ロード済みモジュール不在などの実行失敗。
+    ///
+    /// `budget` はこの 1 回に許される時間 (#81)。番犬 (#59) がこれで見張る。
+    fn call_tick(
+        &mut self,
+        trigger_id: &str,
+        ctx: serde_json::Value,
+        budget: Duration,
+    ) -> Result<Option<TickResult>, String>;
+
+    /// OS 通知を出す。permission が無い等で出せない場合も worker には成功として見せる
+    /// (観測面は activity 側が担保するため)。
+    fn notify(&mut self, title: &str, body: &str);
+}
+
+/// 心拍が executor へ渡す仕事 1 件 (#81)。
+///
+/// **参照を一切持たない。** スレッドをまたぐからでもあるが、それ以上に「渡した時点の
+/// 判断を運ぶ」ことが要件である。長い仕事は心拍を何十回もまたいで走るので、実行側が
+/// `specs` を後から引き直すと、走り始めたときとは別の manifest を見ることになる。
+///
+/// 逆に **時刻は運ばない。** 引き渡しから実行までに時間が経つので、心拍が見た時刻を
+/// 持ち回ると ctx の `delayMs` が実際より小さく出る。時刻は [`run_job`] が実行の
+/// 直前に取り直す。
+pub(crate) struct Job {
+    pub task: Task,
+    pub trigger_id: String,
+    /// 通知タイトルの既定値 (`manifest.name`)。executor は spec を引かないので写して渡す。
+    pub trigger_name: String,
+    /// この実行に許される時間 (#81)。番犬の予算になる。
+    pub max_runtime: Duration,
+    /// どのレーンへ渡すか、そして落ちたときにやり直すか (#81)。
+    pub lane: Lane,
+}
+
+/// 心拍から実行側への受け渡し口 (#81)。
+///
+/// **心拍は「渡した」までしか知らない。** 本番では mpsc で executor スレッドへ送り、
+/// テストではその場で [`run_job`] を呼ぶ。後者のおかげで、実行が別スレッドに出た後も
+/// 副作用の順序を 1 本の列として検証し続けられる。
+pub(crate) trait Dispatcher {
+    /// 渡せたら `true`。`false` は「受け取り手がいない」で、心拍は実行中の印を
+    /// 落として普通の pending に戻す (印だけ残すと二度と動かないタスクになる)。
+    fn dispatch(&mut self, job: Job) -> bool;
 }
 
 /// 心拍から見たトリガー 1 つ。`lib.rs` の `TriggerInfo` から心拍が必要とするぶんだけを
@@ -109,6 +220,11 @@ pub(crate) struct TriggerSpec {
     /// どちらも false になる。false のトリガーは展開されず、既に積まれたタスクは
     /// due 時に `[unavailable]` で破棄される。
     pub runnable: bool,
+    /// 1 回の実行に許される時間 (#81)。`maxRuntimeSec` の宣言か既定値。
+    pub max_runtime: Duration,
+    /// どのレーンで走るか (#81)。`max_runtime` から決まるが、判断を 1 箇所に
+    /// 固めるため値として持ち回る。
+    pub lane: Lane,
 }
 
 fn find_spec<'a>(specs: &'a [TriggerSpec], id: &str) -> Option<&'a TriggerSpec> {
@@ -333,13 +449,18 @@ fn sweep_stale_tasks<H: WorkerHost>(
     true
 }
 
-/// 心拍 1 回。展開 → due 取り出し → 分類 → 実行 → 後片付け。
+/// 心拍 1 回。展開 → due 取り出し → 分類 → **引き渡し** → 後片付け。
+///
+/// **実行そのものはここにいない** (#81)。心拍は「誰のどの予定が今やるべきものか」まで
+/// 判断して [`Dispatcher`] に渡し、結果を待たずに戻る。実行の中身は [`run_job`]。
 ///
 /// `now` を引数に取るのは意図的で、テストが時計を進めるだけでシナリオを書けるようにする
-/// ためであると同時に、**同一心拍内の全タスクが同じ `now` を見る**ことの保証でもある
-/// (1 件の tick() に時間がかかっても、後続タスクの遅延判定がそのぶんずれない)。
-pub(crate) fn heartbeat<H: WorkerHost>(
+/// ためであると同時に、**同一心拍内の全タスクが同じ `now` を見る**ことの保証でもある。
+/// 引き渡しになった今、この保証はむしろ強くなった — 以前は 1 件の `tick()` が長引くと
+/// 後続の分類が古い `now` で行われたが、今は分類が実行を待たない。
+pub(crate) fn heartbeat<H: WorkerHost, D: Dispatcher>(
     host: &mut H,
+    dispatcher: &mut D,
     specs: &[TriggerSpec],
     task_store: &Mutex<TaskStore>,
     state: &mut WorkerState,
@@ -373,7 +494,7 @@ pub(crate) fn heartbeat<H: WorkerHost>(
     //    tick() の実行時間ぶん待たされるのを避ける)。
     let due = lock_tasks(task_store).due(now);
 
-    // 4. 分類と実行。
+    // 4. 分類と引き渡し。
     let mut handled: Vec<String> = Vec::new();
     for task in due {
         let spec = task
@@ -388,7 +509,7 @@ pub(crate) fn heartbeat<H: WorkerHost>(
 
         let source = task.trigger_id.clone().unwrap_or_else(|| "__task__".into());
         match classify_due(&task, now, runtime_state, schedule_grace) {
-            Disposition::Run { delay_ms } => {
+            Disposition::Run { .. } => {
                 // classify_due が Run を返した = spec が実行可能な状態で揃っている。
                 let Some(spec) = spec else {
                     // trigger_id を持たないタスク (Phase 3 の自然言語タスク) は
@@ -405,38 +526,36 @@ pub(crate) fn heartbeat<H: WorkerHost>(
                     handled.push(task.id.clone());
                     continue;
                 };
-                let id = spec.id.as_str();
-                let current_state = host.read_state(id);
-                // scheduledAt / delayMs を渡すのは追加決定 11。遅延をどう伝えるかは
-                // framework が本文に前置きするのではなく、トリガー側に判断させる。
-                let ctx = serde_json::json!({
-                    "now": now,
-                    "state": current_state,
-                    "scheduledAt": task.scheduled_at,
-                    "delayMs": delay_ms,
-                });
-                match host.call_tick(id, ctx) {
-                    Ok(Some(res)) => {
-                        if let Some(notify) = res.notify {
-                            let title = notify.title.unwrap_or_else(|| spec.name.clone());
-                            host.notify(&title, &notify.body);
-                            // 通知は必ず観測面にも出す (#6)。OS 通知の描画に依存せず
-                            // 「秘書が何を言ったか」を UI から追えることが要件。
-                            host.activity(
-                                Activity::new(id, ActivityKind::Notify, notify.body)
-                                    .with_task(&task),
-                            );
-                        }
-                        if let Some(new_state) = res.state {
-                            host.write_state(id, new_state);
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        eprintln!("trigger '{id}' tick() error: {e}");
-                        host.activity(Activity::new(id, ActivityKind::Error, e).with_task(&task));
-                    }
+                // 同じトリガーの前の実行が終わるまで次は始めない (#81)。標準レーンは
+                // 作業員が複数いるので、印がタスク単位のままだと「手動実行 2 連打」や
+                // 「手動 + 定時」で同じトリガーが別々の isolate で並行に走り、state の
+                // 読み書きが後勝ちで潰し合う。**何も言わずに次の心拍へ送る** — 心拍が
+                // 自分で実行していた頃、後続は単に順番待ちだった。待ちきれない遅れは
+                // sweep が今までどおり掃除する。
+                if lock_tasks(task_store).has_in_flight_for(&spec.id) {
+                    continue;
                 }
+                // ここで心拍の仕事は終わる (#81)。実行の完了も、その後片付けも待たない。
+                //
+                // **`handled` に積まないことが要点。** 積むと step 5 が実行中のタスクを
+                // 消してしまい、途中でプロセスが落ちたときに再実行されなくなる
+                // (= at-least-once が壊れる)。消すのは実行し終えた側の責任で、
+                // [`TaskStore::finish`] がその 1 箇所である。
+                // 印は渡す**前**に付ける。executor が先に走り終えて [`TaskStore::finish`]
+                // を呼んだ後に付けると、二度と落ちない印が残る。
+                let task_id = task.id.clone();
+                lock_tasks(task_store).mark_in_flight(&task_id);
+                let handed = dispatcher.dispatch(Job {
+                    trigger_id: spec.id.clone(),
+                    trigger_name: spec.name.clone(),
+                    max_runtime: spec.max_runtime,
+                    lane: spec.lane,
+                    task,
+                });
+                if !handed {
+                    lock_tasks(task_store).clear_in_flight(&task_id);
+                }
+                continue;
             }
             Disposition::Orphaned => {
                 // discovery では見えているのに実行できない場合と、manifest から
@@ -505,7 +624,9 @@ pub(crate) fn heartbeat<H: WorkerHost>(
         handled.push(task.id.clone());
     }
 
-    // 5. 後片付け。実行後に消すことで at-least-once を保つ。
+    // 5. 後片付け。ここで消えるのは**実行に行かなかった**タスクだけ (破棄・停止・
+    //    未対応)。引き渡したものは [`run_job`] が実行し終えてから消す — 実行後に
+    //    消すことで at-least-once を保つ、という順序は移動しただけで生きている。
     //    展開だけがあった心拍でも境界が動いているので save は必要。
     if !handled.is_empty() || dirty {
         let mut store = lock_tasks(task_store);
@@ -514,6 +635,147 @@ pub(crate) fn heartbeat<H: WorkerHost>(
         }
         host.save_tasks(&store);
     }
+}
+
+/// 引き渡された仕事 1 件を実行する (#81)。心拍とは別のスレッドで走る。
+///
+/// # 副作用の順序は仕様である
+///
+/// state読 → tick(ctx) → notify → state保存 → タスク削除。**心拍が自分で実行していた頃と
+/// 同じ列で、根拠も変わっていない** ([`crate::worker`] のモジュール doc)。
+/// - notify が state 保存より先: プロセスクラッシュ時の at-least-once を優先
+/// - タスク削除が最後: 同じ理由。実行中に落ちたタスクはリストに残り、次回起動で再試行される
+///   — ただし**長レーンだけは逆**で、走らせる前に消す ([`Lane::at_most_once`])
+/// - tick() がエラーを返してもタスクは消す。schedule の意味を「実行を試みる時刻」に統一する
+///
+/// `now` は**実行の直前**に取った時刻。心拍が見た時刻ではない (順番待ちのぶん進んでいる)。
+pub(crate) fn run_job<H: ExecutorHost>(
+    host: &mut H,
+    task_store: &Mutex<TaskStore>,
+    job: Job,
+    now: u64,
+    schedule_grace: Duration,
+) {
+    let Job {
+        task,
+        trigger_id,
+        trigger_name,
+        max_runtime,
+        lane,
+    } = job;
+    let id = trigger_id.as_str();
+
+    // **猶予は走らせる直前にもう一度当てる。** 心拍は塞がらなくなったが executor は
+    // 直列なので、前の仕事が長ければ順番待ちで遅れる。配った時点では間に合っていた
+    // 予定が、番が来た頃には手遅れということが起こりうる。
+    //
+    // ここを置かないと #26 決定事項 8 (遅れた予定は実行しない) が引き渡しの向こう側で
+    // 静かに無効になる — 秘書が 30 分前の予定を今さら持ち出すことになる。判断そのものは
+    // 心拍と同じ [`classify_due`] を使う。paused は見ない (引き渡し時に見ている)。
+    // 手遅れの種別は**心拍と同じ語彙を使う** (`[skipped]` / `[expired]`)。同じ条件を指す
+    // 行が引き渡しのどちら側で出たかによって別の kind になると、観測面から追えなくなる。
+    // 違うのは「順番待ちのうちに」の一句だけで、そこだけが executor 固有の情報である。
+    // 由来による言い分けは `classify_due` が既にしているので、`task.origin` を見直さない。
+    let classified = match classify_due(
+        &task,
+        now,
+        Some(TriggerRuntimeState { paused: false }),
+        schedule_grace,
+    ) {
+        Disposition::Run { delay_ms } => Ok(delay_ms),
+        Disposition::SkippedLate { delay_ms } => Err((ActivityKind::Skipped, delay_ms)),
+        Disposition::Expired { delay_ms } => Err((ActivityKind::Expired, delay_ms)),
+        // **ここには来ない。** 引き渡し時に心拍が spec の存在と実行可能性を確かめており、
+        // paused も false で渡している。来たら分類の前提が壊れているので、通常経路と
+        // 同じ文言にしない (同じ行に見えると不変条件の破れに気づけない)。
+        other => {
+            host.activity(
+                Activity::new(
+                    id,
+                    ActivityKind::Error,
+                    format!("引き渡された仕事を分類できません: {other:?} (framework の不具合)"),
+                )
+                .with_task(&task),
+            );
+            finish_and_save(host, task_store, &task.id);
+            return;
+        }
+    };
+    let delay_ms = match classified {
+        Ok(delay_ms) => delay_ms,
+        Err((kind, delay_ms)) => {
+            host.activity(
+                Activity::new(
+                    id,
+                    kind,
+                    format!(
+                        "{} の予定が順番待ちのうちに猶予を超えた ({} 遅れ) ため\
+                         未実行のまま破棄しました",
+                        fmt_utc(task.scheduled_at),
+                        fmt_delay(delay_ms)
+                    ),
+                )
+                .with_task(&task),
+            );
+            finish_and_save(host, task_store, &task.id);
+            return;
+        }
+    };
+
+    // 長レーンは**走らせる前に**タスクを消す (#81)。実行の途中でプロセスが落ちても
+    // 次回起動でやり直さないための順序で、`at_most_once` の実体はこの 1 行である。
+    //
+    // 短いレーンは今までどおり最後に消す (at-least-once)。どちらを選ぶかは
+    // [`Lane::at_most_once`] に理由ごと書いてある。
+    if lane.at_most_once() {
+        finish_and_save(host, task_store, &task.id);
+    }
+
+    let current_state = host.read_state(id);
+    // scheduledAt / delayMs を渡すのは追加決定 11。遅延をどう伝えるかは
+    // framework が本文に前置きするのではなく、トリガー側に判断させる。
+    let ctx = serde_json::json!({
+        "now": now,
+        "state": current_state,
+        "scheduledAt": task.scheduled_at,
+        "delayMs": delay_ms,
+    });
+    match host.call_tick(id, ctx, max_runtime) {
+        Ok(Some(res)) => {
+            if let Some(notify) = res.notify {
+                let title = notify.title.unwrap_or(trigger_name);
+                host.notify(&title, &notify.body);
+                // 通知は必ず観測面にも出す (#6)。OS 通知の描画に依存せず
+                // 「秘書が何を言ったか」を UI から追えることが要件。
+                host.activity(
+                    Activity::new(id, ActivityKind::Notify, notify.body).with_task(&task),
+                );
+            }
+            if let Some(new_state) = res.state {
+                host.write_state(id, new_state);
+            }
+        }
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("trigger '{id}' tick() error: {e}");
+            host.activity(Activity::new(id, ActivityKind::Error, e).with_task(&task));
+        }
+    }
+
+    if !lane.at_most_once() {
+        finish_and_save(host, task_store, &task.id);
+    }
+}
+
+/// 実行し終えたタスクを片付けて永続化する。
+///
+/// **[`TaskStore::finish`] と保存を離さない**ための 1 箇所。消したのに保存しない経路が
+/// できると、次回起動でそのタスクがもう一度実行される。
+///
+fn finish_and_save<H: WorkerHost>(host: &mut H, task_store: &Mutex<TaskStore>, task_id: &str) {
+    let mut store = lock_tasks(task_store);
+    store.finish(task_id);
+    host.save_tasks(&store);
 }
 
 #[cfg(test)]
@@ -599,7 +861,7 @@ mod tests {
         }
     }
 
-    impl WorkerHost for FakeHost {
+    impl ExecutorHost for FakeHost {
         fn read_state(&mut self, trigger_id: &str) -> serde_json::Value {
             self.effects.push(Effect::ReadState(trigger_id.into()));
             self.states
@@ -621,6 +883,7 @@ mod tests {
             &mut self,
             trigger_id: &str,
             _ctx: serde_json::Value,
+            _budget: Duration,
         ) -> Result<Option<TickResult>, String> {
             self.effects.push(Effect::Tick(trigger_id.into()));
             // 同じトリガーが同一心拍で複数回 due になることがあるので、返答は消費しない。
@@ -634,7 +897,9 @@ mod tests {
         fn notify(&mut self, title: &str, body: &str) {
             self.effects.push(Effect::Notify(title.into(), body.into()));
         }
+    }
 
+    impl WorkerHost for FakeHost {
         fn activity(&mut self, activity: Activity) {
             self.activities.push(activity.clone());
             self.effects.push(Effect::Activity(
@@ -657,6 +922,56 @@ mod tests {
         }
     }
 
+    /// テスト用の [`Dispatcher`]。渡された仕事を溜めるだけ。
+    #[derive(Default)]
+    struct CollectingDispatcher {
+        jobs: Vec<Job>,
+    }
+
+    impl Dispatcher for CollectingDispatcher {
+        fn dispatch(&mut self, job: Job) -> bool {
+            self.jobs.push(job);
+            true
+        }
+    }
+
+    /// 心拍を 1 回回し、引き渡された仕事をその場で実行する。戻り値は実行されたトリガー id。
+    ///
+    /// **本番の順序をそのまま写している。** 心拍が一巡を終えてから executor が動くので、
+    /// 記録される列も「心拍の副作用 → 実行の副作用」になる。本番では実行が並行に走るが、
+    /// テストで並行にすると列がスレッドの都合で揺れて、順序を仕様として固定できない。
+    ///
+    /// 心拍側と実行側で host を分けないのは、見たいのが**副作用の列**であって所有関係では
+    /// ないため。`FakeHost` は [`WorkerHost`] と [`ExecutorHost`] の両方を実装している。
+    fn tick_once(
+        host: &mut FakeHost,
+        specs: &[TriggerSpec],
+        task_store: &Mutex<TaskStore>,
+        state: &mut WorkerState,
+        now: u64,
+        schedule_grace: Duration,
+    ) -> Vec<String> {
+        let mut dispatcher = CollectingDispatcher::default();
+        heartbeat(
+            host,
+            &mut dispatcher,
+            specs,
+            task_store,
+            state,
+            now,
+            schedule_grace,
+        );
+        let ran: Vec<String> = dispatcher
+            .jobs
+            .iter()
+            .map(|j| j.trigger_id.clone())
+            .collect();
+        for job in dispatcher.jobs {
+            run_job(host, task_store, job, now, schedule_grace);
+        }
+        ran
+    }
+
     /// テスト用のトリガー定義。デフォルトは「実行可能・停止していない」。
     fn spec(id: &str, schedule: &str) -> TriggerSpec {
         TriggerSpec {
@@ -668,6 +983,17 @@ mod tests {
             tz: "UTC".parse().unwrap(),
             paused: false,
             runnable: true,
+            max_runtime: Duration::from_secs(110),
+            lane: Lane::Standard,
+        }
+    }
+
+    /// 長レーンのトリガー定義 (#81)。`maxRuntimeSec` を宣言した状態に相当する。
+    fn long_spec(id: &str, schedule: &str) -> TriggerSpec {
+        TriggerSpec {
+            max_runtime: Duration::from_secs(600),
+            lane: Lane::Long,
+            ..spec(id, schedule)
         }
     }
 
@@ -740,7 +1066,7 @@ mod tests {
         let specs = vec![spec("hourly", "@hourly"), spec("daily", "@daily 06:00")];
         let store = store_of(vec![]);
 
-        heartbeat(&mut host, &specs, &store, &mut state, base(), grace());
+        tick_once(&mut host, &specs, &store, &mut state, base(), grace());
 
         // @hourly は 48h ぶんで 48 件 (起点 00:00 は「境界より後」なので含まれない)。
         // @daily 06:00 は 2 件 (初日と翌日)。
@@ -780,7 +1106,7 @@ mod tests {
         let specs = vec![spec("daily", "@daily 06:00")];
         let store = store_of(vec![]);
 
-        heartbeat(&mut host, &specs, &store, &mut state, base(), grace());
+        tick_once(&mut host, &specs, &store, &mut state, base(), grace());
 
         let tasks = lock_tasks(&store);
         let times: Vec<u64> = tasks.tasks.iter().map(|t| t.scheduled_at).collect();
@@ -795,12 +1121,12 @@ mod tests {
         let specs = vec![spec("hourly", "@hourly")];
         let store = store_of(vec![]);
 
-        heartbeat(&mut host, &specs, &store, &mut state, base(), grace());
+        tick_once(&mut host, &specs, &store, &mut state, base(), grace());
         let after_first = ids(&store);
         let saves_after_first = host.saves;
 
         // 1 分後。境界は now + 48h - 1m で、閾値 (now + 24h) にはまだ遠い。
-        heartbeat(
+        tick_once(
             &mut host,
             &specs,
             &store,
@@ -827,11 +1153,11 @@ mod tests {
 
         // 1 週間前に展開して、そこから 1 週間アプリを閉じていた状況を作る。
         let long_ago = base() - 7 * DAY;
-        heartbeat(&mut host, &specs, &store, &mut state, long_ago, grace());
+        tick_once(&mut host, &specs, &store, &mut state, long_ago, grace());
         // 積まれた過去タスクは検証対象ではないので捨てる (境界だけ残す)。
         lock_tasks(&store).tasks.clear();
 
-        heartbeat(&mut host, &specs, &store, &mut state, base(), grace());
+        tick_once(&mut host, &specs, &store, &mut state, base(), grace());
 
         let tasks = lock_tasks(&store);
         assert!(
@@ -858,13 +1184,24 @@ mod tests {
         let store = store_of(vec![]);
 
         // 00:00 に起動。01:00 / 02:00 / ... が積まれる。
-        heartbeat(&mut host, &specs, &store, &mut state, base(), grace());
+        tick_once(&mut host, &specs, &store, &mut state, base(), grace());
         // スリープ前に手動実行を予約した想定の ad-hoc を 1 件積む。
         lock_tasks(&store).insert(adhoc("manual-hourly-1", "hourly", base() + MINUTE));
 
         // 3 時間スリープして 03:00 ちょうどに復帰。
         let resumed = base() + 3 * HOUR;
-        heartbeat(&mut host, &specs, &store, &mut state, resumed, grace());
+        tick_once(&mut host, &specs, &store, &mut state, resumed, grace());
+        // 2 件とも同じトリガーなので、後の 1 件は次の心拍まで順番待ちになる (#81)。
+        // 同じ心拍で両方配ると、標準レーンの 2 人が同じトリガーを並行に走らせて
+        // state を潰し合う。
+        tick_once(
+            &mut host,
+            &specs,
+            &store,
+            &mut state,
+            resumed + MINUTE,
+            grace(),
+        );
 
         // 01:00 (2h 遅れ) と 02:00 (1h 遅れ) が猶予 (2 分) を超えて破棄される。
         // 2 件あるので 1 行に畳まれる (#53)。03:00 は遅れ 0 なので実行される。
@@ -896,9 +1233,9 @@ mod tests {
         let mut host = FakeHost::default().reply("hourly", Ok(Some(tick_result("定時報告"))));
         let store = store_of(vec![]);
 
-        heartbeat(&mut host, &specs, &store, &mut state, base(), grace());
+        tick_once(&mut host, &specs, &store, &mut state, base(), grace());
         // 01:00 の予定を 90 秒遅れで拾う (猶予 120 秒以内)。
-        heartbeat(
+        tick_once(
             &mut host,
             &specs,
             &store,
@@ -924,11 +1261,11 @@ mod tests {
         let mut host = FakeHost::default();
         let store = store_of(vec![]);
 
-        heartbeat(&mut host, &specs, &store, &mut state, base(), grace());
+        tick_once(&mut host, &specs, &store, &mut state, base(), grace());
         let boundary_before = boundary(&store, "hourly");
 
         specs[0].paused = true;
-        heartbeat(
+        tick_once(
             &mut host,
             &specs,
             &store,
@@ -955,7 +1292,7 @@ mod tests {
         let specs = vec![spec("hourly", "@hourly"), spec("daily", "@daily 06:00")];
         let store = store_of(vec![]);
 
-        heartbeat(&mut host, &specs, &store, &mut state, base(), grace());
+        tick_once(&mut host, &specs, &store, &mut state, base(), grace());
         let daily_before: Vec<String> = ids(&store)
             .into_iter()
             .filter(|id| id.starts_with("daily@"))
@@ -988,7 +1325,7 @@ mod tests {
         assert_eq!(boundary(&store, "daily"), daily_boundary);
 
         // 次の心拍で :30 グリッドに載り直す。
-        heartbeat(
+        tick_once(
             &mut host2,
             &restarted,
             &store,
@@ -1012,7 +1349,7 @@ mod tests {
         let mut host = FakeHost::default();
         let specs = vec![spec("hourly", "@hourly"), spec("daily", "@daily 06:00")];
         let store = store_of(vec![]);
-        heartbeat(&mut host, &specs, &store, &mut state, base(), grace());
+        tick_once(&mut host, &specs, &store, &mut state, base(), grace());
 
         // daily が manifest から消えた状態で再起動。
         let restarted = vec![spec("hourly", "@hourly")];
@@ -1051,7 +1388,7 @@ mod tests {
         // 前回起動時に積まれた予定が残っている状況。
         let store = store_of(vec![adhoc("manual-broken-1", "broken", base())]);
 
-        heartbeat(&mut host, &[broken], &store, &mut state, base(), grace());
+        tick_once(&mut host, &[broken], &store, &mut state, base(), grace());
 
         assert_eq!(host.count_kind(ActivityKind::Unavailable), 1);
         assert_eq!(host.count_kind(ActivityKind::Expanded), 0);
@@ -1073,7 +1410,7 @@ mod tests {
             created_at: base(),
         }]);
 
-        heartbeat(&mut host, &[], &store, &mut state, base(), grace());
+        tick_once(&mut host, &[], &store, &mut state, base(), grace());
 
         assert_eq!(host.count_kind(ActivityKind::Unsupported), 1);
         assert_eq!(host.activities()[0].0, "__task__");
@@ -1087,7 +1424,7 @@ mod tests {
         let mut host = FakeHost::default();
         let store = store_of(vec![adhoc("manual-ghost-1", "ghost", base())]);
 
-        heartbeat(&mut host, &[], &store, &mut state, base(), grace());
+        tick_once(&mut host, &[], &store, &mut state, base(), grace());
 
         assert_eq!(host.count_kind(ActivityKind::Orphaned), 1);
         assert!(ids(&store).is_empty());
@@ -1103,14 +1440,14 @@ mod tests {
         let mut host = FakeHost::default().reply("hourly", Ok(Some(tick_result("手動実行"))));
         let store = store_of(vec![]);
 
-        heartbeat(&mut host, &specs, &store, &mut state, base(), grace());
+        tick_once(&mut host, &specs, &store, &mut state, base(), grace());
         let boundary_before = boundary(&store, "hourly");
         let scheduled_before = ids(&store);
 
         // run_trigger_now 相当: 即 due な ad-hoc を積んで心拍を起こす。
         let manual_at = base() + MINUTE;
         lock_tasks(&store).insert(adhoc("manual-hourly-1", "hourly", manual_at));
-        heartbeat(&mut host, &specs, &store, &mut state, manual_at, grace());
+        tick_once(&mut host, &specs, &store, &mut state, manual_at, grace());
 
         assert!(host
             .effects
@@ -1128,7 +1465,7 @@ mod tests {
         let specs = vec![spec("hourly", "@hourly")];
         let store = store_of(vec![adhoc("manual-hourly-1", "hourly", base())]);
 
-        heartbeat(
+        tick_once(
             &mut host,
             &specs,
             &store,
@@ -1161,7 +1498,7 @@ mod tests {
         let store =
             store_without_expansion("hourly", vec![adhoc("manual-hourly-1", "hourly", base())]);
 
-        heartbeat(&mut host, &specs, &store, &mut state, base(), grace());
+        tick_once(&mut host, &specs, &store, &mut state, base(), grace());
 
         assert_eq!(
             host.effects,
@@ -1199,7 +1536,7 @@ mod tests {
             store_without_expansion("hourly", vec![adhoc("manual-hourly-1", "hourly", base())]);
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            heartbeat(&mut host, &specs, &store, &mut state, base(), grace());
+            tick_once(&mut host, &specs, &store, &mut state, base(), grace());
         }));
         assert!(result.is_err(), "write_state で panic するはず");
 
@@ -1243,7 +1580,7 @@ mod tests {
         let mut host = FakeHost::default().reply("hourly", Err("ReferenceError: x".into()));
         let store = store_of(vec![adhoc("manual-hourly-1", "hourly", base())]);
 
-        heartbeat(&mut host, &specs, &store, &mut state, base(), grace());
+        tick_once(&mut host, &specs, &store, &mut state, base(), grace());
 
         assert_eq!(host.count_kind(ActivityKind::Error), 1);
         assert!(!ids(&store).contains(&"manual-hourly-1".to_string()));
@@ -1258,15 +1595,23 @@ mod tests {
         let store =
             store_without_expansion("hourly", vec![adhoc("manual-hourly-1", "hourly", base())]);
 
-        heartbeat(&mut host, &specs, &store, &mut state, base(), grace());
+        tick_once(&mut host, &specs, &store, &mut state, base(), grace());
 
         assert!(!host.effects.iter().any(|e| matches!(e, Effect::Notify(..))));
         assert!(host.activities().is_empty());
     }
 
-    /// 同一心拍で複数トリガーが due になっても 1 回しか永続化しない。
+    /// 永続化の回数は「心拍 1 回 + 実行 1 件につき 1 回」に収まる (#81)。
+    ///
+    /// 心拍が自分で JS を回していた頃は 1 心拍 = 1 回だった。実行が別スレッドに出て
+    /// **完了時刻が心拍と揃わなくなった**ので、消すのは実行し終えた側になり、そのぶん
+    /// 書き込みが増える。
+    ///
+    /// 増分を実行件数に比例させたまま (件数と無関係に増えない) 抑えているのがこの
+    /// テストの主張である。`tasks.json` はファイル全体を書き直すため (#26 ストレージ
+    /// 判断)、ここが緩むと due が重なった心拍で書き込みが跳ねる。
     #[test]
-    fn one_save_per_heartbeat() {
+    fn saves_are_one_per_heartbeat_plus_one_per_run() {
         let mut state = WorkerState::default();
         let specs = vec![spec("a", "@hourly"), spec("b", "@hourly")];
         let mut host = FakeHost::default();
@@ -1275,10 +1620,380 @@ mod tests {
             adhoc("manual-b-1", "b", base()),
         ]);
 
-        heartbeat(&mut host, &specs, &store, &mut state, base(), grace());
+        let ran = tick_once(&mut host, &specs, &store, &mut state, base(), grace());
 
-        assert_eq!(host.saves, 1);
+        assert_eq!(ran.len(), 2, "2 件とも実行に回ること");
+        assert_eq!(host.saves, 1 + ran.len());
         assert!(host.saved.iter().all(|id| !id.starts_with("manual-")));
+    }
+
+    /// 実行中のタスクは、終わるまで次の心拍で配り直されない (#81)。
+    ///
+    /// **心拍が実行を待たなくなったことの裏返し。** 20 分かかる仕事は心拍を 20 回
+    /// またぐので、印が無ければ毎心拍もう一度 due に見えて 20 重に走る。
+    #[test]
+    fn an_in_flight_task_is_not_dispatched_again() {
+        let mut state = WorkerState::default();
+        let specs = vec![spec("slow", "@hourly")];
+        let mut host = FakeHost::default();
+        let store = store_of(vec![adhoc("manual-slow-1", "slow", base())]);
+
+        // 1 回目: 引き渡すが、実行はまだ終わっていない。
+        let mut dispatcher = CollectingDispatcher::default();
+        heartbeat(
+            &mut host,
+            &mut dispatcher,
+            &specs,
+            &store,
+            &mut state,
+            base(),
+            grace(),
+        );
+        assert_eq!(dispatcher.jobs.len(), 1);
+        assert!(lock_tasks(&store).in_flight.contains("manual-slow-1"));
+
+        // 実行中のまま心拍が 2 回進んでも、二度と配られない。
+        for _ in 0..2 {
+            let mut again = CollectingDispatcher::default();
+            heartbeat(
+                &mut host,
+                &mut again,
+                &specs,
+                &store,
+                &mut state,
+                base() + MINUTE,
+                grace(),
+            );
+            assert!(again.jobs.is_empty(), "実行中のタスクが配り直された");
+        }
+        // 掃除にも拾われない (猶予を超えて走り続けるのが長い仕事の正常系)。
+        assert!(lock_tasks(&store)
+            .tasks
+            .iter()
+            .any(|t| t.id == "manual-slow-1"));
+
+        // 終わればリストからも印からも消える。
+        for job in dispatcher.jobs {
+            run_job(&mut host, &store, job, base(), grace());
+        }
+        let store = lock_tasks(&store);
+        assert!(
+            !store.tasks.iter().any(|t| t.id == "manual-slow-1"),
+            "実行し終えたタスクがリストに残っている"
+        );
+        assert!(store.in_flight.is_empty());
+    }
+
+    /// 同じトリガーの別タスクは、前の実行が終わるまで配られない (#81)。
+    ///
+    /// **標準レーンは作業員が複数いる**ので、印がタスク単位のままだと「手動実行 2 連打」
+    /// で同じトリガーが 2 つの isolate で並行に走る。両方が `read_state` してから
+    /// `write_state` するので、後の書き込みが前の結果を黙って消す。仕様書 (#60 §6) が
+    /// 「前回が終わるまで次は始まりません」と約束している側でもある。
+    #[test]
+    fn a_second_task_of_a_running_trigger_waits_its_turn() {
+        let mut state = WorkerState::default();
+        let specs = vec![spec("busy", "@hourly")];
+        let mut host = FakeHost::default().reply("busy", Ok(Some(tick_result("ok"))));
+        // 手動実行 2 連打 = 同じトリガーの ad-hoc タスクが 2 件、どちらも即 due。
+        let store = store_of(vec![
+            adhoc("manual-busy-1", "busy", base()),
+            adhoc("manual-busy-2", "busy", base()),
+        ]);
+
+        let mut first = CollectingDispatcher::default();
+        heartbeat(
+            &mut host,
+            &mut first,
+            &specs,
+            &store,
+            &mut state,
+            base(),
+            grace(),
+        );
+        let handed: Vec<&str> = first.jobs.iter().map(|j| j.task.id.as_str()).collect();
+        assert_eq!(
+            handed,
+            vec!["manual-busy-1"],
+            "同じトリガーが二重に配られた"
+        );
+
+        // 1 件目が走っている間は、次の心拍でも 2 件目は出ない。
+        let mut during = CollectingDispatcher::default();
+        heartbeat(
+            &mut host,
+            &mut during,
+            &specs,
+            &store,
+            &mut state,
+            base() + MINUTE,
+            grace(),
+        );
+        assert!(during.jobs.is_empty(), "実行中に次が始まってしまった");
+
+        // 終われば次の心拍で配られる (ad-hoc の猶予は 24h なので捨てられない)。
+        for job in first.jobs {
+            run_job(&mut host, &store, job, base(), grace());
+        }
+        let mut after = CollectingDispatcher::default();
+        heartbeat(
+            &mut host,
+            &mut after,
+            &specs,
+            &store,
+            &mut state,
+            base() + 2 * MINUTE,
+            grace(),
+        );
+        let handed: Vec<&str> = after.jobs.iter().map(|j| j.task.id.as_str()).collect();
+        assert_eq!(handed, vec!["manual-busy-2"], "順番待ちが再開しない");
+    }
+
+    /// 渡せなかった仕事の印は落ちる (#81)。
+    ///
+    /// 印だけ残ると `due` からも `sweep_stale` からも外れ、**リストに残ったまま二度と
+    /// 動かず活動ログにも 1 行も出ない**タスクになる。V8 の初期化に失敗してレーンの
+    /// 作業員が全滅した場合がこれ。
+    #[test]
+    fn a_job_that_could_not_be_handed_over_is_not_left_marked() {
+        struct RefusingDispatcher;
+        impl Dispatcher for RefusingDispatcher {
+            fn dispatch(&mut self, _job: Job) -> bool {
+                false
+            }
+        }
+
+        let mut state = WorkerState::default();
+        let specs = vec![spec("hourly", "@hourly")];
+        let mut host = FakeHost::default();
+        let store = store_of(vec![adhoc("manual-hourly-1", "hourly", base())]);
+
+        heartbeat(
+            &mut host,
+            &mut RefusingDispatcher,
+            &specs,
+            &store,
+            &mut state,
+            base(),
+            grace(),
+        );
+
+        let tasks = lock_tasks(&store);
+        assert!(
+            tasks.in_flight.is_empty(),
+            "渡せなかったタスクに印が残っている"
+        );
+        assert!(
+            tasks.tasks.iter().any(|t| t.id == "manual-hourly-1"),
+            "渡せなかったタスクが消えている"
+        );
+    }
+
+    /// 長レーンの仕事は**走らせる前に**タスクが消える (#81 / at-most-once)。
+    ///
+    /// クラッシュしても次回起動でやり直さないことの実体。AI 呼び出しを何十回も積む
+    /// 仕事を黙って焼き直すとエンドユーザーの請求が倍になる (#71 / #72)。
+    #[test]
+    fn a_long_job_is_removed_before_it_runs() {
+        let specs = vec![long_spec("digest", "@hourly")];
+        let mut host = FakeHost::default().reply("digest", Ok(Some(tick_result("まとめました"))));
+        let store = store_of(vec![adhoc("manual-digest-1", "digest", base())]);
+
+        let mut dispatcher = CollectingDispatcher::default();
+        heartbeat(
+            &mut host,
+            &mut dispatcher,
+            &specs,
+            &store,
+            &mut WorkerState::default(),
+            base(),
+            grace(),
+        );
+        assert_eq!(dispatcher.jobs.len(), 1);
+        assert_eq!(dispatcher.jobs[0].lane, Lane::Long);
+
+        // tick が呼ばれた時点でタスクはもう残っていない。
+        for job in dispatcher.jobs {
+            run_job(&mut host, &store, job, base(), grace());
+        }
+        let saves_before_tick = host
+            .effects
+            .iter()
+            .position(|e| matches!(e, Effect::Tick(_)))
+            .expect("tick が呼ばれていない");
+        assert!(
+            host.effects[..saves_before_tick]
+                .iter()
+                .any(|e| matches!(e, Effect::Save(_))),
+            "tick より前にタスクリストが保存されていない (走ってから消している)"
+        );
+        assert!(!lock_tasks(&store)
+            .tasks
+            .iter()
+            .any(|t| t.id == "manual-digest-1"));
+    }
+
+    /// 標準レーンは今までどおり**走らせてから**消す (at-least-once)。
+    #[test]
+    fn a_standard_job_is_removed_after_it_runs() {
+        let specs = vec![spec("ping", "@hourly")];
+        let mut host = FakeHost::default().reply("ping", Ok(Some(tick_result("ok"))));
+        let store = store_of(vec![adhoc("manual-ping-1", "ping", base())]);
+
+        let mut dispatcher = CollectingDispatcher::default();
+        heartbeat(
+            &mut host,
+            &mut dispatcher,
+            &specs,
+            &store,
+            &mut WorkerState::default(),
+            base(),
+            grace(),
+        );
+        assert_eq!(dispatcher.jobs[0].lane, Lane::Standard);
+        for job in dispatcher.jobs {
+            run_job(&mut host, &store, job, base(), grace());
+        }
+
+        let tick_at = host
+            .effects
+            .iter()
+            .position(|e| matches!(e, Effect::Tick(_)))
+            .expect("tick が呼ばれていない");
+        let last_save = host
+            .effects
+            .iter()
+            .rposition(|e| matches!(e, Effect::Save(_)))
+            .expect("保存されていない");
+        assert!(last_save > tick_at, "実行より前に消している");
+    }
+
+    /// クラッシュ (state 保存中の panic) の後、標準レーンのタスクは残り、
+    /// 長レーンのタスクは残らない (#81)。
+    #[test]
+    fn a_crash_keeps_the_standard_task_but_not_the_long_one() {
+        for (spec_of, should_survive) in [
+            (spec as fn(&str, &str) -> TriggerSpec, true),
+            (long_spec as fn(&str, &str) -> TriggerSpec, false),
+        ] {
+            let specs = vec![spec_of("boom", "@hourly")];
+            let store = store_of(vec![adhoc("manual-boom-1", "boom", base())]);
+            // state 保存で落ちる = notify の後、タスクを消す前のクラッシュ。
+            let mut host = FakeHost::default().reply(
+                "boom",
+                Ok(Some(TickResult {
+                    state: Some(serde_json::json!({ "n": 1 })),
+                    ..tick_result("落ちる直前")
+                })),
+            );
+            host.panic_on_write_state = Some("boom".to_string());
+
+            let mut dispatcher = CollectingDispatcher::default();
+            heartbeat(
+                &mut host,
+                &mut dispatcher,
+                &specs,
+                &store,
+                &mut WorkerState::default(),
+                base(),
+                grace(),
+            );
+            let job = dispatcher.jobs.pop().expect("配られていない");
+            let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_job(&mut host, &store, job, base(), grace());
+            }));
+            assert!(crashed.is_err(), "クラッシュしていない");
+
+            let survived = lock_tasks(&store)
+                .tasks
+                .iter()
+                .any(|t| t.id == "manual-boom-1");
+            assert_eq!(
+                survived, should_survive,
+                "クラッシュ後のタスクの残り方がレーンの約束と違う"
+            );
+        }
+    }
+
+    /// 順番待ちのうちに猶予を使い切った仕事は、走らせずに捨てる (#81)。
+    ///
+    /// 心拍は塞がらなくなったが executor は直列なので、前の仕事が長ければ順番が回って
+    /// くる頃には手遅れということが起こる。#26 決定事項 8 が引き渡しの向こう側でも
+    /// 効いていることの主張。
+    #[test]
+    fn a_job_that_waited_too_long_in_the_queue_is_dropped() {
+        let mut state = WorkerState::default();
+        let specs = vec![spec("late", "@hourly")];
+        let mut host = FakeHost::default().reply("late", Ok(Some(tick_result("走ってしまった"))));
+        let store = store_of(vec![Task {
+            origin: TaskOrigin::Schedule,
+            ..adhoc("sched-late-1", "late", base())
+        }]);
+
+        let mut dispatcher = CollectingDispatcher::default();
+        heartbeat(
+            &mut host,
+            &mut dispatcher,
+            &specs,
+            &store,
+            &mut state,
+            base(),
+            grace(),
+        );
+        assert_eq!(dispatcher.jobs.len(), 1, "配られた時点では間に合っている");
+
+        // executor が前の仕事を抱えていて、番が回ってきたのは猶予を超えた後。
+        let too_late = base() + grace().as_millis() as u64 + MINUTE;
+        for job in dispatcher.jobs {
+            run_job(&mut host, &store, job, too_late, grace());
+        }
+
+        assert!(
+            !host.effects.iter().any(|e| matches!(e, Effect::Tick(_))),
+            "手遅れの予定が走ってしまった"
+        );
+        // schedule 由来なので心拍側と同じ `[skipped]`。手遅れの言い方は引き渡しの
+        // どちら側で出ても揃っていること。
+        assert_eq!(host.count_kind(ActivityKind::Skipped), 1);
+        assert!(host
+            .only(ActivityKind::Skipped)
+            .display()
+            .contains("順番待ち"));
+        assert!(lock_tasks(&store).in_flight.is_empty());
+    }
+
+    /// 実行中のタスクの後ろにある due なタスクは、いま配られる (#81)。
+    ///
+    /// `due()` の絞り込みが `take_while` の**後**にあることの主張。条件に混ぜると
+    /// 実行中のタスクで走査が止まり、後ろが心拍 1 回ぶん見えなくなる。
+    #[test]
+    fn a_task_behind_an_in_flight_one_is_still_dispatched() {
+        let mut state = WorkerState::default();
+        let specs = vec![spec("slow", "@hourly"), spec("quick", "@hourly")];
+        let mut host = FakeHost::default();
+        let store = store_of(vec![
+            adhoc("manual-slow-1", "slow", base()),
+            adhoc("manual-quick-1", "quick", base() + 1),
+        ]);
+        lock_tasks(&store).mark_in_flight("manual-slow-1");
+
+        let mut dispatcher = CollectingDispatcher::default();
+        heartbeat(
+            &mut host,
+            &mut dispatcher,
+            &specs,
+            &store,
+            &mut state,
+            base() + MINUTE,
+            grace(),
+        );
+
+        let ran: Vec<&str> = dispatcher
+            .jobs
+            .iter()
+            .map(|j| j.trigger_id.as_str())
+            .collect();
+        assert_eq!(ran, vec!["quick"]);
     }
 
     // ---- 長期停止からの復帰 (#50) --------------------------------------------
@@ -1295,7 +2010,7 @@ mod tests {
         {
             let mut warmup = FakeHost::default();
             let mut state = WorkerState::default();
-            heartbeat(&mut warmup, &specs, &store, &mut state, before, grace());
+            tick_once(&mut warmup, &specs, &store, &mut state, before, grace());
         }
         let stacked = ids(&store).len();
         assert!(stacked > 40, "前提: 相応の件数が積まれている ({stacked})");
@@ -1304,7 +2019,7 @@ mod tests {
         let mut host = FakeHost::default();
         let mut state = WorkerState::default();
         reconcile_at_startup(&mut host, &specs, &store, base());
-        heartbeat(&mut host, &specs, &store, &mut state, base(), grace());
+        tick_once(&mut host, &specs, &store, &mut state, base(), grace());
 
         // トリガーごとに 1 行だけ。
         assert_eq!(host.count_kind(ActivityKind::Stale), 2);
@@ -1327,7 +2042,7 @@ mod tests {
         assert!(host.effects.contains(&Effect::Tick("hourly".into())));
 
         // 続く心拍は静か。破棄済みなので同じ行が再び出ることはない。
-        heartbeat(
+        tick_once(
             &mut host,
             &specs,
             &store,
@@ -1350,9 +2065,9 @@ mod tests {
         let mut host = FakeHost::default();
         let store = store_of(vec![]);
 
-        heartbeat(&mut host, &specs, &store, &mut state, base(), grace());
+        tick_once(&mut host, &specs, &store, &mut state, base(), grace());
         // 再起動しない = reconcile_at_startup を通らないまま 2 日進む。
-        heartbeat(
+        tick_once(
             &mut host,
             &specs,
             &store,
@@ -1383,10 +2098,10 @@ mod tests {
         let mut host = FakeHost::default();
         let store = store_of(vec![]);
 
-        heartbeat(&mut host, &specs, &store, &mut state, base(), grace());
+        tick_once(&mut host, &specs, &store, &mut state, base(), grace());
         assert_eq!(host.sweeps, 1, "起動直後は必ず 1 回走る");
 
-        heartbeat(
+        tick_once(
             &mut host,
             &specs,
             &store,
@@ -1396,7 +2111,7 @@ mod tests {
         );
         assert_eq!(host.sweeps, 1, "閾値未満では走らない");
 
-        heartbeat(
+        tick_once(
             &mut host,
             &specs,
             &store,
@@ -1417,7 +2132,7 @@ mod tests {
         let store =
             store_without_expansion("hourly", vec![adhoc("manual-hourly-1", "hourly", base())]);
 
-        heartbeat(&mut host, &specs, &store, &mut state, base(), grace());
+        tick_once(&mut host, &specs, &store, &mut state, base(), grace());
 
         let notify = host.only(ActivityKind::Notify);
         let task = notify.task.as_ref().expect("通知はタスク由来");
@@ -1435,9 +2150,9 @@ mod tests {
         let mut host = FakeHost::default();
         let store = store_of(vec![]);
 
-        heartbeat(&mut host, &specs, &store, &mut state, base(), grace());
+        tick_once(&mut host, &specs, &store, &mut state, base(), grace());
         // 06:00 の予定を 3 時間遅れで拾う。積まれているのは 1 件だけ。
-        heartbeat(
+        tick_once(
             &mut host,
             &specs,
             &store,
@@ -1469,7 +2184,7 @@ mod tests {
         let mut host = FakeHost::default();
         let store = store_of(vec![]);
 
-        heartbeat(&mut host, &specs, &store, &mut state, base(), grace());
+        tick_once(&mut host, &specs, &store, &mut state, base(), grace());
 
         assert!(host.only(ActivityKind::Expanded).task.is_none());
     }
@@ -1482,7 +2197,7 @@ mod tests {
         let mut host = FakeHost::default();
         let store = store_of(vec![]);
 
-        heartbeat(&mut host, &specs, &store, &mut state, base(), grace());
+        tick_once(&mut host, &specs, &store, &mut state, base(), grace());
 
         assert_eq!(
             host.only(ActivityKind::Expanded).display(),

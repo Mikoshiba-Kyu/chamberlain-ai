@@ -5,7 +5,12 @@ import {
   type TriggerListItem,
   type TriggerSource,
 } from "../api";
-import { ConsentCard, RestartNotice, formatPermissions } from "./ConsentCard";
+import {
+  ConsentCard,
+  RestartNotice,
+  formatPermissions,
+  formatRuntime,
+} from "./ConsentCard";
 import { useBusyAction } from "./useBusyAction";
 
 interface Props {
@@ -47,9 +52,9 @@ export function TriggersPanel({
 }: Props) {
   // 下見が終わって同意待ちのトリガー。null の間は登録の口が閉じている。
   const [candidate, setCandidate] = useState<TriggerCandidate | null>(null);
-  const [confirmingUnregister, setConfirmingUnregister] = useState<string | null>(
-    null,
-  );
+  const [confirmingUnregister, setConfirmingUnregister] = useState<
+    string | null
+  >(null);
   const { busy, error, notice, setNotice, run } = useBusyAction();
 
   const pickFolder = () =>
@@ -128,6 +133,10 @@ export function TriggersPanel({
         <ul className="trigger-list">
           {triggers.map((t) => {
             const permissions = formatPermissions(t);
+            // 同意画面と同じ文言を出す (#81)。**同梱トリガーはここにしか出ない** —
+            // 確認画面を通らないので、長く走る / やり直されないことを読める場所が
+            // 一覧のほかに無い。
+            const runtime = formatRuntime(t);
             return (
               <li key={t.id} className="trigger-row">
                 <div className="trigger-meta">
@@ -149,6 +158,9 @@ export function TriggersPanel({
                   </div>
                   {permissions ? (
                     <div className="trigger-permissions">{permissions}</div>
+                  ) : null}
+                  {runtime ? (
+                    <div className="consent-runtime">{runtime}</div>
                   ) : null}
                   {t.error ? (
                     <div className="trigger-error">エラー: {t.error}</div>
@@ -202,7 +214,11 @@ function TriggerActions({
     return (
       <>
         <span className="status status-error">解除しますか？</span>
-        <button className="btn" onClick={() => onUnregister(t.id)} disabled={busy}>
+        <button
+          className="btn"
+          onClick={() => onUnregister(t.id)}
+          disabled={busy}
+        >
           解除する
         </button>
         <button className="btn" onClick={() => onAskUnregister(null)}>

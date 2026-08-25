@@ -51,8 +51,34 @@ export function formatConsentPermissions(
   );
 }
 
+/**
+ * 実行時間の宣言を 1 行にする (#81)。宣言していなければ null。
+ *
+ * **時間そのものより、宣言に付いてくる 2 つの約束の方が読み手には重い。** 長く走る
+ * ということは、その間 AI 呼び出しが使う人の実費で積み上がりうるということで、
+ * 落ちてもやり直されないということでもある。時間だけ出しても判断材料にならない。
+ */
+export function formatRuntime(
+  t: Partial<Pick<TriggerCandidate, "maxRuntimeSec">>,
+): string | null {
+  // `?? null` は core の pin だけ古い状態への保険 (formatPermissions と同じ理由)。
+  const secs = t.maxRuntimeSec ?? null;
+  if (secs === null) {
+    return null;
+  }
+  // 分に丸めるのは割り切れるときだけ。`Math.round` だと 150 秒が「最大 3 分」になり、
+  // **宣言より長い時間を見せる**ことになる (同意画面に出す数字は宣言と一致させる)。
+  const label =
+    secs >= 120 && secs % 60 === 0
+      ? `最大 ${secs / 60} 分`
+      : `最大 ${secs} 秒`;
+  return `${label}かかることがあります。長い実行の間 AI の利用料がかかることがあり、途中でアプリが終了した場合はやり直されません。`;
+}
+
 /** id が既存とぶつかっているときの注意書き。ぶつかっていなければ null。 */
-export function describeConflict(conflict: TriggerSource | null): string | null {
+export function describeConflict(
+  conflict: TriggerSource | null,
+): string | null {
   if (conflict === "bundled") {
     return "同じ id のトリガーがアプリに同梱されています。同梱された方が優先されるため、登録できません。";
   }
@@ -85,6 +111,7 @@ export function ConsentCard({
   onCancel,
 }: Props) {
   const conflictNote = describeConflict(candidate.conflict);
+  const runtimeNote = formatRuntime(candidate);
   // core の pin だけ古い状態でも落ちないように (formatPermissions と同じ理由)。
   const warnings = candidate.warnings ?? [];
 
@@ -108,6 +135,12 @@ export function ConsentCard({
         </dd>
         <dt>できること</dt>
         <dd>{formatConsentPermissions(candidate)}</dd>
+        {runtimeNote && (
+          <>
+            <dt>実行時間</dt>
+            <dd className="consent-runtime">{runtimeNote}</dd>
+          </>
+        )}
         <dt>場所</dt>
         <dd className="consent-path">{candidate.path}</dd>
       </dl>

@@ -1,7 +1,7 @@
 :root {
   color-scheme: light dark;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans JP",
-    sans-serif;
+  font-family:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans JP", sans-serif;
   font-size: 14px;
   line-height: 1.55;
 }
@@ -301,7 +301,11 @@ body {
 /* 出どころのバッジ (#58)。同梱は「アプリの形」、登録はエンドユーザーが足した仕事 */
 .trigger-name .status {
   margin-left: 8px;
-  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-family:
+    system-ui,
+    -apple-system,
+    "Segoe UI",
+    sans-serif;
   font-weight: 400;
 }
 
@@ -391,6 +395,9 @@ body {
   color: #6b6b6f;
 }
 
+/* 長く走る宣言 (#81)。「できること」の宣言と違って、読み手が負うのは時間と利用料と
+   やり直しの無さなので、警告と同じ色で他の行と区別する */
+.consent-runtime,
 .consent-warning {
   font-size: 13px;
   color: #96590a;
@@ -413,6 +420,7 @@ body {
   .consent-path {
     color: #a1a1a6;
   }
+  .consent-runtime,
   .consent-warning {
     color: #ffc978;
   }

@@ -72,6 +72,12 @@ export interface TriggerListItem {
    * 実行時登録 (#58) の同意画面はこの 2 つを見せる。
    */
   allowedHosts: string[];
+  /**
+   * 宣言された 1 回あたりの実行時間の上限 (秒) (#81)。宣言が無ければ null。
+   *
+   * これが入っているトリガーは既定の 110 秒より長く走り、**落ちてもやり直されない**。
+   */
+  maxRuntimeSec: number | null;
   /** 焼き込みか実行時登録か (#58)。解除できるのは `"registered"` だけ。 */
   source: TriggerSource;
 }
@@ -95,6 +101,8 @@ export interface TriggerCandidate {
   tz: string | null;
   requiredSecrets: string[];
   allowedHosts: string[];
+  /** 宣言された 1 回あたりの実行時間の上限 (秒) (#81)。宣言が無ければ null。 */
+  maxRuntimeSec: number | null;
   /**
    * 同じ id が既にある場合の相手。`"bundled"` は登録できない (同梱トリガーは
    * 乗っ取らせない)、`"registered"` は置き換え = 配布物の更新になる。
@@ -192,7 +200,8 @@ export const chamberlainApi = {
    * ダイアログは core が Rust 側で開く (フロントに dialog プラグインを足さないため)。
    * キャンセルは `null`、トリガーとして読めないフォルダは reject。
    */
-  pickTriggerFolder: () => invoke<TriggerCandidate | null>("pick_trigger_folder"),
+  pickTriggerFolder: () =>
+    invoke<TriggerCandidate | null>("pick_trigger_folder"),
   /**
    * 下見したフォルダを実際に取り込む。**反映は再起動から** (#58)。
    *
@@ -220,7 +229,8 @@ export const chamberlainApi = {
    */
   saveTriggerSkill: () => invoke<string | null>("save_trigger_skill"),
 
-  listDeclaredSecrets: () => invoke<DeclaredSecretItem[]>("list_declared_secrets"),
+  listDeclaredSecrets: () =>
+    invoke<DeclaredSecretItem[]>("list_declared_secrets"),
   hasSecret: (name: string) => invoke<boolean>("has_secret", { name }),
   setSecret: (name: string, value: string) =>
     invoke<void>("set_secret", { name, value }),

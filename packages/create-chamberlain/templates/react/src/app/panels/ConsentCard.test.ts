@@ -4,6 +4,7 @@ import {
   describeConflict,
   formatConsentPermissions,
   formatPermissions,
+  formatRuntime,
 } from "./ConsentCard";
 
 // 宣言は core が実際に強制している内容そのもの (#56 / #57)。表示が宣言と食い違うと
@@ -56,6 +57,33 @@ describe("formatConsentPermissions", () => {
     expect(
       formatConsentPermissions({ requiredSecrets: [], allowedHosts: [] }),
     ).toBe("鍵もネットワークも使いません (宣言なし)");
+  });
+});
+
+// #81。宣言していないトリガーと同じ画面に並ぶので、**違いが読み取れること**だけを固定する。
+describe("formatRuntime", () => {
+  it("宣言が無ければ何も出さない", () => {
+    // 既定 (110 秒) は今までどおりなので、わざわざ言うことが無い。
+    expect(formatRuntime({ maxRuntimeSec: null })).toBeNull();
+  });
+
+  it("core の pin が古くて欠けていても落ちない", () => {
+    expect(formatRuntime({})).toBeNull();
+  });
+
+  it("時間だけでなく、課金とやり直しの約束も言う", () => {
+    const note = formatRuntime({ maxRuntimeSec: 1800 });
+    expect(note).toContain("30 分");
+    expect(note).toContain("利用料");
+    expect(note).toContain("やり直されません");
+  });
+
+  it("2 分未満は秒のまま出す", () => {
+    expect(formatRuntime({ maxRuntimeSec: 111 })).toContain("111 秒");
+  });
+
+  it("割り切れない秒数を分に丸めない (宣言より長く見せない)", () => {
+    expect(formatRuntime({ maxRuntimeSec: 150 })).toContain("150 秒");
   });
 });
 

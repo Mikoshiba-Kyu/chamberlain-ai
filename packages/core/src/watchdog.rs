@@ -62,7 +62,6 @@ struct Watch {
 /// 1 つの Runtime に 1 つ。JS は直列にしか動かないので、締め切りも常に 1 つで足りる。
 pub(crate) struct Watchdog {
     shared: Arc<(Mutex<Watch>, Condvar)>,
-    budget: Duration,
     /// [`Drop`] で畳むために持つ。`None` になるのは drop 中だけ。
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -84,7 +83,7 @@ impl Watchdog {
         let handle = runtime.deno_runtime().v8_isolate().thread_safe_handle();
         Ok((
             runtime,
-            Self::spawn(budget, move || {
+            Self::spawn(move || {
                 handle.terminate_execution();
             }),
         ))
@@ -96,13 +95,12 @@ impl Watchdog {
     /// 間に合ったか / 叩いたかの判定を V8 抜きで試験するため — ここで間違えると
     /// 「叩き漏らす」か「無関係な実行を巻き込む」のどちらかになり、どちらも本物の
     /// Runtime 越しには再現しづらい。
-    fn spawn(budget: Duration, interrupt: impl Fn() + Send + 'static) -> Self {
+    fn spawn(interrupt: impl Fn() + Send + 'static) -> Self {
         let shared = Arc::new((Mutex::new(Watch::default()), Condvar::new()));
         let for_thread = Arc::clone(&shared);
         let thread = std::thread::spawn(move || watch(&for_thread, interrupt));
         Self {
             shared,
-            budget,
             thread: Some(thread),
         }
     }
@@ -112,12 +110,31 @@ impl Watchdog {
     /// 戻り値のエラーは表示用の文字列。予算超過は 2 通りの止め方のどちらで止まっても
     /// **同じ 1 文**に正規化する — 観測面から見て意味があるのは「予算を使い切って
     /// 中断された」の 1 つで、どちらの仕組みが拾ったかは内部事情である。
+    /// 予算はこの 1 回のためのもの (#81)。トリガーが `maxRuntimeSec` を宣言して
+    /// いればその値が入る。
+    ///
+    /// **止め方 2 通りのうち、ここで指定した値ちょうどで止まるのは同期のループだけ。**
+    /// 非同期の待ちを止めるのは `RuntimeOptions::timeout` で、こちらは Runtime 生成時に
+    /// 固定である ([`Self::guarding`] に渡した値 = そのレーンの上限)。
+    ///
+    /// つまり `budget` がレーンの上限より短いとき、**非同期側の締め切りはレーンの上限に
+    /// なる**。`maxRuntimeSec: 120` を宣言したトリガーが解決しない Promise を待つと、
+    /// 同期ループなら 120 秒で止まるが、待ちは長レーンの上限 (30 分) まで伸びる。
+    ///
+    /// これを許しているのは、`chamberlain.*` の非同期 op が個別に上限を持っているため
+    /// (`ai.complete` は 90 秒、`http.fetch` は 30 秒)。解決しない待ちを作るには
+    /// `new Promise(() => {})` を自分で書く必要があり、その場合でも占有されるのは
+    /// そのレーンの作業員 1 人に留まる。
+    ///
+    /// **既定のまま (宣言なし) のトリガーには非対称が無い。** 標準レーンの上限と
+    /// `JS_BUDGET` が同じ値なので、どちらの止め方も 110 秒ちょうどで効く。
     pub(crate) fn guard<T>(
         &self,
+        budget: Duration,
         runtime: &mut rustyscript::Runtime,
         f: impl FnOnce(&mut rustyscript::Runtime) -> Result<T, rustyscript::Error>,
     ) -> Result<T, String> {
-        self.arm();
+        self.arm(budget);
         let result = f(runtime);
         let interrupted = self.disarm();
         if interrupted {
@@ -134,7 +151,7 @@ impl Watchdog {
             if interrupted || matches!(e, rustyscript::Error::Timeout(_)) {
                 format!(
                     "実行が {} 秒の上限を超えたため中断しました",
-                    self.budget.as_secs()
+                    budget.as_secs()
                 )
             } else {
                 e.to_string()
@@ -143,8 +160,8 @@ impl Watchdog {
     }
 
     /// 締め切りを立てる。番犬は寝ているか前の締め切りを待っているので、起こして読み直させる。
-    fn arm(&self) {
-        let deadline = Instant::now() + self.budget;
+    fn arm(&self, budget: Duration) {
+        let deadline = Instant::now() + budget;
         let (lock, cvar) = &*self.shared;
         let mut w = lock.lock().unwrap_or_else(|e| e.into_inner());
         w.deadline = Some(deadline);
@@ -219,13 +236,13 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// 叩かれた回数を数えるだけの番犬。V8 を起こさずに締め切りの判定だけを見る。
-    fn counting(budget_ms: u64) -> (Watchdog, Arc<AtomicUsize>) {
+    fn counting(budget_ms: u64) -> (Watchdog, Duration, Arc<AtomicUsize>) {
         let hits = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&hits);
-        let dog = Watchdog::spawn(Duration::from_millis(budget_ms), move || {
+        let dog = Watchdog::spawn(move || {
             counter.fetch_add(1, Ordering::SeqCst);
         });
-        (dog, hits)
+        (dog, Duration::from_millis(budget_ms), hits)
     }
 
     fn hits(counter: &Arc<AtomicUsize>) -> usize {
@@ -235,8 +252,8 @@ mod tests {
     /// 予算を超えた実行は叩かれ、`disarm` がそれを申告する。
     #[test]
     fn an_overrunning_run_is_interrupted() {
-        let (dog, counter) = counting(50);
-        dog.arm();
+        let (dog, budget, counter) = counting(50);
+        dog.arm(budget);
         std::thread::sleep(Duration::from_millis(150));
         assert!(dog.disarm(), "予算超過が申告されていない");
         assert_eq!(hits(&counter), 1);
@@ -245,8 +262,8 @@ mod tests {
     /// 間に合った実行は叩かれない。
     #[test]
     fn a_run_within_the_budget_is_left_alone() {
-        let (dog, counter) = counting(1000);
-        dog.arm();
+        let (dog, budget, counter) = counting(1000);
+        dog.arm(budget);
         std::thread::sleep(Duration::from_millis(20));
         assert!(!dog.disarm());
         assert_eq!(hits(&counter), 0);
@@ -256,9 +273,9 @@ mod tests {
     /// (累計は予算を超えるが、1 回あたりは超えていない)。
     #[test]
     fn each_run_gets_a_fresh_budget() {
-        let (dog, counter) = counting(150);
+        let (dog, budget, counter) = counting(150);
         for _ in 0..6 {
-            dog.arm();
+            dog.arm(budget);
             std::thread::sleep(Duration::from_millis(40));
             assert!(!dog.disarm());
         }
@@ -268,12 +285,12 @@ mod tests {
     /// 叩かれた実行の次は、また間に合う判定に戻る (`fired` が持ち越されない)。
     #[test]
     fn the_verdict_does_not_leak_into_the_next_run() {
-        let (dog, counter) = counting(50);
-        dog.arm();
+        let (dog, budget, counter) = counting(50);
+        dog.arm(budget);
         std::thread::sleep(Duration::from_millis(150));
         assert!(dog.disarm());
 
-        dog.arm();
+        dog.arm(budget);
         std::thread::sleep(Duration::from_millis(10));
         assert!(!dog.disarm(), "前の実行の判定が持ち越されている");
         assert_eq!(hits(&counter), 1);
@@ -282,7 +299,7 @@ mod tests {
     /// JS が動いていない間は締め切りが無いので、いくら待っても叩かれない。
     #[test]
     fn an_idle_watchdog_never_fires() {
-        let (_dog, counter) = counting(50);
+        let (_dog, _budget, counter) = counting(50);
         std::thread::sleep(Duration::from_millis(150));
         assert_eq!(hits(&counter), 0);
     }
@@ -302,10 +319,11 @@ mod tests {
 
     fn tick<T: serde::de::DeserializeOwned>(
         dog: &Watchdog,
+        budget: Duration,
         runtime: &mut rustyscript::Runtime,
         handle: &rustyscript::ModuleHandle,
     ) -> Result<T, String> {
-        dog.guard(runtime, |rt| {
+        dog.guard(budget, runtime, |rt| {
             rt.call_function(Some(handle), "tick", rustyscript::json_args!())
         })
     }
@@ -317,8 +335,9 @@ mod tests {
     /// 要ることになる。止め方 2 通りのどちらで止まっても同じ結末になることを、同じ
     /// 手順で 2 回確かめる。
     fn a_hang_is_cut_and_the_neighbour_survives(name: &str, source: &str) {
-        let (mut runtime, dog) = Watchdog::guarding(Duration::from_millis(300), Default::default())
-            .expect("failed to init JS runtime");
+        let budget = Duration::from_millis(300);
+        let (mut runtime, dog) =
+            Watchdog::guarding(budget, Default::default()).expect("failed to init JS runtime");
         let hung = load(&mut runtime, name, source);
         let neighbour = load(
             &mut runtime,
@@ -326,12 +345,12 @@ mod tests {
             "export function tick() { return 'まだ動きます'; }",
         );
 
-        let err = tick::<serde_json::Value>(&dog, &mut runtime, &hung)
+        let err = tick::<serde_json::Value>(&dog, budget, &mut runtime, &hung)
             .expect_err("返ってこない JS が中断されていない");
         assert!(err.contains("上限を超えた"), "{err}");
 
         let survived: String =
-            tick(&dog, &mut runtime, &neighbour).expect("隣のトリガーが動かない");
+            tick(&dog, budget, &mut runtime, &neighbour).expect("隣のトリガーが動かない");
         assert_eq!(survived, "まだ動きます");
     }
 
@@ -357,15 +376,16 @@ mod tests {
     /// 混ぜると、観測面から原因の切り分けができなくなる。
     #[test]
     fn an_ordinary_js_error_keeps_its_own_message() {
-        let (mut runtime, dog) = Watchdog::guarding(Duration::from_secs(10), Default::default())
-            .expect("failed to init JS runtime");
+        let budget = Duration::from_secs(10);
+        let (mut runtime, dog) =
+            Watchdog::guarding(budget, Default::default()).expect("failed to init JS runtime");
         let boom = load(
             &mut runtime,
             "boom.js",
             "export function tick() { throw new Error('壊れています'); }",
         );
 
-        let err = tick::<serde_json::Value>(&dog, &mut runtime, &boom)
+        let err = tick::<serde_json::Value>(&dog, budget, &mut runtime, &boom)
             .expect_err("投げたのに成功している");
         assert!(err.contains("壊れています"), "{err}");
         assert!(!err.contains("上限を超えた"), "{err}");
