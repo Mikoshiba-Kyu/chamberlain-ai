@@ -10,6 +10,7 @@ import {
   RestartNotice,
   formatPermissions,
   formatRuntime,
+  formatTokenBudget,
 } from "./ConsentCard";
 import { useBusyAction } from "./useBusyAction";
 
@@ -137,6 +138,11 @@ export function TriggersPanel({
             // 確認画面を通らないので、長く走る / やり直されないことを読める場所が
             // 一覧のほかに無い。
             const runtime = formatRuntime(t);
+            // 消費の見積もりも同意画面と同じものを出す (#82)。**同梱トリガーは
+            // 確認画面を通らない**ので、ここに出さないとアプリに元から入っている
+            // トリガーの消費だけがどこからも読めない。構成エラーのトリガーを外すのは
+            // core の仕事で、その場合は null が返る。
+            const budget = formatTokenBudget(t);
             return (
               <li key={t.id} className="trigger-row">
                 <div className="trigger-meta">
@@ -161,6 +167,9 @@ export function TriggersPanel({
                   ) : null}
                   {runtime ? (
                     <div className="consent-runtime">{runtime}</div>
+                  ) : null}
+                  {budget ? (
+                    <div className="consent-budget">{budget}</div>
                   ) : null}
                   {t.error ? (
                     <div className="trigger-error">エラー: {t.error}</div>

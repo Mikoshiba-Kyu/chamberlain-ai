@@ -5,6 +5,7 @@ import {
   formatConsentPermissions,
   formatPermissions,
   formatRuntime,
+  formatTokenBudget,
 } from "./ConsentCard";
 
 // 宣言は core が実際に強制している内容そのもの (#56 / #57)。表示が宣言と食い違うと
@@ -84,6 +85,56 @@ describe("formatRuntime", () => {
 
   it("割り切れない秒数を分に丸めない (宣言より長く見せない)", () => {
     expect(formatRuntime({ maxRuntimeSec: 150 })).toContain("150 秒");
+  });
+});
+
+// #82。**承認する前に、増える消費が見える**ようにするための行なので、掛け算と
+// 「月あたりが無い場合」だけ固定する。
+describe("formatTokenBudget", () => {
+  it("1 回あたりと月あたりを掛け算して出す", () => {
+    const note = formatTokenBudget({
+      maxTokensPerRun: 24576,
+      runsPerMonth: 8928,
+    });
+    expect(note).toContain("24,576");
+    expect(note).toContain("8,928");
+    expect(note).toContain("219,414,528");
+  });
+
+  it("1 回きりのトリガーに月あたりを出さない", () => {
+    // `@at` に「月あたり 0 回」と書くと AI を使わないように読める。
+    const note = formatTokenBudget({ maxTokensPerRun: 4096, runsPerMonth: null });
+    expect(note).toContain("1 回だけ");
+    expect(note).not.toContain("月あたり");
+  });
+
+  it("金額には換算しない", () => {
+    // 単価を持つと、その表の陳腐化を追い続けることになる (#71 / #27)。
+    const note = formatTokenBudget({
+      maxTokensPerRun: 24576,
+      runsPerMonth: 31,
+    });
+    expect(note).not.toMatch(/[¥$]/);
+    expect(note).toContain("単価");
+  });
+
+  it("32bit を超える見積もりでも桁が壊れない", () => {
+    // core は u32 なのでここで掛ける。飽和させると天井が実際より小さく見える。
+    const note = formatTokenBudget({
+      maxTokensPerRun: 4122880,
+      runsPerMonth: 8928,
+    });
+    expect(note).toContain("36,809,072,640");
+  });
+
+  it("見積もりが出せないトリガーには何も出さない", () => {
+    // 構成エラーのトリガーは core が両方 null で返す (#82)。UI 側で `error` を
+    // 見に行かないための約束なので、ここで固定しておく。
+    expect(
+      formatTokenBudget({ maxTokensPerRun: null, runsPerMonth: null }),
+    ).toBeNull();
+    // core の pin だけ古くてフィールドごと欠けている場合も同じ。
+    expect(formatTokenBudget({})).toBeNull();
   });
 });
 

@@ -50,6 +50,14 @@ const OBSERVED_SECS: u32 = 60;
 pub const MAX_ALLOWED_MAX_TOKENS: u32 =
     OBSERVED_MAX_TOKENS * (ANTHROPIC_TIMEOUT_SECS as u32) / OBSERVED_SECS;
 
+/// モデルに入る入力の上限 (Claude のコンテキスト窓)。
+///
+/// **入力側には時間の縛りが効かない。** 出力は生成速度に律速されるので
+/// [`MAX_ALLOWED_MAX_TOKENS`] が timeout から導けるが、prompt の処理は速く、
+/// 1 回の呼び出しに詰め込める入力量を決めているのはコンテキスト窓の方である。
+/// run 単位の予算の天井 (`crate::MAX_ALLOWED_MAX_TOKENS_PER_RUN`) がこれを使う。
+pub const MAX_CONTEXT_TOKENS: u32 = 200_000;
+
 /// Anthropic 用の reqwest Client を 1 個だけ持ち、connection pool と TLS session を
 /// 使い回す (呼び出しごとに作ると TLS handshake が毎回走る)。build 失敗は初回参照時に
 /// panic するが、timeout 指定と rustls-tls feature の組合せで失敗する理由が無いので許容。
@@ -258,6 +266,21 @@ impl Usage {
     /// これになる。
     pub fn is_zero(&self) -> bool {
         *self == Self::default()
+    }
+
+    /// 1 回の呼び出しが消費したトークンの総数 (#82)。run 単位の予算がこれを積む。
+    ///
+    /// **4 項目を全部足す。** キャッシュ読みは単価が安いが 0 ではなく、予算は金額では
+    /// なくトークンで持つと決めてある (#71 の「換算しない」の帰結) 以上、項目ごとに
+    /// 重みを付ける根拠がこの層には無い。
+    ///
+    /// `u64` で返すのは、run の合計が呼び出し回数だけ積み上がるため。1 回分は u32 に
+    /// 収まるが、合計は収まる保証が無い。
+    pub fn total(&self) -> u64 {
+        u64::from(self.input_tokens)
+            + u64::from(self.output_tokens)
+            + u64::from(self.cache_creation_input_tokens)
+            + u64::from(self.cache_read_input_tokens)
     }
 
     /// 活動ログの本文に消費を添える。0 のときは何も足さない — **添えない行は
@@ -525,6 +548,10 @@ fn checked_max_tokens(requested: Option<u32>) -> Result<u32, JsErrorBox> {
 /// **応答が `maxTokens` で切れたら例外にする** (#68)。「切れた要約を通知した」より
 /// 「要約に失敗した」の方が秘書として正しい。長い応答が要るトリガーは `maxTokens` を
 /// 上げる。
+///
+/// **1 回の実行で消費できる総量には天井がある** (#82)。`maxTokens` は 1 回あたりの
+/// 上限にすぎず、回数に上限が無い状態では 1 run の消費が青天井になる。予算を使い切った
+/// 後の呼び出しは例外になり、`[denied]` が残る。
 #[op2(async)]
 #[string]
 pub async fn op_chamberlain_ai_complete(
@@ -539,11 +566,17 @@ pub async fn op_chamberlain_ai_complete(
     let api_key = {
         let mut state = state.borrow_mut();
 
+        // 予算の判定が先 (#82)。断った呼び出しは `[denied]` として残り、`[ai]` には
+        // 現れない — 呼びに行っていないものを「呼び出しの量」に数えると、予算が
+        // 効いているほど使ったように見える。
+        //
         // 記録は呼び出しの「試行」に対して残す。キー未設定や API エラーで落ちた場合も
         // 呼びに行ったこと自体は事実で、抑えたいのは呼び出しの量だから。
-        state
-            .borrow_mut::<TriggerPermissions>()
-            .record_ai_call(model);
+        let perms = state.borrow_mut::<TriggerPermissions>();
+        perms
+            .authorize_ai_call(max_tokens)
+            .map_err(JsErrorBox::generic)?;
+        perms.record_ai_call(model);
 
         let service = state.borrow::<SecretsService>().0.clone();
         secret_store::get(&service, ANTHROPIC_API_KEY_NAME)
@@ -556,19 +589,27 @@ pub async fn op_chamberlain_ai_complete(
         content: args.prompt,
     }];
 
-    let Response {
-        content: text,
-        stop,
-        usage,
-    } = complete(
+    let response = complete(
         &api_key,
         Some(model),
         args.system.as_deref(),
         &messages,
         max_tokens,
     )
-    .await
-    .map_err(JsErrorBox::generic)?;
+    .await;
+
+    // 予約 (#82) は成否に関わらずここで外す。**`?` より先に。** 落ちた呼び出しの予約を
+    // 残すと、返ってこなかったぶんだけ予算が目減りしたまま実行が続く。
+    state
+        .borrow_mut()
+        .borrow_mut::<TriggerPermissions>()
+        .release_ai_reservation(max_tokens);
+
+    let Response {
+        content: text,
+        stop,
+        usage,
+    } = response.map_err(JsErrorBox::generic)?;
 
     // 消費を呼び出しの行に足す (#71)。**切り捨ての分岐より先に。** 切れた応答は
     // `max_tokens` を吐き切っているので消費は最大で、そこを例外の陰で落とすと
@@ -597,6 +638,69 @@ pub async fn op_chamberlain_ai_complete(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::permissions::TriggerGrants;
+    use crate::trigger_runtime_options;
+    use std::collections::BTreeMap;
+
+    /// 予算を使い切った後の `ai.complete` は **JS に例外として届き、ネットワークには
+    /// 出ない** (#82)。
+    ///
+    /// このテストがネットワークもキーも要らないこと自体が主張である — 判定が呼び出しの
+    /// 手前にあるなら、API キーを読むより先に落ちるはずで、`SecretsService` を
+    /// `OpState` に置いていないのに動くことがその証拠になる。
+    #[test]
+    fn a_call_over_the_budget_is_rejected_before_anything_is_sent() {
+        // 本番の worker と同じ構成で立てる (`trigger_runtime_options`)。ここで
+        // 組み直すと、拡張が変わったときに別の isolate に対して合格し続ける。
+        let mut runtime = rustyscript::Runtime::new(trigger_runtime_options())
+            .expect("failed to init JS runtime");
+        {
+            let op_state = runtime.deno_runtime().op_state();
+            let mut op_state = op_state.borrow_mut();
+            let grants = TriggerGrants {
+                max_tokens_per_run: 100,
+                ..Default::default()
+            };
+            let mut perms = TriggerPermissions::new(BTreeMap::from([("t".to_string(), grants)]));
+            perms.enter("t");
+            op_state.put(perms);
+        }
+
+        let module = rustyscript::Module::new(
+            "over-budget.ts",
+            r#"
+            export async function tick() {
+              try {
+                await chamberlain.ai.complete({ prompt: "hi", maxTokens: 200 });
+                return "reached the API";
+              } catch (e) {
+                return String(e);
+              }
+            }
+            "#,
+        );
+        let handle = runtime.load_module(&module).expect("failed to load module");
+        let result: String = runtime
+            .call_function(Some(&handle), "tick", rustyscript::json_args!())
+            .expect("tick failed");
+
+        assert!(
+            result.contains("maxTokensPerRun"),
+            "予算超過が送信前に落ちていない: {result}"
+        );
+
+        let op_state = runtime.deno_runtime().op_state();
+        let recorded = op_state
+            .borrow_mut()
+            .borrow_mut::<TriggerPermissions>()
+            .leave();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "拒否が観測面に残っていない: {recorded:?}"
+        );
+        assert_eq!(recorded[0].trigger_id.as_deref(), Some("t"));
+    }
 
     fn convo(contents: &[&str]) -> Vec<Message> {
         contents

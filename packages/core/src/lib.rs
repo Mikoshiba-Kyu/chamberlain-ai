@@ -107,6 +107,37 @@ const JS_BUDGET: Duration = Duration::from_secs(110);
 /// 消費そのものの天井ではない — それは #82 が別に持つ。
 const MAX_RUNTIME: Duration = Duration::from_secs(30 * 60);
 
+/// 1 回の実行に `ai.complete` が消費してよいトークンの既定値 (#82)。
+///
+/// **[`JS_BUDGET`] と同じ発想の、消費側の天井である。** 時間の予算は 1 run を物理的に
+/// 閉じるが、消費は閉じない — 短い呼び出しなら 110 秒でも何度でも積める。そして
+/// `@every 5m` は 1 日 288 回走る。**トリガーの形では、コストは「頻度 × 出力トークン」で
+/// 決まる**ので、1 run あたりの消費に上限が無いと、トリガーの書き方だけでエンドユーザーの
+/// 請求が桁で動く。
+///
+/// **回数ではなくトークンで持つ。** 10 件を要約するトリガーは 10 回呼んで正しく、回数の
+/// 上限は正常系を壊す。
+///
+/// 既定は「最大サイズの呼び出し ([`ai::MAX_ALLOWED_MAX_TOKENS`]) 4 回分」。1 回分にすると
+/// #68 の逃げ道 (`maxTokens` を上げる) を使ったトリガーが 1 回しか呼べなくなり、桁を
+/// 上げると宣言しないまま `@every 5m` で回るトリガーが月あたり億のオーダーに届く。
+/// **宣言せずに書けるのは「1 回の実行で AI を数回呼ぶ」形まで**、という線である。
+const DEFAULT_MAX_TOKENS_PER_RUN: u32 = ai::MAX_ALLOWED_MAX_TOKENS * 4;
+
+/// `maxTokensPerRun` に宣言できる上限 (#82)。
+///
+/// **1 run が物理的に消費しうる量から導く。** 手で置いた数字にすると、到達できない量を
+/// 案内した瞬間にそれは天井として機能しなくなる (#68 の
+/// `the_ceiling_is_reachable_within_the_timeout` と同じ論法)。
+///
+/// 積める呼び出しの回数は既に 2 つの時間で決まっている — 1 run の上限 ([`MAX_RUNTIME`])
+/// を 1 呼び出しの上限 ([`ai::ANTHROPIC_TIMEOUT_SECS`]) で割ったもの。その各回が出力を
+/// 上限まで吐き ([`ai::MAX_ALLOWED_MAX_TOKENS`])、入力をコンテキスト窓いっぱいまで
+/// 詰めた ([`ai::MAX_CONTEXT_TOKENS`]) 場合が、1 run の消費の物理的な上界になる。
+const MAX_ALLOWED_MAX_TOKENS_PER_RUN: u32 = (MAX_RUNTIME.as_secs() as u32
+    / ai::ANTHROPIC_TIMEOUT_SECS as u32)
+    * (ai::MAX_ALLOWED_MAX_TOKENS + ai::MAX_CONTEXT_TOKENS);
+
 /// 心拍から渡された仕事を実際に走らせる作業員の数 (#81)。
 ///
 /// **2 つのレーンに分かれている。** どちらに入るかは manifest の `maxRuntimeSec` を
@@ -236,13 +267,26 @@ struct TriggerManifest {
     /// 同じ方針) — 黙って丸めると、宣言と実際の上限がずれたまま気づけない。
     #[serde(default, rename = "maxRuntimeSec")]
     max_runtime_sec: Option<u64>,
+    /// 1 回の実行で `ai.complete` が消費してよいトークンの総数 (#82)。省略時は
+    /// [`DEFAULT_MAX_TOKENS_PER_RUN`]。
+    ///
+    /// **`maxRuntimeSec` (#81) と違って、下げる方向にも書ける。** 長レーンの宣言は
+    /// 「席を取る」という意思表示なので下げる意味が無いが、こちらは下げることに意味が
+    /// ある — 安いトリガーが安いと名乗れると、同意画面 (#58) に出る見積もりが小さくなり、
+    /// エンドユーザーが承認しやすくなる。宣言が自分に不利にしか働かないなら、誰も
+    /// 正直に書かない。
+    ///
+    /// 範囲は 1〜[`MAX_ALLOWED_MAX_TOKENS_PER_RUN`]。範囲外は丸めずに構成エラーにする
+    /// (#68 / #81 と同じ方針)。
+    #[serde(default, rename = "maxTokensPerRun")]
+    max_tokens_per_run: Option<u32>,
 }
 
 /// [`TriggerManifest`] が読むキーの全部。**serde は未知のキーを黙って無視する**ので、
 /// 配布する仕様書 (#60) の例に綴り違い (`required_secrets` 等) が混ざっていないかを
 /// テストで見るために名前を並べておく。構造体にフィールドを足したらここにも足す。
 #[cfg(test)]
-const MANIFEST_FIELDS: [&str; 9] = [
+const MANIFEST_FIELDS: [&str; 10] = [
     "id",
     "name",
     "description",
@@ -252,6 +296,7 @@ const MANIFEST_FIELDS: [&str; 9] = [
     "schedule",
     "tz",
     "maxRuntimeSec",
+    "maxTokensPerRun",
 ];
 
 struct TriggerInfo {
@@ -284,6 +329,10 @@ struct TriggerInfo {
     /// 1 回の実行に許される時間 (#81)。`maxRuntimeSec` の宣言か、既定の [`JS_BUDGET`]。
     /// これが `JS_BUDGET` を超えているトリガーが長レーンで走る。
     max_runtime: Duration,
+    /// 1 回の実行に許される AI の消費 (#82)。`maxTokensPerRun` の宣言か、既定の
+    /// [`DEFAULT_MAX_TOKENS_PER_RUN`]。`config_error` があるトリガーでも既定に倒れる
+    /// (走らないので参照されない)。
+    max_tokens_per_run: u32,
 }
 
 type TriggersRef = Arc<Vec<TriggerInfo>>;
@@ -345,6 +394,21 @@ struct TriggerListItem {
     /// 宣言された 1 回あたりの上限 (#81)。宣言が無ければ null。
     #[serde(rename = "maxRuntimeSec")]
     max_runtime_sec: Option<u64>,
+    /// 1 回の実行に許される AI の消費 (#82)。**構成エラーのトリガーでは null。**
+    ///
+    /// `maxRuntimeSec` が Option なのは「宣言したかどうか」に意味がある (長レーンに
+    /// 入るかが変わる) からだが、こちらは宣言しなくても既定の予算が効いている。
+    /// それでも Option なのは、**「見積もりが出せない」を core が 1 回だけ言うため** —
+    /// 構成エラーのトリガーは走らないので見積もりに意味が無く、ここを必ず埋めると
+    /// 「出せない」の判断が UI 側 (テンプレートの数だけ) に降りる。
+    #[serde(rename = "maxTokensPerRun")]
+    max_tokens_per_run: Option<u32>,
+    /// 1 か月にこのトリガーが動く回数 (#82)。1 回きり (`@at`) と構成エラーでは null。
+    ///
+    /// `maxTokensPerRun` と掛けると「月あたり最大どれだけ AI を使うか」になる。
+    /// **掛け算は UI 側でやる** — u32 では溢れる組み合わせがある。
+    #[serde(rename = "runsPerMonth")]
+    runs_per_month: Option<u32>,
     /// `"bundled"` (アプリに焼き込まれた) | `"registered"` (実行時に登録された) (#58)。
     ///
     /// エンドユーザーが外せるのは後者だけ。「アプリの形」と「秘書にさせる仕事」の
@@ -380,6 +444,17 @@ pub struct TriggerCandidate {
     /// 「入れる前に見せる」の対象として `requiredSecrets` / `allowedHosts` と同格である。
     #[serde(rename = "maxRuntimeSec")]
     pub max_runtime_sec: Option<u64>,
+    /// 1 回の実行に許される AI の消費 (#82)。**宣言の有無に関わらず必ず入る。**
+    ///
+    /// これと [`Self::runs_per_month`] が、同意画面に出す見積もりの両側である。
+    /// **エンドユーザーが承認する前に、増える消費の上限が見える**ことが、3 役モデルで
+    /// この画面が担う仕事になる — 「UI は変えられない / 仕事は増やせる」の線引きで、
+    /// 増やす側のコストは増やす人に見せる。
+    #[serde(rename = "maxTokensPerRun")]
+    pub max_tokens_per_run: u32,
+    /// 1 か月にこのトリガーが動く回数 (#82)。1 回きり (`@at`) なら null。
+    #[serde(rename = "runsPerMonth")]
+    pub runs_per_month: Option<u32>,
     /// 同じ id が既にある場合の相手 (`"bundled"` | `"registered"`)。
     ///
     /// `"bundled"` は登録を拒否する — アプリに同梱された「そのアプリらしさ」を後から
@@ -728,6 +803,9 @@ struct ValidatedManifest {
     hosts: Vec<HostPattern>,
     /// 解決済みの 1 回あたりの上限 (#81)。宣言が無ければ [`JS_BUDGET`]。
     max_runtime: Duration,
+    /// 解決済みの 1 回あたりのトークン予算 (#82)。宣言が無ければ
+    /// [`DEFAULT_MAX_TOKENS_PER_RUN`]。
+    max_tokens_per_run: u32,
     /// 見つかった構成エラー。1 件ずつ観測面に流せるよう配列で持つ。
     errors: Vec<String>,
 }
@@ -787,12 +865,20 @@ fn validate_manifest(manifest: &TriggerManifest) -> ValidatedManifest {
             JS_BUDGET
         }
     };
+    let max_tokens_per_run = match validate_max_tokens_per_run(manifest.max_tokens_per_run) {
+        Ok(n) => n,
+        Err(e) => {
+            errors.push(e);
+            DEFAULT_MAX_TOKENS_PER_RUN
+        }
+    };
 
     ValidatedManifest {
         schedule,
         tz,
         hosts,
         max_runtime,
+        max_tokens_per_run,
         errors,
     }
 }
@@ -818,6 +904,27 @@ fn validate_max_runtime(declared: Option<u64>) -> Result<Duration, String> {
         ));
     }
     Ok(Duration::from_secs(secs))
+}
+
+/// `maxTokensPerRun` の宣言を 1 回の実行のトークン予算に変える (#82)。
+///
+/// **下限は 1。** `maxRuntimeSec` (#81) と違って下げる方向にも書ける — 詳細は
+/// [`TriggerManifest::max_tokens_per_run`]。0 を許さないのは、それが「AI を使わない」の
+/// 宣言に見えて実際には「呼ぶたびに例外」になるため。AI を呼ばないトリガーは何も書かない。
+///
+/// 範囲外は**丸めずに構成エラー**にする。黙って丸めると、同意画面 (#58) に出る見積もりの
+/// 分母と実際に効く予算がずれる。宣言が強制力を持たない状態で同意を取るのはシアターだ
+/// という #57 の線がここにも効く。
+fn validate_max_tokens_per_run(declared: Option<u32>) -> Result<u32, String> {
+    let Some(n) = declared else {
+        return Ok(DEFAULT_MAX_TOKENS_PER_RUN);
+    };
+    if !(1..=MAX_ALLOWED_MAX_TOKENS_PER_RUN).contains(&n) {
+        return Err(format!(
+            "maxTokensPerRun は 1 以上 {MAX_ALLOWED_MAX_TOKENS_PER_RUN} 以下で宣言してください (指定: {n})"
+        ));
+    }
+    Ok(n)
 }
 
 /// 1 つのディレクトリを走査して有効なトリガーだけを拾う。
@@ -911,6 +1018,7 @@ fn discover_triggers(
             config_error,
             hosts: validated.hosts,
             max_runtime: validated.max_runtime,
+            max_tokens_per_run: validated.max_tokens_per_run,
         });
     }
 
@@ -1044,6 +1152,7 @@ fn build_grants(triggers: &[TriggerInfo]) -> BTreeMap<String, TriggerGrants> {
                 TriggerGrants {
                     secrets: t.manifest.required_secrets.iter().cloned().collect(),
                     hosts: t.hosts.clone(),
+                    max_tokens_per_run: t.max_tokens_per_run,
                 },
             )
         })
@@ -1616,25 +1725,38 @@ fn list_triggers(
 ) -> Vec<TriggerListItem> {
     let store = lock_tasks(&task_store);
     active_triggers(&triggers)
-        .map(|t| TriggerListItem {
-            id: t.manifest.id.clone(),
-            name: t.manifest.name.clone(),
-            description: t.manifest.description.clone(),
-            paused: t.paused.load(Ordering::Relaxed),
-            schedule: t.manifest.schedule.clone(),
-            next_fire_at: store.next_scheduled_for(&t.manifest.id),
-            error: t.config_error.clone(),
-            required_secrets: t.manifest.required_secrets.clone(),
-            // 検証済みのパターンから組み立て直す。manifest の生文字列をそのまま出すと、
-            // 大文字や前後の空白の差で「UI に見えている文字列」と「実際に効く宣言」が
-            // ずれる。ここで見せるものは強制力を持つ側と同一でなければならない。
-            allowed_hosts: t.hosts.iter().map(|h| h.as_declared()).collect(),
-            // **強制されている側の値を出す。** 生の宣言 (`manifest.max_runtime_sec`) は
-            // 構成エラーのトリガーでは効いておらず、一覧はそれも載せるため
-            // (`error` 付きで見せるのがこの一覧の役目)。宣言 99999 が構成エラーとして
-            // 弾かれて 110 秒で動くのに 99999 と表示する、が起きないようにする。
-            max_runtime_sec: declared_max_runtime_sec(t.max_runtime),
-            source: t.source,
+        .map(|t| {
+            let estimable = t.config_error.is_none();
+            TriggerListItem {
+                id: t.manifest.id.clone(),
+                name: t.manifest.name.clone(),
+                description: t.manifest.description.clone(),
+                paused: t.paused.load(Ordering::Relaxed),
+                schedule: t.manifest.schedule.clone(),
+                next_fire_at: store.next_scheduled_for(&t.manifest.id),
+                error: t.config_error.clone(),
+                required_secrets: t.manifest.required_secrets.clone(),
+                // 検証済みのパターンから組み立て直す。manifest の生文字列をそのまま出すと、
+                // 大文字や前後の空白の差で「UI に見えている文字列」と「実際に効く宣言」が
+                // ずれる。ここで見せるものは強制力を持つ側と同一でなければならない。
+                allowed_hosts: t.hosts.iter().map(|h| h.as_declared()).collect(),
+                // **強制されている側の値を出す。** 生の宣言 (`manifest.max_runtime_sec`) は
+                // 構成エラーのトリガーでは効いておらず、一覧はそれも載せるため
+                // (`error` 付きで見せるのがこの一覧の役目)。宣言 99999 が構成エラーとして
+                // 弾かれて 110 秒で動くのに 99999 と表示する、が起きないようにする。
+                max_runtime_sec: declared_max_runtime_sec(t.max_runtime),
+                // 構成エラーのトリガーには見積もりを出さない (#82)。走らないので意味が
+                // 無いし、その `schedule` はダミー値なので、壊れた宣言から作った数字を
+                // 並べる方が誤解を生む。**2 つまとめて落とす** — 片方だけ残すと DTO に
+                // ダミー由来の数が乗る。
+                max_tokens_per_run: estimable.then_some(t.max_tokens_per_run),
+                runs_per_month: if estimable {
+                    t.schedule.runs_per_month()
+                } else {
+                    None
+                },
+                source: t.source,
+            }
         })
         .collect()
 }
@@ -1840,6 +1962,11 @@ pub(crate) fn inspect_candidate(
         // 出る文字列は、実際に効く宣言と 1 文字も違ってはいけない。
         allowed_hosts: validated.hosts.iter().map(|h| h.as_declared()).collect(),
         max_runtime_sec: manifest.max_runtime_sec,
+        // 検証済みの値から作る (allowed_hosts と同じ理由)。ここに出る数字は、登録した
+        // 後に実際に効く予算と 1 も違ってはいけない。範囲外の宣言は上の
+        // `config_error` で既に弾かれているので、ここに来るのは宣言か既定のどちらか。
+        max_tokens_per_run: validated.max_tokens_per_run,
+        runs_per_month: validated.schedule.runs_per_month(),
         conflict,
         warnings,
     })
@@ -2356,6 +2483,72 @@ mod tests {
         assert_eq!(validate_max_runtime(None).expect("既定"), JS_BUDGET);
     }
 
+    /// `maxTokensPerRun` も範囲外は構成エラーで、丸めない (#82)。
+    ///
+    /// 黙って丸めると、同意画面 (#58) に出す見積もりの分母と実際に効く予算がずれる。
+    #[test]
+    fn an_out_of_range_token_budget_is_a_config_error_not_a_clamp() {
+        for bad in [0, MAX_ALLOWED_MAX_TOKENS_PER_RUN + 1, u32::MAX] {
+            assert!(
+                validate_max_tokens_per_run(Some(bad)).is_err(),
+                "{bad} トークンが通ってしまう"
+            );
+        }
+        // **下げる方向も宣言できる** (`maxRuntimeSec` との違い)。安いトリガーが安いと
+        // 名乗れないと、同意画面の見積もりが全部同じ数字になって材料にならない。
+        for ok in [
+            1,
+            DEFAULT_MAX_TOKENS_PER_RUN / 8,
+            MAX_ALLOWED_MAX_TOKENS_PER_RUN,
+        ] {
+            assert_eq!(validate_max_tokens_per_run(Some(ok)).expect("通らない"), ok);
+        }
+        assert_eq!(
+            validate_max_tokens_per_run(None).expect("既定"),
+            DEFAULT_MAX_TOKENS_PER_RUN
+        );
+    }
+
+    /// 予算の既定値が、#68 の逃げ道を塞いでいないこと (#82)。
+    ///
+    /// 応答が切れたトリガーへの案内は「`maxTokens` を上げろ」(最大
+    /// [`ai::MAX_ALLOWED_MAX_TOKENS`]) である。既定の予算がそれを 1 回も賄えないと、
+    /// 案内どおりに直したトリガーが今度は `[denied]` で落ちる — **#68 が潰した
+    /// 「読めない失敗」に別の入口から戻る**。
+    #[test]
+    fn the_default_budget_covers_the_escape_hatch_from_truncation() {
+        const {
+            assert!(
+                DEFAULT_MAX_TOKENS_PER_RUN >= ai::MAX_ALLOWED_MAX_TOKENS,
+                "既定の予算が最大サイズの呼び出し 1 回に足りない"
+            );
+            // 宣言は逃げ道として上向きに開いている。既定 = 天井だと、足りない
+            // トリガーに打つ手が無くなる (`maxRuntimeSec` と同じ形)。
+            assert!(
+                MAX_ALLOWED_MAX_TOKENS_PER_RUN > DEFAULT_MAX_TOKENS_PER_RUN,
+                "宣言しても既定より上に行けない"
+            );
+        }
+    }
+
+    /// 宣言できる天井が、1 run で到達しうる量に収まっていること (#82)。
+    ///
+    /// 手で置いた数字にすると、到達できない量を案内した瞬間に天井として機能しなくなる
+    /// (#68 の `the_ceiling_is_reachable_within_the_timeout` と同じ論法)。**定義の
+    /// 式を書き写しても何も守れない**ので、時間の側から独立に計算した上界と比べる。
+    #[test]
+    fn the_token_ceiling_stays_within_what_a_run_can_physically_spend() {
+        let calls = MAX_RUNTIME.as_secs() as u32 / ai::ANTHROPIC_TIMEOUT_SECS as u32;
+        assert!(calls >= 1, "1 run に呼び出しが 1 回も入らない");
+        // 1 run に積める呼び出しの回数は時間で決まっていて、各回が入力をコンテキスト窓
+        // いっぱいまで詰めて出力を上限まで吐くのが最大の消費。
+        assert!(
+            MAX_ALLOWED_MAX_TOKENS_PER_RUN
+                <= calls * (ai::MAX_ALLOWED_MAX_TOKENS + ai::MAX_CONTEXT_TOKENS),
+            "宣言できる予算が、1 run で到達しうる量を超えている"
+        );
+    }
+
     /// 宣言の有無がそのままレーンを決める (#81)。**判断は 1 箇所** なので、
     /// ここがずれると「宣言したのに標準レーンで 110 秒に切られる」が静かに起きる。
     #[test]
@@ -2547,6 +2740,7 @@ mod tests {
                 allowed_hosts: Vec::new(),
                 schedule: "@hourly".to_string(),
                 max_runtime_sec: None,
+                max_tokens_per_run: None,
                 tz: None,
             },
             dir: PathBuf::from(format!("/tmp/{id}")),
@@ -2558,6 +2752,7 @@ mod tests {
             config_error: None,
             hosts: Vec::new(),
             max_runtime: JS_BUDGET,
+            max_tokens_per_run: DEFAULT_MAX_TOKENS_PER_RUN,
         }
     }
 
@@ -2981,6 +3176,40 @@ mod tests {
             );
             // 本文が挙げている例がそのまま通ること。
             assert!(validate_max_runtime(Some(1800)).is_ok());
+        }
+
+        /// 仕様書が書いている `maxTokensPerRun` の既定と範囲が実装と一致すること (#82)。
+        ///
+        /// **この 2 つの数字は「いくらまで使ってよいか」の説明そのもの**なので、ずれると
+        /// 仕様書どおりに宣言したトリガーが構成エラーになるか、書かないまま予算切れで
+        /// `[denied]` に落ちる。
+        #[test]
+        fn spec_states_the_real_token_budget() {
+            let doc = super::TRIGGER_SPEC;
+            assert!(
+                doc.contains(&format!("既定 **{DEFAULT_MAX_TOKENS_PER_RUN}**")),
+                "仕様書が書いている既定が実装 ({DEFAULT_MAX_TOKENS_PER_RUN}) と違う"
+            );
+            assert!(
+                doc.contains(&format!("**1〜{MAX_ALLOWED_MAX_TOKENS_PER_RUN}**")),
+                "仕様書が書いている範囲が実装 (1〜{MAX_ALLOWED_MAX_TOKENS_PER_RUN}) と違う"
+            );
+            // 本文が挙げている例がそのまま通ること。
+            assert!(validate_max_tokens_per_run(Some(400_000)).is_ok());
+        }
+
+        /// 「頻度は必要最小限に」が仕様書に残っていること (#82)。
+        ///
+        /// **弱いが無料の対策で、天井 (`maxTokensPerRun`) の代わりにはならない。**
+        /// それでも、トリガーの形ではコストを決める一番大きな要素は頻度なので、
+        /// 秘書 (#61) が読む仕様書からこれが消えると、生成物が既定で細かい schedule を
+        /// 書く方向に戻る。
+        #[test]
+        fn spec_tells_the_author_to_keep_the_cadence_coarse() {
+            assert!(
+                super::TRIGGER_SPEC.contains("### 頻度は必要最小限に"),
+                "仕様書から頻度の節が消えている"
+            );
         }
 
         /// 仕様書の「できないこと」(§6) が実際の JS 環境と一致していること。

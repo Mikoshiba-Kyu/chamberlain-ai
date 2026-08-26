@@ -403,6 +403,14 @@ body {
   color: #96590a;
 }
 
+/* AI の消費の見積もり (#82)。**警告色にはしない** — 宣言の有無に関わらず全部の
+   トリガーに出るので、警告として塗ると警告の意味が薄まる。読ませたいのは金額の
+   桁であって「危ない」ではない */
+.consent-budget {
+  font-size: 13px;
+  color: #6b6b6f;
+}
+
 /* 静的検査で見つかった「たぶん動かない」点 (#61)。宣言 (できること) とは別物なので、
    同じ警告色でも箇条書きにして混ぜない */
 .consent-warnings {
@@ -417,7 +425,8 @@ body {
 
 @media (prefers-color-scheme: dark) {
   .consent-fields dt,
-  .consent-path {
+  .consent-path,
+  .consent-budget {
     color: #a1a1a6;
   }
   .consent-runtime,
