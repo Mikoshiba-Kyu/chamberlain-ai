@@ -78,6 +78,19 @@ export interface TriggerListItem {
    * これが入っているトリガーは既定の 110 秒より長く走り、**落ちてもやり直されない**。
    */
   maxRuntimeSec: number | null;
+  /**
+   * 1 回の実行で AI が使えるトークンの上限 (#82)。宣言していなくても既定の予算が
+   * 入るが、**構成エラーのトリガーでは null** — そのトリガーは走らないので見積もりに
+   * 意味が無い。`runsPerMonth` と揃って落ちるので、片方だけ見て判断しなくてよい。
+   */
+  maxTokensPerRun: number | null;
+  /**
+   * 1 か月にこのトリガーが動く回数 (#82)。1 回きり (`@at`) と構成エラーでは null。
+   *
+   * `maxTokensPerRun` と掛けると「月あたり最大どれだけ AI を使うか」になる。
+   * **掛け算を core でやらないのは、u32 では溢れる組み合わせがあるため。**
+   */
+  runsPerMonth: number | null;
   /** 焼き込みか実行時登録か (#58)。解除できるのは `"registered"` だけ。 */
   source: TriggerSource;
 }
@@ -103,6 +116,15 @@ export interface TriggerCandidate {
   allowedHosts: string[];
   /** 宣言された 1 回あたりの実行時間の上限 (秒) (#81)。宣言が無ければ null。 */
   maxRuntimeSec: number | null;
+  /**
+   * 1 回の実行で AI が使えるトークンの上限 (#82)。**宣言していなくても必ず入る。**
+   *
+   * `runsPerMonth` と掛けたものが同意画面に出る見積もりで、**エンドユーザーが承認する
+   * 前に、増える消費の上限が見える**ようにするためのもの。
+   */
+  maxTokensPerRun: number;
+  /** 1 か月にこのトリガーが動く回数 (#82)。1 回きり (`@at`) なら null。 */
+  runsPerMonth: number | null;
   /**
    * 同じ id が既にある場合の相手。`"bundled"` は登録できない (同梱トリガーは
    * 乗っ取らせない)、`"registered"` は置き換え = 配布物の更新になる。

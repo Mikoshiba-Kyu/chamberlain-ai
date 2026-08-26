@@ -75,6 +75,53 @@ export function formatRuntime(
   return `${label}かかることがあります。長い実行の間 AI の利用料がかかることがあり、途中でアプリが終了した場合はやり直されません。`;
 }
 
+/** 桁区切りを入れる。トークン数は 8 桁以上になるので、区切りが無いと読めない。 */
+function groupDigits(n: number): string {
+  return n.toLocaleString("ja-JP");
+}
+
+/**
+ * AI の消費の上限を 1 行にする (#82)。
+ *
+ * **承認する前に、増える消費が見える**ようにするためのもの。`maxTokensPerRun` は
+ * core が実際に強制している天井で (超えた `ai.complete` は例外になる)、`runsPerMonth` は
+ * `schedule` の意味からそのまま出る回数なので、掛けたものは「このトリガーが月あたり最大
+ * どれだけ使うか」の上界になる。
+ *
+ * **金額には換算しない。** モデル別の単価を持つと、その表の陳腐化を追い続けることに
+ * なる (#71 / #27)。トークン数までを出して、単価はエンドユーザーの手元にある。
+ */
+export function formatTokenBudget(t: {
+  maxTokensPerRun?: number | null;
+  runsPerMonth?: number | null;
+}): string | null {
+  // null は「見積もりが出せない」= 構成エラーのトリガー。**その判断は core が
+  // 済ませている**ので、ここで `error` を見に行かない (#82)。`?? null` は core の
+  // pin だけ古い状態への保険も兼ねる (formatPermissions と同じ理由)。
+  const perRun = t.maxTokensPerRun ?? null;
+  if (perRun === null) {
+    return null;
+  }
+  // **「最大」とは言わない。** 予算は出力側 (`maxTokens`) を先に足して判定するので
+  // 出力は超えないが、prompt が何トークンになるかは送るまで分からず core は
+  // tokenizer を持たない (#82)。1 回分の入力ぶんは上に出うるので、断言すると
+  // 「同意画面に出た数字が実際に効く上限と一致する」という #58 の線を割る。
+  const head = `1 回の実行あたり ${groupDigits(perRun)} トークンの予算`;
+  const runs = t.runsPerMonth ?? null;
+  // 1 回きり (`@at`) に「月あたり」は無い。0 回と書くと使わないように読める。
+  if (runs === null) {
+    return `${head}。このトリガーは 1 回だけ動きます。`;
+  }
+  // **掛け算はここでやる。** core は u32 なので溢れる組み合わせがあり、飽和させると
+  // 天井が実際より小さく見える。
+  const perMonth = perRun * runs;
+  return (
+    `${head}。月あたり最大 ${groupDigits(runs)} 回動くので、` +
+    `合わせて ${groupDigits(perMonth)} トークンが目安になります。` +
+    `料金は使っているモデルの単価によります。`
+  );
+}
+
 /** id が既存とぶつかっているときの注意書き。ぶつかっていなければ null。 */
 export function describeConflict(
   conflict: TriggerSource | null,
@@ -112,6 +159,7 @@ export function ConsentCard({
 }: Props) {
   const conflictNote = describeConflict(candidate.conflict);
   const runtimeNote = formatRuntime(candidate);
+  const budgetNote = formatTokenBudget(candidate);
   // core の pin だけ古い状態でも落ちないように (formatPermissions と同じ理由)。
   const warnings = candidate.warnings ?? [];
 
@@ -139,6 +187,12 @@ export function ConsentCard({
           <>
             <dt>実行時間</dt>
             <dd className="consent-runtime">{runtimeNote}</dd>
+          </>
+        )}
+        {budgetNote && (
+          <>
+            <dt>AI の消費</dt>
+            <dd className="consent-budget">{budgetNote}</dd>
           </>
         )}
         <dt>場所</dt>

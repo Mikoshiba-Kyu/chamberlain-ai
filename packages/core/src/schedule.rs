@@ -70,6 +70,33 @@ pub(crate) enum Schedule {
     At { datetime: NaiveDateTime },
 }
 
+/// 「月あたり」を数えるときの日数。**一番長い月で数える** (#82)。
+///
+/// 同意画面 (#58) に出るのは「月あたり最大」なので、平均の 30.44 日で割ると実際より
+/// 小さい数字を見せることになる。承認の材料として出す数字は、上振れる側に倒す。
+const MONTH_DAYS: u32 = 31;
+
+impl Schedule {
+    /// この規則が 1 か月に生む発火の回数 (#82)。1 回きりの `@at` は `None`。
+    ///
+    /// **同意画面の見積もりの片側である。** もう片方 (`maxTokensPerRun`) と掛けると
+    /// 「このトリガーが月あたり最大どれだけ AI を使うか」になる。**掛け算は UI 側で
+    /// やる** — u32 では溢れる組み合わせがあり、ここで飽和させると天井が実際より
+    /// 小さく見える。
+    ///
+    /// 数え方は上界。31 日の月に同じ曜日は最大 5 回入り、`@monthly 31` のように
+    /// 存在しない月を飛ばす規則も 1 回として数える。
+    pub(crate) fn runs_per_month(&self) -> Option<u32> {
+        match self {
+            Self::Hourly { minutes } => Some(minutes.len() as u32 * 24 * MONTH_DAYS),
+            Self::Daily { .. } => Some(MONTH_DAYS),
+            Self::Weekly { .. } => Some(MONTH_DAYS.div_ceil(7)),
+            Self::Monthly { .. } => Some(1),
+            Self::At { .. } => None,
+        }
+    }
+}
+
 /// `manifest.schedule` DSL のエントリ。
 ///
 /// interval 形式 (`"5m"` / `"1h"`) を書かれた場合は、"unknown keyword" ではなく移行先を
@@ -409,6 +436,31 @@ fn pick_earlier_utc(tz: &Tz, naive: &NaiveDateTime) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 月あたりの回数は、DSL の意味からそのまま出る (#82)。**同意画面の見積もりの
+    /// 片側**なので、ここがずれると承認の材料が嘘になる。
+    #[test]
+    fn runs_per_month_counts_the_longest_month() {
+        let per_month = |dsl: &str| parse_schedule(dsl).expect(dsl).runs_per_month();
+        assert_eq!(per_month("@every 5m"), Some(12 * 24 * 31));
+        assert_eq!(per_month("@hourly"), Some(24 * 31));
+        assert_eq!(per_month("@daily 09:00"), Some(31));
+        // 31 日の月に同じ曜日は 5 回入る。4 で数えると見積もりが下振れする。
+        assert_eq!(per_month("@weekly MON 09:00"), Some(5));
+        assert_eq!(per_month("@monthly 15 09:00"), Some(1));
+    }
+
+    /// 1 回きりの `@at` に「月あたり」は無い。0 を返すと「AI を使わない」と読めるし、
+    /// 1 を返すと毎月動くように読める。
+    #[test]
+    fn a_one_off_schedule_has_no_monthly_rate() {
+        assert_eq!(
+            parse_schedule("@at 2026-08-01T18:30")
+                .expect("valid")
+                .runs_per_month(),
+            None
+        );
+    }
 
     fn tz_utc() -> Tz {
         "UTC".parse().unwrap()

@@ -50,13 +50,25 @@ pub(crate) struct TriggerGrants {
     pub secrets: BTreeSet<String>,
     /// manifest の `allowedHosts` (#57)。宣言順を保つ (同意画面に書いた順で出す)。
     pub hosts: Vec<HostPattern>,
+    /// 1 回の実行で `ai.complete` が消費してよいトークンの総数 (#82)。
+    /// manifest の `maxTokensPerRun` か、既定 (`crate::DEFAULT_MAX_TOKENS_PER_RUN`)。
+    ///
+    /// **他の 2 つと違って「何を許すか」ではなく「どれだけ許すか」を持つ。** 宛先を
+    /// core が決める `ai.complete` には `allowedHosts` のような宣言が取れない一方
+    /// (#57)、1 run あたりの呼び出し回数に上限が無いままだと、エンドユーザーの課金が
+    /// トリガーの書き方だけで際限なく伸びる。
+    pub max_tokens_per_run: u32,
 }
 
 /// 宣言を持たないトリガーの権限 = 何も許可されていない。実行文脈はあるが grants が
 /// 見つからない場合 (discovery に載っていない等) に借りる先。
+///
+/// トークン予算も 0 = **1 回も呼べない**。既定値に倒すと、一覧に載っていないトリガーが
+/// 「宣言のあるトリガーと同じだけ使える」ことになり、既定は拒否という前提が消える。
 static NO_GRANTS: TriggerGrants = TriggerGrants {
     secrets: BTreeSet::new(),
     hosts: Vec::new(),
+    max_tokens_per_run: 0,
 };
 
 /// `allowedHosts` の 1 エントリ。
@@ -229,6 +241,69 @@ impl HostDenial {
     }
 }
 
+/// `ai.complete` の拒否理由 (#82)。
+///
+/// **`allowedHosts` / `requiredSecrets` と違って「宣言し忘れ」が無い。** 宛先は core が
+/// 決めるので宣言する対象そのものが無く、ここで拒否が起きるのは予算を使い切ったときだけ
+/// である。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AiDenial {
+    /// トリガーの実行文脈の外から呼ばれた。
+    NoContext,
+    /// この実行のトークン予算では、この呼び出しを賄えない。
+    BudgetExhausted { budget: u32 },
+}
+
+impl AiDenial {
+    /// 観測面とトリガーへの例外に出す本文。
+    ///
+    /// **使った量 (`spent`) は入れない。** 呼び出しごとに値が変わるので
+    /// [`TriggerPermissions::record`] の重複排除のキーが毎回割れ、「予算切れで何回
+    /// 断られたか」がまさに数えたい状況で数えられなくなる (`maxTokens` の値を本文に
+    /// 入れなかったのと同じ理由 — #68)。予算の値はトリガーごとに固定なので入れてよく、
+    /// 直すべき対象 (`maxTokensPerRun`) を名指すのはこちらである。
+    fn message(&self) -> String {
+        match self {
+            Self::NoContext => "ai.complete was called outside of a trigger execution; \
+                 the caller could not be identified"
+                .to_string(),
+            Self::BudgetExhausted { budget } => format!(
+                "ai.complete would exceed this run's token budget of {budget}; \
+                 declare a larger maxTokensPerRun in the manifest, \
+                 or make fewer / shorter calls"
+            ),
+        }
+    }
+}
+
+/// `ai.complete` を通してよいかの判断。副作用を持たない。
+///
+/// **判定は呼びに行く前に、今回の `maxTokens` を含めて行う。** 消費が分かるのは応答が
+/// 返ってからなので、使い切ってから断る形にすると予算は必ず 1 回分ぶん超過する。
+/// 出力側は `maxTokens` が上限を先に名乗っているので、足してから比べれば超えない。
+///
+/// `spent` には**応答待ちの呼び出しが押さえているぶんも入る。** 消費が分かるのは応答が
+/// 返ってからなので、実消費だけで比べると `await` しない呼び出しはどれも 0 の状態で
+/// 判定され、予算がまるごと素通りする。
+///
+/// **入力側は超えうる。** prompt が何トークンになるかは送ってみるまで分からず、core は
+/// tokenizer を持たない。予算は「これ以上は新しく呼びに行かせない」線であって、1 回分の
+/// 入力ぶんだけは上に出る。それでも回数に上限が無い状態とは桁が違う。
+pub(crate) fn decide_ai_call(
+    grants: Option<&TriggerGrants>,
+    spent: u64,
+    max_tokens: u32,
+) -> Result<(), AiDenial> {
+    let Some(grants) = grants else {
+        return Err(AiDenial::NoContext);
+    };
+    let budget = grants.max_tokens_per_run;
+    if spent.saturating_add(u64::from(max_tokens)) > u64::from(budget) {
+        return Err(AiDenial::BudgetExhausted { budget });
+    }
+    Ok(())
+}
+
 /// `getSecret(name)` を通してよいかの判断。副作用を持たない。
 ///
 /// `grants` が `None` は「実行文脈の外」を意味する (トリガーが宣言を持たない場合は
@@ -393,6 +468,19 @@ pub(crate) struct TriggerPermissions {
     current: Option<String>,
     /// 未回収の記録 (拒否と `ai.complete` の呼び出し)。
     pending: Vec<OpActivity>,
+    /// この実行で `ai.complete` が消費したトークンの累計 (#82)。[`Self::enter`] で 0 に戻る。
+    ///
+    /// **時間の予算 (`crate::JS_BUDGET`) と同じ発想の、消費側の天井の分子である。**
+    /// 回数ではなくトークンで持つのは、10 件を要約するトリガーが 10 回呼ぶのは正常系で、
+    /// 回数の上限はそれを壊すため。
+    run_tokens: u64,
+    /// 応答待ちの `ai.complete` が押さえているトークン (#82)。[`Self::enter`] で 0 に戻る。
+    ///
+    /// **消費が分かるのは応答が返ってからなので、これが無いと予算は並行呼び出しで
+    /// 素通りする。** `await` せずに 1000 本投げれば、どの判定も `run_tokens` が 0 の
+    /// ままの状態で行われる。呼びに行くと決めた時点で今回の `maxTokens` を押さえ、
+    /// 応答 (または失敗) が返った時点で外す。
+    run_reserved: u64,
 }
 
 impl TriggerPermissions {
@@ -404,8 +492,14 @@ impl TriggerPermissions {
     }
 
     /// JS を動かす直前に呼ぶ。以後の op はこのトリガーの宣言で判定される。
+    ///
+    /// **トークンの累計はここで 0 に戻す** ([`Self::leave`] ではなく)。閉じた後に返って
+    /// きた応答 (await されなかった promise) の消費を捨てずに済み、かつ次の実行がそれを
+    /// 引き継がない。
     pub(crate) fn enter(&mut self, trigger_id: &str) {
         self.current = Some(trigger_id.to_string());
+        self.run_tokens = 0;
+        self.run_reserved = 0;
     }
 
     /// JS の実行が終わったら呼ぶ。実行文脈を閉じ、その間に溜まった記録を返す
@@ -459,6 +553,34 @@ impl TriggerPermissions {
         }
     }
 
+    /// `ai.complete` を呼びに行ってよいか (#82)。拒否した場合は記録に残す。
+    ///
+    /// **`authorize_secret` と違って呼び出し側に例外を投げさせる。** `getSecret` が
+    /// `null` を返せるのは「未設定の secret」と同じ形があるからで、`ai.complete` の
+    /// 戻り値は応答テキストなので「値が無い」に相当するものが無い (`http.fetch` を
+    /// 例外にしたのと同じ理由 — 握り潰すと空文字を掴んで進む)。
+    ///
+    /// **通した呼び出しは、応答が返るまで今回の `maxTokens` を押さえる**
+    /// ([`Self::run_reserved`])。押さえないと `await` しない呼び出しがいくらでも
+    /// 並べられ、どれも消費 0 の状態で判定されて予算が効かない。外すのは
+    /// [`Self::release_ai_reservation`]。
+    pub(crate) fn authorize_ai_call(&mut self, max_tokens: u32) -> Result<(), String> {
+        let spent = self.run_tokens.saturating_add(self.run_reserved);
+        match decide_ai_call(self.current_grants(), spent, max_tokens) {
+            Ok(()) => {
+                self.run_reserved = self.run_reserved.saturating_add(u64::from(max_tokens));
+                Ok(())
+            }
+            Err(denial) => {
+                let message = denial.message();
+                let record =
+                    OpActivity::new(self.current.clone(), ActivityKind::Denied, message.clone());
+                self.record(record);
+                Err(message)
+            }
+        }
+    }
+
     /// `ai.complete` の呼び出しを記録する (#57)。
     ///
     /// **拒否は無い。** 宛先を core が決める (Anthropic 固定) ので `allowedHosts` のような
@@ -474,6 +596,15 @@ impl TriggerPermissions {
         self.record(record);
     }
 
+    /// 応答待ちだった呼び出しの予約を外す (#82)。
+    ///
+    /// **成否に関わらず必ず呼ぶ。** 落ちた呼び出しの予約を残すと、返ってこない呼び出しの
+    /// ぶんだけ予算が目減りしたまま実行が続く。実際の消費は
+    /// [`Self::record_ai_usage`] が別に積むので、ここで外すのは見積もりの側だけである。
+    pub(crate) fn release_ai_reservation(&mut self, max_tokens: u32) {
+        self.run_reserved = self.run_reserved.saturating_sub(u64::from(max_tokens));
+    }
+
     /// 応答が返ってきたら、その消費を**呼び出しの行に足す** (#71)。
     ///
     /// [`Self::record_ai_call`] は呼びに行く前に走る (キー未設定や API エラーで落ちた
@@ -483,7 +614,11 @@ impl TriggerPermissions {
     /// 読み手の仕事になる。
     ///
     /// **回数は増やさない。** 数えているのは呼び出しの回数で、これはその内訳を足すだけ。
+    ///
+    /// 予算 (#82) の累計もここで進む。**行に載せるのと同じ数字を積む** — 観測面に出た
+    /// 消費と、次の呼び出しを断る根拠になった消費が食い違わないようにする。
     pub(crate) fn record_ai_usage(&mut self, model: &str, usage: Usage) {
+        self.run_tokens = self.run_tokens.saturating_add(usage.total());
         let record = self.ai_call_row(model).with_usage(usage);
         // 呼び出しの行 → それが種類上限 ([`MAX_PENDING`]) で畳まれた先、の順に探す。
         // 畳まれた行を見ずに [`Self::record`] へ回すと、そこで回数がもう 1 つ増えて
@@ -1006,5 +1141,159 @@ mod tests {
         let mut s = state();
         s.enter("never-discovered");
         assert!(!s.authorize_secret("github_token"));
+    }
+
+    /// 予算 `budget` を持つトリガー 1 本だけの状態 (#82)。
+    fn budgeted(budget: u32) -> TriggerPermissions {
+        let mut s = TriggerPermissions::new(BTreeMap::from([(
+            "t".to_string(),
+            TriggerGrants {
+                max_tokens_per_run: budget,
+                ..Default::default()
+            },
+        )]));
+        s.enter("t");
+        s
+    }
+
+    /// **判定は呼びに行く前に、今回の `maxTokens` を含めて行う** (#82)。使い切ってから
+    /// 断る形にすると予算は必ず 1 回分ぶん超過する。
+    #[test]
+    fn the_budget_counts_the_call_it_is_about_to_allow() {
+        let mut s = budgeted(1000);
+        assert!(
+            s.authorize_ai_call(1000).is_ok(),
+            "ちょうど収まる 1 回を断った"
+        );
+
+        let mut s = budgeted(1000);
+        let err = s.authorize_ai_call(1001).unwrap_err();
+        assert!(
+            err.contains("maxTokensPerRun"),
+            "直す先を名指していない: {err}"
+        );
+    }
+
+    /// **応答待ちの呼び出しも予算を押さえる** (#82)。消費が分かるのは応答が返ってから
+    /// なので、実消費だけで判定すると `await` しない呼び出し (`Promise.all` で束ねた
+    /// 100 本など) はどれも 0 の状態で通り、予算がまるごと素通りする。
+    #[test]
+    fn calls_that_have_not_answered_yet_still_hold_the_budget() {
+        let mut s = budgeted(1000);
+        assert!(s.authorize_ai_call(600).is_ok());
+        assert!(
+            s.authorize_ai_call(600).is_err(),
+            "応答待ちの呼び出しが予算を押さえていない"
+        );
+
+        // 応答 (または失敗) が返れば予約は外れ、以後は実消費だけが残る。
+        s.release_ai_reservation(600);
+        s.record_ai_usage("claude-sonnet-5", tokens(100, 100));
+        assert!(
+            s.authorize_ai_call(600).is_ok(),
+            "返ってきた呼び出しの予約が外れていない"
+        );
+    }
+
+    /// 落ちた呼び出しの予約も外れる。外し忘れると、返ってこなかったぶんだけ予算が
+    /// 目減りしたまま実行が続く。
+    #[test]
+    fn a_failed_call_does_not_keep_holding_the_budget() {
+        let mut s = budgeted(1000);
+        assert!(s.authorize_ai_call(1000).is_ok());
+        // 応答は返らず (キー未設定 / API エラー)、消費も記録されない。
+        s.release_ai_reservation(1000);
+        assert!(
+            s.authorize_ai_call(1000).is_ok(),
+            "失敗した呼び出しの予約が残っている"
+        );
+    }
+
+    /// 予算は 4 項目の合計で減る。キャッシュ読みだけを数えないと、キャッシュが効いている
+    /// トリガーの消費が予算から見えなくなる。
+    #[test]
+    fn every_kind_of_token_draws_from_the_same_budget() {
+        let mut s = budgeted(100);
+        s.record_ai_usage(
+            "claude-sonnet-5",
+            Usage {
+                input_tokens: 10,
+                output_tokens: 10,
+                cache_creation_input_tokens: 10,
+                cache_read_input_tokens: 10,
+            },
+        );
+        assert!(s.authorize_ai_call(60).is_ok());
+        assert!(
+            s.authorize_ai_call(61).is_err(),
+            "40 トークン消費した後に 61 が通っている"
+        );
+    }
+
+    /// **予算は実行ごとに戻る** ([`crate::JS_BUDGET`] と同じ)。戻らないと、長く動いて
+    /// いるアプリほどトリガーが使えなくなる。
+    #[test]
+    fn each_run_gets_a_fresh_budget() {
+        let mut s = budgeted(100);
+        s.record_ai_usage("claude-sonnet-5", tokens(100, 0));
+        assert!(s.authorize_ai_call(1).is_err());
+
+        s.leave();
+        s.enter("t");
+        assert!(
+            s.authorize_ai_call(100).is_ok(),
+            "次の実行に前回の消費が残っている"
+        );
+    }
+
+    /// 予算切れは `[denied]` として観測面に残り、**回数が数えられる**。本文に使用量を
+    /// 入れると呼び出しごとに文字列が割れて畳みが効かない (#68 と同じ理由)。
+    #[test]
+    fn budget_denials_fold_into_one_counted_row() {
+        let mut s = budgeted(10);
+        for _ in 0..5 {
+            assert!(s.authorize_ai_call(11).is_err());
+        }
+
+        let recorded = s.leave();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "予算切れが 1 行に畳まれていない: {recorded:?}"
+        );
+        assert_eq!(recorded[0].kind, ActivityKind::Denied);
+        assert_eq!(recorded[0].count, 5);
+    }
+
+    /// 断った呼び出しは `[ai]` には出ない。呼びに行っていないものを呼び出しの量に
+    /// 数えると、予算が効いているほど使ったように見える。
+    #[test]
+    fn a_denied_call_is_not_counted_as_a_call() {
+        let mut s = budgeted(10);
+        assert!(s.authorize_ai_call(11).is_err());
+
+        let recorded = s.leave();
+        assert!(
+            recorded.iter().all(|a| a.kind != ActivityKind::AiCall),
+            "断った呼び出しが [ai] に出ている: {recorded:?}"
+        );
+    }
+
+    /// grants に載っていないトリガーは 1 回も呼べない。既定値に倒すと「一覧に無い
+    /// トリガーが宣言のあるトリガーと同じだけ使える」ことになる。
+    #[test]
+    fn a_trigger_without_grants_has_no_budget_at_all() {
+        let mut s = state();
+        s.enter("never-discovered");
+        assert!(s.authorize_ai_call(1).is_err());
+    }
+
+    /// 実行文脈の外からの呼び出しは、予算の話になる前に落ちる。
+    #[test]
+    fn calls_outside_a_run_are_denied_before_the_budget_is_consulted() {
+        let mut s = budgeted(1_000_000);
+        s.leave();
+        let err = s.authorize_ai_call(1).unwrap_err();
+        assert!(err.contains("outside of a trigger execution"), "{err}");
     }
 }
